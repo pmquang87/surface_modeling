@@ -28,51 +28,39 @@ class QuadWrapper:
         """Generate quad-dominant mesh wrapping the reference.
         
         Pipeline:
-        1. Compute curvature field (principal curvatures and directions)
-        2. Detect sharp features (edges with dihedral angle > threshold)
-        3. Generate initial point distribution (Poisson disk sampling on surface)
-        4. Build Voronoi-like cells on the surface
-        5. Dualize the Voronoi diagram to get a quad-dominant mesh
-        6. Snap vertices to the reference mesh surface
-        7. Optimize mesh quality (smooth, untangle)
-        
-        Returns: Clean quad-dominant HalfEdgeMesh control cage
+        1. Calculate bounding box of the reference mesh
+        2. Generate a base quad box matching the bounds
+        3. Subdivide the box until it roughly matches the target face count
+        4. Use ShrinkWrapper to project the cage onto the reference surface
         """
         if len(reference_mesh.faces) == 0:
             return HalfEdgeMesh()
             
         tri_mesh = reference_mesh.to_trimesh()
-        
-        # 1-3. Generate well-distributed points based on target face count.
-        # target_face_count roughly corresponds to number of points we sample for Voronoi cells
-        num_points = max(10, self.target_face_count)
-        pts, face_indices = trimesh.sample.sample_surface_even(tri_mesh, num_points)
-        
-        if len(pts) < 4:
-            # Fallback if sampling fails
-            pts = tri_mesh.vertices[:num_points]
-            
-        normals = tri_mesh.face_normals[face_indices]
-        
-        # 4-5. Dualize Delaunay to get Voronoi-based quad-dominant mesh
-        # In 3D this is complex, so we'll use a simplified voxel/marching cubes or 
-        # a direct quad generation over the sampled points as a placeholder for the advanced logic
-        
-        # Fallback to voxel-based quad extraction for simplicity in this implementation
-        # Find the bounding box
         bounds = tri_mesh.bounds
-        extents = bounds[1] - bounds[0]
         
-        # Calculate voxel size based on target face count
-        surface_area = tri_mesh.area
-        voxel_size = np.sqrt(surface_area / (self.target_face_count * 2.0))
+        # 1-2. Generate base bounding box cage
+        # Add a slight padding so it completely encloses the mesh before shrink wrap
+        padding = (bounds[1] - bounds[0]) * 0.05
+        padded_bounds = np.array([bounds[0] - padding, bounds[1] + padding])
+        base_cage = self._generate_base_cage(padded_bounds, 0)
         
-        # We can implement a simplified approach using trimesh's voxelization or 
-        # just construct a bounding box cage for now if it's too sparse
+        # 3. Subdivide to reach target face count
+        import math
+        from src.subd.catmull_clark import subdivide
+        current_faces = 6
+        target = max(6, self.target_face_count)
+        levels = math.ceil(math.log(target / current_faces) / math.log(4))
+        # Cap levels to prevent memory explosion
+        levels = min(max(0, levels), 4)
         
-        # Let's generate a basic spherical or bounding box quad mesh and shrink wrap it
-        # as a robust alternative to full field-aligned remeshing for the baseline
-        quad_mesh = self._generate_base_cage(bounds, voxel_size)
+        if levels > 0:
+            base_cage = subdivide(base_cage, levels)
+            
+        # 4. Shrink wrap onto the reference mesh
+        from src.reverse_engineering.shrink_wrap import ShrinkWrapper
+        wrapper = ShrinkWrapper(iterations=10, smooth_weight=0.6, projection_mode='closest_point')
+        quad_mesh = wrapper.wrap(base_cage, reference_mesh)
         
         return quad_mesh
         

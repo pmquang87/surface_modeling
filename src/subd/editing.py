@@ -110,27 +110,112 @@ def insert_edge_loop(mesh: HalfEdgeMesh, edge_index: int, position: float = 0.5)
     if edge_index >= len(mesh.edges):
         return mesh.copy()
         
-    loop = mesh.get_edge_loop(mesh.edges[edge_index])
+    # get_edge_loop in halfedge_mesh traverses opposite edges, which effectively gets an edge ring
+    raw_edges = mesh.get_edge_loop(mesh.edges[edge_index])
+    ring_edges = list({e.index: e for e in raw_edges}.values())
+    ring_edge_indices = set(e.index for e in ring_edges)
     
     verts = [v.position.copy() for v in mesh.vertices]
-    faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
+    faces = []
     
-    # Simple placeholder: a full robust edge loop insertion requires replacing faces along the loop
-    # In a full implementation, we split each edge in the loop, then split the connecting faces
-    return mesh.copy()
+    edge_to_new_vert = {}
+    for e in ring_edges:
+        v1 = e.half_edge.vertex.position
+        v2 = e.half_edge.next.vertex.position
+        new_pos = v1 * (1.0 - position) + v2 * position
+        verts.append(new_pos)
+        edge_to_new_vert[e.index] = len(verts) - 1
+        
+    for f in mesh.faces:
+        f_edges = []
+        he = f.half_edge
+        start_he = he
+        while True:
+            f_edges.append(he)
+            he = he.next
+            if he == start_he: break
+            
+        split_hes = [he for he in f_edges if he.edge.index in ring_edge_indices]
+        if len(split_hes) == 2 and len(f_edges) == 4:
+            idx0 = f_edges.index(split_hes[0])
+            he0, he1, he2, he3 = f_edges[idx0], f_edges[(idx0+1)%4], f_edges[(idx0+2)%4], f_edges[(idx0+3)%4]
+            nv0 = edge_to_new_vert[he0.edge.index]
+            nv2 = edge_to_new_vert[he2.edge.index]
+            v1 = he1.vertex.index
+            v2 = he2.vertex.index
+            v3 = he3.vertex.index
+            v0 = he0.vertex.index
+            faces.append([nv0, v1, v2, nv2])
+            faces.append([nv2, v3, v0, nv0])
+        else:
+            faces.append([he.vertex.index for he in f_edges])
+            
+    return HalfEdgeMesh.from_arrays(verts, faces)
 
 
 def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: list[int]) -> HalfEdgeMesh:
     """Delete both face groups and connect their boundary edges with new quad faces."""
+    import numpy as np
     verts = [v.position.copy() for v in mesh.vertices]
-    faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
+    faces = []
     
     to_delete = set(face_indices_a + face_indices_b)
-    new_faces = [f for i, f in enumerate(faces) if i not in to_delete]
     
-    # Placeholder: connect boundaries
-    # Real implementation would trace boundary loops of A and B, align them, and bridge
-    return HalfEdgeMesh.from_arrays(verts, new_faces)
+    for f in mesh.faces:
+        if f.index not in to_delete:
+            faces.append([v.index for v in mesh.get_face_vertices(f)])
+            
+    def get_boundary_loop(group_indices):
+        boundary_edges = []
+        for f_idx in group_indices:
+            f = mesh.faces[f_idx]
+            he = f.half_edge
+            start_he = he
+            while True:
+                twin_face_idx = he.twin.face.index if he.twin and he.twin.face else -1
+                if twin_face_idx not in group_indices:
+                    boundary_edges.append(he)
+                he = he.next
+                if he == start_he: break
+        
+        if not boundary_edges: return []
+        loop = [boundary_edges.pop(0)]
+        while boundary_edges:
+            last_he = loop[-1]
+            next_vertex = last_he.next.vertex
+            found = False
+            for i, he in enumerate(boundary_edges):
+                if he.vertex == next_vertex:
+                    loop.append(boundary_edges.pop(i))
+                    found = True
+                    break
+            if not found: break 
+        return [he.vertex.index for he in loop]
+
+    loop_a = get_boundary_loop(set(face_indices_a))
+    loop_b = get_boundary_loop(set(face_indices_b))
+    
+    if len(loop_a) == len(loop_b) and len(loop_a) > 2:
+        n = len(loop_a)
+        best_shift = 0
+        min_dist = float('inf')
+        for shift in range(n):
+            dist = sum(np.linalg.norm(verts[loop_a[i]] - verts[loop_b[(i + shift) % n]]) for i in range(n))
+            if dist < min_dist:
+                min_dist = dist
+                best_shift = shift
+                
+        loop_b_aligned = loop_b[best_shift:] + loop_b[:best_shift]
+        loop_b_aligned.reverse()
+        
+        for i in range(n):
+            v1 = loop_a[i]
+            v2 = loop_a[(i + 1) % n]
+            v3 = loop_b_aligned[(i + 1) % n]
+            v4 = loop_b_aligned[i]
+            faces.append([v1, v2, v3, v4])
+            
+    return HalfEdgeMesh.from_arrays(verts, faces)
 
 
 def mirror_mesh(mesh: HalfEdgeMesh, axis: str = 'x', merge_distance: float = 0.001) -> HalfEdgeMesh:

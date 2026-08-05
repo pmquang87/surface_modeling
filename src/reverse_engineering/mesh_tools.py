@@ -9,11 +9,15 @@ def fill_holes(mesh: HalfEdgeMesh, max_hole_edges: int = 20) -> HalfEdgeMesh:
     Detect boundary loops, triangulate each hole using ear-clipping,
     then convert to quads where possible.
     """
-    result = mesh.copy()
-    # Simple placeholder: a full implementation would find boundary loops
-    # and triangulate them, which is non-trivial in a HalfEdge structure
-    # without a specific ear-clipping implementation.
-    return result
+    t_mesh = mesh.to_trimesh()
+    try:
+        from trimesh.repair import fill_holes as trimesh_fill_holes
+        trimesh_fill_holes(t_mesh)
+        result = HalfEdgeMesh.from_trimesh(t_mesh)
+        return result
+    except Exception as e:
+        print(f"Error filling holes: {e}")
+        return mesh.copy()
 
 def smooth_mesh(mesh: HalfEdgeMesh, iterations: int = 3, 
                 method: str = 'taubin', lambda_factor: float = 0.5,

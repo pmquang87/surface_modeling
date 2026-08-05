@@ -3,7 +3,10 @@ import numpy as np
 from typing import Dict, Any, Optional
 import trimesh
 
+import logging
 from src.core.halfedge_mesh import HalfEdgeMesh
+
+logger = logging.getLogger(__name__)
 
 def import_step(filepath: str) -> Dict[str, Any]:
     """Import a STEP file and return shape data.
@@ -25,8 +28,8 @@ def import_step(filepath: str) -> Dict[str, Any]:
     }
     
     if not os.path.exists(filepath):
-        print(f"File not found: {filepath}")
-        return result
+        logger.error(f"File not found: {filepath}")
+        raise FileNotFoundError(f"File not found: {filepath}")
 
     # Try OCP (support both 'OCP.Module' and cadquery-style 'OCP.OCP.Module')
     try:
@@ -51,7 +54,7 @@ def import_step(filepath: str) -> Dict[str, Any]:
         reader = STEPControl_Reader()
         status = reader.ReadFile(filepath)
         if status != 1:
-            print("Error reading STEP file with OCP.")
+            logger.error("Error reading STEP file with OCP.")
             return result
         
         reader.TransferRoots()
@@ -92,11 +95,11 @@ def import_step(filepath: str) -> Dict[str, Any]:
         result['faces'] = faces
         if len(vertices) > 0:
             result['mesh'] = HalfEdgeMesh.from_arrays(result['vertices'], result['faces'])
-        print(f"STEP loaded via OCP: {len(vertices)} vertices, {len(faces)} faces")
+        logger.info(f"STEP loaded via OCP: {len(vertices)} vertices, {len(faces)} faces")
         return result
         
     except ImportError:
-        print("OCP not available. Trying cadquery...")
+        logger.info("OCP not available. Trying cadquery...")
         
     # Try cadquery
     try:
@@ -118,9 +121,9 @@ def import_step(filepath: str) -> Dict[str, Any]:
         return result
         
     except ImportError:
-        print("CadQuery not available. Falling back to simple warning.")
+        logger.warning("CadQuery not available. Falling back to simple warning.")
         
-    print("No OCP or CadQuery installed. Cannot parse STEP B-Rep properly.")
+    logger.error("No OCP or CadQuery installed. Cannot parse STEP B-Rep properly.")
     return result
 
 
@@ -132,8 +135,8 @@ def import_stl(filepath: str) -> 'HalfEdgeMesh':
             mesh = mesh.dump(concatenate=True)
         return HalfEdgeMesh.from_trimesh(mesh)
     except Exception as e:
-        print(f"Error loading STL: {e}")
-        return HalfEdgeMesh()
+        logger.error(f"Error loading STL: {e}")
+        raise FileNotFoundError(f"Error loading STL: {e}") from e
 
 
 def import_obj(filepath: str) -> 'HalfEdgeMesh':
@@ -144,5 +147,5 @@ def import_obj(filepath: str) -> 'HalfEdgeMesh':
             mesh = mesh.dump(concatenate=True)
         return HalfEdgeMesh.from_trimesh(mesh)
     except Exception as e:
-        print(f"Error loading OBJ: {e}")
-        return HalfEdgeMesh()
+        logger.error(f"Error loading OBJ: {e}")
+        raise FileNotFoundError(f"Error loading OBJ: {e}") from e

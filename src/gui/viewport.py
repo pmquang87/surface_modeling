@@ -47,12 +47,24 @@ class MeshViewport(QWidget):
 
     def _on_cell_picked(self, cell):
         if not self.current_mesh: return
-        # A cell in pv.PolyData corresponds to a face
-        # We need the index of the face
-        pass
+        if hasattr(cell, 'cell_data') and "vtkOriginalCellIds" in cell.cell_data:
+            original_ids = cell.cell_data["vtkOriginalCellIds"]
+            if len(original_ids) > 0:
+                face_id = original_ids[0]
+                self.face_selected.emit(face_id)
+                self.selection_changed.emit([face_id])
+                self.highlight_selection([face_id], 'face')
 
     def _on_point_picked(self, point):
-        pass
+        if not self.current_mesh: return
+        # point is [x, y, z] coordinate. Find nearest vertex.
+        verts = np.array(self.current_mesh.vertices)
+        if len(verts) == 0: return
+        dists = np.linalg.norm(verts - point, axis=1)
+        vert_id = int(np.argmin(dists))
+        self.vertex_selected.emit(vert_id)
+        self.selection_changed.emit([vert_id])
+        self.highlight_selection([vert_id], 'vertex')
 
     def set_mesh(self, mesh, name: str = 'default'):
         self.update_mesh(mesh, name)
@@ -110,10 +122,11 @@ class MeshViewport(QWidget):
             pass
         
         if mode == 'face':
-            self.plotter.enable_cell_picking(callback=self._on_cell_picked, show_message=False)
+            self.plotter.enable_cell_picking(callback=self._on_cell_picked, show_message=False, through=False)
         elif mode == 'vertex':
             self.plotter.enable_point_picking(callback=self._on_point_picked, show_message=False)
         # mode == 'none' or 'edge': picking stays disabled
+        self.highlight_selection([], mode)
 
     def highlight_selection(self, indices: list, element_type: str):
         self._selected_indices = indices
@@ -135,8 +148,9 @@ class MeshViewport(QWidget):
             self.selection_actors.append(actor)
             
         elif element_type == 'face':
-            # Extract faces
-            pass
+            extracted = pv_mesh.extract_cells(indices)
+            actor = self.plotter.add_mesh(extracted, color='red', show_edges=True, edge_color='black', pickable=False)
+            self.selection_actors.append(actor)
             
         self.plotter.update()
 
