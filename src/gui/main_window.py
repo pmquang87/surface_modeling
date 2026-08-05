@@ -506,6 +506,11 @@ class PowerSurfacingMainWindow(QMainWindow):
                     result = converter.convert(self.current_mesh)
                     patch_count = len(result.get('patches', []))
                     self.log(f"NURBS conversion complete — {patch_count} patches generated")
+                    if patch_count == 0:
+                        QMessageBox.warning(self, "No Patches Generated", 
+                            "0 patches were generated because your mesh contains no quad (4-sided) faces.\n\n"
+                            "NURBS conversion only works on quad faces. If you imported an STL, it only contains triangles. "
+                            "Please run 'Reverse Engineering -> Quad Wrap' first to convert your mesh into a quad-dominant Sub-D cage.")
                     if result.get('mesh'):
                         self.current_mesh = result['mesh']
                         self.viewport.update_mesh(self.current_mesh)
