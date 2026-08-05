@@ -12,16 +12,16 @@ class QuadWrapper:
     """
     
     def __init__(self, target_face_count: int = 500, 
-                 alignment_strength: float = 0.7,
+                 smoothing_weight: float = 0.6,
                  feature_angle: float = 30.0):
         """
         Args:
             target_face_count: approximate number of quads in output
-            alignment_strength: how strongly to align quads to curvature (0-1)
+            smoothing_weight: laplacian smoothing weight (0.0 = sharp, 0.6 = smooth)
             feature_angle: dihedral angle threshold for sharp feature detection
         """
         self.target_face_count = target_face_count
-        self.alignment_strength = alignment_strength
+        self.smoothing_weight = smoothing_weight
         self.feature_angle = feature_angle
         
     def wrap(self, reference_mesh: HalfEdgeMesh) -> HalfEdgeMesh:
@@ -59,7 +59,7 @@ class QuadWrapper:
             
         # 4. Shrink wrap onto the reference mesh
         from src.reverse_engineering.shrink_wrap import ShrinkWrapper
-        wrapper = ShrinkWrapper(iterations=10, smooth_weight=0.6, projection_mode='closest_point')
+        wrapper = ShrinkWrapper(iterations=10, smooth_weight=self.smoothing_weight, projection_mode='closest_point')
         quad_mesh = wrapper.wrap(base_cage, reference_mesh)
         
         return quad_mesh

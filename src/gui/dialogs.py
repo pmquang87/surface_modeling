@@ -76,10 +76,11 @@ class QuadWrapDialog(QDialog):
         self.target_count.setValue(2000)
         self.form.addRow("Target Face Count:", self.target_count)
         
-        self.align_strength = QDoubleSpinBox()
-        self.align_strength.setRange(0.0, 1.0)
-        self.align_strength.setValue(0.5)
-        self.form.addRow("Alignment Strength:", self.align_strength)
+        self.smoothing_weight = QDoubleSpinBox()
+        self.smoothing_weight.setRange(0.0, 1.0)
+        self.smoothing_weight.setSingleStep(0.1)
+        self.smoothing_weight.setValue(0.6) # Default 0.6 is very smooth, 0.1 preserves geometry
+        self.form.addRow("Smoothing Weight (0=sharp, 1=blob):", self.smoothing_weight)
         
         self.layout.addLayout(self.form)
         

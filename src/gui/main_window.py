@@ -530,9 +530,10 @@ class PowerSurfacingMainWindow(QMainWindow):
             if QuadWrapper:
                 try:
                     target_count = dlg.target_count.value()
-                    self.log(f"Running Quad Wrap (target={target_count} faces)...")
+                    smooth_weight = dlg.smoothing_weight.value()
+                    self.log(f"Running Quad Wrap (target={target_count} faces, smooth={smooth_weight})...")
                     QApplication.processEvents()
-                    wrapper = QuadWrapper(target_face_count=target_count)
+                    wrapper = QuadWrapper(target_face_count=target_count, smoothing_weight=smooth_weight)
                     result = wrapper.wrap(self.current_mesh)
                     v = len(result.vertices)
                     f = len(result.faces)
