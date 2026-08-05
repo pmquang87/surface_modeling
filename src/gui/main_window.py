@@ -19,6 +19,13 @@ except ImportError:
     FeatureTree = None
 
 try:
+    from src.io.importers import import_stl, import_obj, import_step
+except ImportError:
+    import_stl = None
+    import_obj = None
+    import_step = None
+
+try:
     import src.subd.primitives as primitives
     import src.subd.catmull_clark as catmull_clark
 except ImportError:
@@ -26,11 +33,11 @@ except ImportError:
     catmull_clark = None
 
 class PowerSurfacingMainWindow(QMainWindow):
-    """Main application window for Python Power Surfacing."""
+    """Main application window for Python Surfacing."""
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Python Power Surfacing")
+        self.setWindowTitle("Python Surfacing")
         self.resize(1200, 800)
         
         self.current_mesh = None
@@ -210,10 +217,67 @@ class PowerSurfacingMainWindow(QMainWindow):
         self.status_bar.showMessage("New mesh created.")
 
     def on_open(self):
-        filepath, _ = QFileDialog.getOpenFileName(self, "Open Mesh", "", "Mesh Files (*.obj *.stl *.step)")
-        if filepath:
-            self.status_bar.showMessage(f"Opened {os.path.basename(filepath)}")
-            # Logic to load mesh using importers
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Open Mesh", "",
+            "All Supported (*.stl *.obj *.stp *.step);;STL Files (*.stl);;OBJ Files (*.obj);;STEP Files (*.stp *.step);;All Files (*)"
+        )
+        if not filepath:
+            return
+
+        ext = os.path.splitext(filepath)[1].lower()
+        self.status_bar.showMessage(f"Loading {os.path.basename(filepath)}...")
+        QApplication.processEvents()  # update UI before heavy I/O
+
+        try:
+            mesh = None
+            if ext == '.stl':
+                if import_stl:
+                    mesh = import_stl(filepath)
+                else:
+                    QMessageBox.warning(self, "Error", "STL importer not available.")
+                    return
+            elif ext == '.obj':
+                if import_obj:
+                    mesh = import_obj(filepath)
+                else:
+                    QMessageBox.warning(self, "Error", "OBJ importer not available.")
+                    return
+            elif ext in ('.stp', '.step'):
+                if import_step:
+                    result = import_step(filepath)
+                    mesh = result.get('mesh')
+                    if mesh is None or len(mesh.vertices) == 0:
+                        QMessageBox.warning(
+                            self, "STEP Import",
+                            "STEP import requires OpenCascade (OCP or cadquery).\n"
+                            "Install with: pip install cadquery\n\n"
+                            "Alternatively, export to STL and import that."
+                        )
+                        self.status_bar.showMessage("STEP import failed — OCP/cadquery not installed.")
+                        return
+                else:
+                    QMessageBox.warning(self, "Error", "STEP importer not available.")
+                    return
+            else:
+                QMessageBox.warning(self, "Error", f"Unsupported file format: {ext}")
+                return
+
+            if mesh and len(mesh.vertices) > 0:
+                self.current_mesh = mesh
+                self.viewport.set_mesh(mesh)
+                self.properties_panel.set_mesh_info(mesh)
+                vcount = len(mesh.vertices)
+                fcount = len(mesh.faces)
+                self.status_bar.showMessage(
+                    f"Loaded {os.path.basename(filepath)} — {vcount:,} vertices, {fcount:,} faces"
+                )
+            else:
+                QMessageBox.warning(self, "Error", "File loaded but mesh is empty.")
+                self.status_bar.showMessage("Load failed — empty mesh.")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", f"Failed to load file:\n{e}")
+            self.status_bar.showMessage(f"Error loading file: {e}")
 
     def on_export(self):
         dlg = ExportDialog(self)

@@ -1,4 +1,4 @@
-"""Power Surfacing — Python Edition
+"""Python Surfacing — Desktop Application
 Entry point for the desktop application.
 """
 import sys

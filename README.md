@@ -1,4 +1,4 @@
-# Python Power Surfacing
+# Python Surfacing
 
 <p align="center">
   <strong>Subdivision Surface Modeling &amp; Reverse Engineering Tool</strong><br>
@@ -16,7 +16,7 @@
 
 ## Overview
 
-**Python Power Surfacing** is a desktop application for subdivision surface modeling and reverse engineering, inspired by [nPower Software's Power Surfacing](https://www.npowersoftware.com/) for SOLIDWORKS. It bridges the gap between **fluid organic design** (Sub-D modeling) and **precise CAD engineering** (NURBS/B-Rep), enabling users to:
+**Python Surfacing** is a desktop application for subdivision surface modeling and reverse engineering, inspired by [nPower Software's Power Surfacing](https://www.npowersoftware.com/) for SOLIDWORKS. It bridges the gap between **fluid organic design** (Sub-D modeling) and **precise CAD engineering** (NURBS/B-Rep), enabling users to:
 
 - 🎨 **Create** organic shapes using Catmull-Clark subdivision surfaces
 - 🔄 **Convert** Sub-D meshes to NURBS B-spline patches
@@ -93,7 +93,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/python-power-surfacing.git
+git clone https://github.com/pmquang87/python-surfacing.git
 cd python-power-surfacing
 
 # Install dependencies
