@@ -11,16 +11,22 @@ from src.gui.dialogs import (PrimitiveDialog, SubdivideDialog, QuadWrapDialog,
                              ShrinkWrapDialog, ShellThickenDialog, 
                              ConvertNURBSDialog, ExportDialog)
 
+import traceback
+
 try:
     from src.core.halfedge_mesh import HalfEdgeMesh
     from src.core.feature_tree import FeatureTree
-except ImportError:
+except Exception as e:
+    print(f"[WARNING] Could not import core modules: {e}")
+    traceback.print_exc()
     HalfEdgeMesh = None
     FeatureTree = None
 
 try:
     from src.io.importers import import_stl, import_obj, import_step
-except ImportError:
+except Exception as e:
+    print(f"[WARNING] Could not import I/O modules: {e}")
+    traceback.print_exc()
     import_stl = None
     import_obj = None
     import_step = None
@@ -28,7 +34,9 @@ except ImportError:
 try:
     import src.subd.primitives as primitives
     import src.subd.catmull_clark as catmull_clark
-except ImportError:
+except Exception as e:
+    print(f"[WARNING] Could not import SubD modules: {e}")
+    traceback.print_exc()
     primitives = None
     catmull_clark = None
 
@@ -47,7 +55,7 @@ class PowerSurfacingMainWindow(QMainWindow):
             self.feature_tree = None
             
         self._setup_ui()
-        self._setup_dark_theme()
+        self._setup_light_theme()
         
     def _setup_ui(self):
         # Main Layout
@@ -91,21 +99,26 @@ class PowerSurfacingMainWindow(QMainWindow):
         self._create_menus()
         self._create_toolbar()
 
-    def _setup_dark_theme(self):
+    def _setup_light_theme(self):
         palette = QPalette()
-        palette.setColor(QPalette.Window, QColor(43, 43, 43))
-        palette.setColor(QPalette.WindowText, Qt.white)
-        palette.setColor(QPalette.Base, QColor(25, 25, 25))
-        palette.setColor(QPalette.AlternateBase, QColor(43, 43, 43))
-        palette.setColor(QPalette.ToolTipBase, Qt.white)
-        palette.setColor(QPalette.ToolTipText, Qt.white)
-        palette.setColor(QPalette.Text, Qt.white)
-        palette.setColor(QPalette.Button, QColor(43, 43, 43))
-        palette.setColor(QPalette.ButtonText, Qt.white)
-        palette.setColor(QPalette.BrightText, Qt.red)
-        palette.setColor(QPalette.Link, QColor(42, 130, 218))
-        palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
-        palette.setColor(QPalette.HighlightedText, Qt.black)
+        palette.setColor(QPalette.Window, QColor(240, 240, 240))
+        palette.setColor(QPalette.WindowText, QColor(30, 30, 30))
+        palette.setColor(QPalette.Base, QColor(255, 255, 255))
+        palette.setColor(QPalette.AlternateBase, QColor(245, 245, 245))
+        palette.setColor(QPalette.ToolTipBase, QColor(255, 255, 220))
+        palette.setColor(QPalette.ToolTipText, QColor(30, 30, 30))
+        palette.setColor(QPalette.Text, QColor(30, 30, 30))
+        palette.setColor(QPalette.Button, QColor(230, 230, 230))
+        palette.setColor(QPalette.ButtonText, QColor(30, 30, 30))
+        palette.setColor(QPalette.BrightText, QColor(200, 30, 30))
+        palette.setColor(QPalette.Link, QColor(0, 102, 204))
+        palette.setColor(QPalette.Highlight, QColor(0, 120, 215))
+        palette.setColor(QPalette.HighlightedText, Qt.white)
+        palette.setColor(QPalette.Light, QColor(255, 255, 255))
+        palette.setColor(QPalette.Midlight, QColor(227, 227, 227))
+        palette.setColor(QPalette.Mid, QColor(160, 160, 160))
+        palette.setColor(QPalette.Dark, QColor(130, 130, 130))
+        palette.setColor(QPalette.Shadow, QColor(105, 105, 105))
         
         app = QApplication.instance()
         if app:

@@ -27,7 +27,7 @@ class MeshViewport(QWidget):
         self.layout.addWidget(self.plotter.interactor)
         
         # Set background
-        self.plotter.set_background(color="#2b2b2b", top="#1e1e1e")
+        self.plotter.set_background(color="#f0f0f0", top="#e0e5ea")
         self.plotter.add_axes()
         # Adding a simple grid
         self.plotter.show_grid()
@@ -76,9 +76,9 @@ class MeshViewport(QWidget):
         self.mesh_actor = self.plotter.add_mesh(
             pv_mesh, 
             name=name,
-            color="#a0a0a0", 
+            color="#6699bb", 
             show_edges=show_edges,
-            edge_color="#404040",
+            edge_color="#2a2a2a",
             style=style,
             smooth_shading=True,
             pickable=True
