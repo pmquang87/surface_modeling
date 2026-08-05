@@ -1,0 +1,207 @@
+import numpy as np
+from src.core.halfedge_mesh import HalfEdgeMesh
+
+def extrude_faces(mesh: HalfEdgeMesh, face_indices: list[int], distance: float = 0.1, direction: np.ndarray = None) -> HalfEdgeMesh:
+    """Extrude selected faces along their normals or a given direction."""
+    verts = [v.position.copy() for v in mesh.vertices]
+    faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
+    
+    mesh.compute_face_normals()
+    
+    for f_idx in face_indices:
+        if f_idx >= len(mesh.faces): continue
+        f = mesh.faces[f_idx]
+        f_verts = [v.index for v in mesh.get_face_vertices(f)]
+        
+        extrude_dir = direction if direction is not None else f.normal
+        extrude_dir = np.array(extrude_dir, dtype=np.float64)
+        extrude_dir /= np.linalg.norm(extrude_dir)
+        
+        new_f_verts = []
+        for v_idx in f_verts:
+            new_pos = verts[v_idx] + extrude_dir * distance
+            verts.append(new_pos)
+            new_f_verts.append(len(verts) - 1)
+            
+        faces[f_idx] = new_f_verts
+        
+        n = len(f_verts)
+        for i in range(n):
+            v1 = f_verts[i]
+            v2 = f_verts[(i + 1) % n]
+            nv1 = new_f_verts[i]
+            nv2 = new_f_verts[(i + 1) % n]
+            faces.append([v1, v2, nv2, nv1])
+            
+    return HalfEdgeMesh.from_arrays(verts, faces)
+
+
+def extrude_edges(mesh: HalfEdgeMesh, edge_indices: list[int], distance: float = 0.1, direction: np.ndarray = None) -> HalfEdgeMesh:
+    """Extrude edges, creating new faces."""
+    verts = [v.position.copy() for v in mesh.vertices]
+    faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
+    
+    mesh.compute_vertex_normals()
+    
+    for e_idx in edge_indices:
+        if e_idx >= len(mesh.edges): continue
+        e = mesh.edges[e_idx]
+        v1_idx = e.half_edge.prev.vertex.index
+        v2_idx = e.half_edge.vertex.index
+        
+        v1_norm = mesh.vertices[v1_idx].normal
+        v2_norm = mesh.vertices[v2_idx].normal
+        
+        dir1 = direction if direction is not None else v1_norm
+        dir2 = direction if direction is not None else v2_norm
+        
+        nv1 = verts[v1_idx] + np.array(dir1) * distance
+        nv2 = verts[v2_idx] + np.array(dir2) * distance
+        
+        verts.append(nv1)
+        nv1_idx = len(verts) - 1
+        verts.append(nv2)
+        nv2_idx = len(verts) - 1
+        
+        faces.append([v1_idx, v2_idx, nv2_idx, nv1_idx])
+        
+    return HalfEdgeMesh.from_arrays(verts, faces)
+
+
+def inset_faces(mesh: HalfEdgeMesh, face_indices: list[int], inset_amount: float = 0.1) -> HalfEdgeMesh:
+    """Create an inset ring within each selected face."""
+    verts = [v.position.copy() for v in mesh.vertices]
+    faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
+    
+    for f_idx in face_indices:
+        if f_idx >= len(mesh.faces): continue
+        f = mesh.faces[f_idx]
+        f_verts = [v.index for v in mesh.get_face_vertices(f)]
+        
+        centroid = np.mean([verts[v] for v in f_verts], axis=0)
+        
+        new_f_verts = []
+        for v_idx in f_verts:
+            dir_to_center = centroid - verts[v_idx]
+            length = np.linalg.norm(dir_to_center)
+            if length > 0:
+                dir_to_center /= length
+            
+            actual_inset = min(inset_amount, length)
+            new_pos = verts[v_idx] + dir_to_center * actual_inset
+            verts.append(new_pos)
+            new_f_verts.append(len(verts) - 1)
+            
+        faces[f_idx] = new_f_verts
+        
+        n = len(f_verts)
+        for i in range(n):
+            v1 = f_verts[i]
+            v2 = f_verts[(i + 1) % n]
+            nv1 = new_f_verts[i]
+            nv2 = new_f_verts[(i + 1) % n]
+            faces.append([v1, v2, nv2, nv1])
+            
+    return HalfEdgeMesh.from_arrays(verts, faces)
+
+
+def insert_edge_loop(mesh: HalfEdgeMesh, edge_index: int, position: float = 0.5) -> HalfEdgeMesh:
+    """Insert a new edge loop cutting through a ring of connected quads."""
+    if edge_index >= len(mesh.edges):
+        return mesh.copy()
+        
+    loop = mesh.get_edge_loop(mesh.edges[edge_index])
+    
+    verts = [v.position.copy() for v in mesh.vertices]
+    faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
+    
+    # Simple placeholder: a full robust edge loop insertion requires replacing faces along the loop
+    # In a full implementation, we split each edge in the loop, then split the connecting faces
+    return mesh.copy()
+
+
+def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: list[int]) -> HalfEdgeMesh:
+    """Delete both face groups and connect their boundary edges with new quad faces."""
+    verts = [v.position.copy() for v in mesh.vertices]
+    faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
+    
+    to_delete = set(face_indices_a + face_indices_b)
+    new_faces = [f for i, f in enumerate(faces) if i not in to_delete]
+    
+    # Placeholder: connect boundaries
+    # Real implementation would trace boundary loops of A and B, align them, and bridge
+    return HalfEdgeMesh.from_arrays(verts, new_faces)
+
+
+def mirror_mesh(mesh: HalfEdgeMesh, axis: str = 'x', merge_distance: float = 0.001) -> HalfEdgeMesh:
+    """Mirror the mesh across the given axis plane, merging vertices within tolerance."""
+    verts = [v.position.copy() for v in mesh.vertices]
+    faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
+    
+    mirror_verts = []
+    for p in verts:
+        mp = p.copy()
+        if axis == 'x': mp[0] *= -1
+        elif axis == 'y': mp[1] *= -1
+        elif axis == 'z': mp[2] *= -1
+        mirror_verts.append(mp)
+        
+    mirror_faces = [f[::-1] for f in faces]
+    
+    all_verts = list(verts)
+    new_faces = list(faces)
+    
+    n_orig = len(verts)
+    remap = {}
+    
+    for i, mv in enumerate(mirror_verts):
+        dists = np.linalg.norm(np.array(verts) - mv, axis=1)
+        if len(dists) > 0:
+            min_idx = np.argmin(dists)
+            if dists[min_idx] < merge_distance:
+                remap[i + n_orig] = min_idx
+                continue
+                
+        remap[i + n_orig] = len(all_verts)
+        all_verts.append(mv)
+            
+    for f in mirror_faces:
+        new_f = [remap[idx + n_orig] for idx in f]
+        new_faces.append(new_f)
+        
+    return HalfEdgeMesh.from_arrays(all_verts, new_faces)
+
+
+def soft_selection_move(mesh: HalfEdgeMesh, vertex_index: int, offset: np.ndarray, radius: float, falloff: str = 'smooth') -> HalfEdgeMesh:
+    """Move a vertex by offset, with surrounding vertices influenced by distance-based falloff."""
+    new_mesh = mesh.copy()
+    if vertex_index >= len(new_mesh.vertices):
+        return new_mesh
+        
+    center_pos = new_mesh.vertices[vertex_index].position.copy()
+    offset = np.array(offset, dtype=np.float64)
+    
+    for v in new_mesh.vertices:
+        dist = np.linalg.norm(v.position - center_pos)
+        if dist < radius:
+            t = dist / radius
+            if falloff == 'linear':
+                weight = 1.0 - t
+            elif falloff == 'smooth':
+                weight = 0.5 * (1.0 + np.cos(np.pi * t))
+            elif falloff == 'sharp':
+                weight = (1.0 - t) ** 2
+            else:
+                weight = 1.0 - t
+            v.position += offset * weight
+            
+    return new_mesh
+
+
+def set_edge_weight(mesh: HalfEdgeMesh, edge_indices: list[int], weight: float) -> HalfEdgeMesh:
+    """Set crease weight on selected edges."""
+    new_mesh = mesh.copy()
+    for e_idx in edge_indices:
+        if e_idx < len(new_mesh.edges):
+            new_mesh.edges[e_idx].crease_weight = weight
+    return new_mesh

@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test / Coverage
+.pytest_cache/
+htmlcov/
+.coverage
+.tox/
+
+# Distribution
+*.whl
+*.tar.gz
+
+# CAD data (large binary files — don't commit to git)
+*.SLDPRT
+*.SLDASM
+*.stp
+*.STP
+*.STEP
+*.step
+*.stl
+*.STL
+*.blend
+*.blend1
+
+# Temporary
+*.log
+*.tmp
