@@ -28,14 +28,25 @@ def import_step(filepath: str) -> Dict[str, Any]:
         print(f"File not found: {filepath}")
         return result
 
-    # Try OCP
+    # Try OCP (support both 'OCP.Module' and cadquery-style 'OCP.OCP.Module')
     try:
-        from OCP.STEPControl import STEPControl_Reader
-        from OCP.BRepMesh import BRepMesh_IncrementalMesh
-        from OCP.TopExp import TopExp_Explorer
-        from OCP.TopAbs import TopAbs_FACE
-        from OCP.BRep import BRep_Tool
-        from OCP.TopLoc import TopLoc_Location
+        try:
+            from OCP.STEPControl import STEPControl_Reader
+            from OCP.BRepMesh import BRepMesh_IncrementalMesh
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopAbs import TopAbs_FACE
+            from OCP.BRep import BRep_Tool
+            from OCP.TopLoc import TopLoc_Location
+            from OCP.TopoDS import TopoDS
+        except ImportError:
+            # cadquery-ocp nests under OCP.OCP.*
+            from OCP.OCP.STEPControl import STEPControl_Reader
+            from OCP.OCP.BRepMesh import BRepMesh_IncrementalMesh
+            from OCP.OCP.TopExp import TopExp_Explorer
+            from OCP.OCP.TopAbs import TopAbs_FACE
+            from OCP.OCP.BRep import BRep_Tool
+            from OCP.OCP.TopLoc import TopLoc_Location
+            from OCP.OCP.TopoDS import TopoDS
         
         reader = STEPControl_Reader()
         status = reader.ReadFile(filepath)
@@ -56,7 +67,8 @@ def import_step(filepath: str) -> Dict[str, Any]:
         vertex_offset = 0
         
         while explorer.More():
-            face = explorer.Current()
+            # Downcast from TopoDS_Shape to TopoDS_Face
+            face = TopoDS.Face_s(explorer.Current())
             loc = TopLoc_Location()
             poly = BRep_Tool.Triangulation_s(face, loc)
             
@@ -76,9 +88,11 @@ def import_step(filepath: str) -> Dict[str, Any]:
             
             explorer.Next()
             
-        result['vertices'] = np.array(vertices, dtype=np.float64)
+        result['vertices'] = np.array(vertices, dtype=np.float64) if vertices else np.array([])
         result['faces'] = faces
-        result['mesh'] = HalfEdgeMesh.from_arrays(result['vertices'], result['faces'])
+        if len(vertices) > 0:
+            result['mesh'] = HalfEdgeMesh.from_arrays(result['vertices'], result['faces'])
+        print(f"STEP loaded via OCP: {len(vertices)} vertices, {len(faces)} faces")
         return result
         
     except ImportError:
