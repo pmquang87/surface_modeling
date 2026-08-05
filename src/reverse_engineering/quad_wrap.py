@@ -51,8 +51,7 @@ class QuadWrapper:
         current_faces = 6
         target = max(6, self.target_face_count)
         levels = math.ceil(math.log(target / current_faces) / math.log(4))
-        # Cap levels to prevent memory explosion, but allow up to 6 (24,576 faces)
-        levels = min(max(0, levels), 6)
+        levels = max(0, levels) # Ensure non-negative, but no upper limit per user request
         
         if levels > 0:
             base_cage = subdivide(base_cage, levels)
