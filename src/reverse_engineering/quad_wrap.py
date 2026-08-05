@@ -39,22 +39,21 @@ class QuadWrapper:
         tri_mesh = reference_mesh.to_trimesh()
         bounds = tri_mesh.bounds
         
-        # 1-2. Generate base bounding box cage
-        # Add a slight padding so it completely encloses the mesh before shrink wrap
-        padding = (bounds[1] - bounds[0]) * 0.05
-        padded_bounds = np.array([bounds[0] - padding, bounds[1] + padding])
-        base_cage = self._generate_base_cage(padded_bounds, 0)
-        
-        # 3. Subdivide to reach target face count
         import math
         from src.subd.catmull_clark import subdivide
-        current_faces = 6
-        target = max(6, self.target_face_count)
-        levels = math.ceil(math.log(target / current_faces) / math.log(4))
-        levels = max(0, levels) # Ensure non-negative, but no upper limit per user request
+        from src.reverse_engineering.mesh_tools import decimate_mesh
+
+        # 1-2. Generate topology-aware base cage by decimating the reference mesh
+        # We want the final subdivided quad mesh to roughly match target_face_count.
+        # The first subdivision of a triangle mesh converts each triangle into 3 quads.
+        # So we need to decimate the STL down to (target_face_count / 3) triangles.
+        target_triangles = max(4, int(self.target_face_count / 3))
         
-        if levels > 0:
-            base_cage = subdivide(base_cage, levels)
+        base_cage = decimate_mesh(reference_mesh, target_faces=target_triangles)
+        
+        # 3. Subdivide once to convert all triangles to quads
+        if len(base_cage.faces) > 0:
+            base_cage = subdivide(base_cage, 1)
             
         # 4. Shrink wrap onto the reference mesh
         from src.reverse_engineering.shrink_wrap import ShrinkWrapper
