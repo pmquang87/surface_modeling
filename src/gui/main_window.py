@@ -1,9 +1,12 @@
 import os
+import sys
+import io
+import datetime
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QSplitter, QMenuBar, QMenu, QToolBar, QStatusBar,
-                               QFileDialog, QMessageBox, QApplication)
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QPalette, QColor, QKeySequence, QIcon
+                               QFileDialog, QMessageBox, QApplication, QTextEdit)
+from PySide6.QtCore import Qt, QObject, Signal
+from PySide6.QtGui import QAction, QPalette, QColor, QKeySequence, QIcon, QTextCursor
 
 from src.gui.viewport import MeshViewport
 from src.gui.panels import FeatureTreePanel, PropertiesPanel
@@ -24,12 +27,15 @@ except Exception as e:
 
 try:
     from src.io.importers import import_stl, import_obj, import_step
+    from src.io.exporters import export_stl, export_obj
 except Exception as e:
     print(f"[WARNING] Could not import I/O modules: {e}")
     traceback.print_exc()
     import_stl = None
     import_obj = None
     import_step = None
+    export_stl = None
+    export_obj = None
 
 try:
     import src.subd.primitives as primitives
@@ -39,6 +45,54 @@ except Exception as e:
     traceback.print_exc()
     primitives = None
     catmull_clark = None
+
+try:
+    from src.reverse_engineering.quad_wrap import QuadWrapper
+    from src.reverse_engineering.shrink_wrap import ShrinkWrapper
+    from src.reverse_engineering.mesh_tools import smooth_mesh, decimate_mesh, fill_holes
+except Exception as e:
+    print(f"[WARNING] Could not import RE modules: {e}")
+    traceback.print_exc()
+    QuadWrapper = None
+    ShrinkWrapper = None
+    smooth_mesh = None
+    decimate_mesh = None
+    fill_holes = None
+
+try:
+    from src.operations.shell_thicken import shell_solid, thicken_surface
+except Exception as e:
+    print(f"[WARNING] Could not import operations modules: {e}")
+    traceback.print_exc()
+    shell_solid = None
+    thicken_surface = None
+
+try:
+    from src.nurbs.converter import SubDToNURBSConverter
+except Exception as e:
+    print(f"[WARNING] Could not import NURBS converter: {e}")
+    traceback.print_exc()
+    SubDToNURBSConverter = None
+
+
+class LogStream(QObject):
+    """Redirects sys.stdout/stderr to a Qt signal for in-GUI display."""
+    message = Signal(str)
+
+    def __init__(self, original_stream=None):
+        super().__init__()
+        self.original = original_stream
+
+    def write(self, text):
+        if text.strip():
+            self.message.emit(text)
+        if self.original:
+            self.original.write(text)
+            self.original.flush()
+
+    def flush(self):
+        if self.original:
+            self.original.flush()
 
 class PowerSurfacingMainWindow(QMainWindow):
     """Main application window for Python Surfacing."""
@@ -64,9 +118,12 @@ class PowerSurfacingMainWindow(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Splitter for panels
+        # Vertical splitter: top = workspace, bottom = log panel
+        self.v_splitter = QSplitter(Qt.Vertical)
+        main_layout.addWidget(self.v_splitter)
+
+        # Horizontal splitter for panels
         self.splitter = QSplitter(Qt.Horizontal)
-        main_layout.addWidget(self.splitter)
         
         # Left Panel (Feature Tree)
         self.feature_panel = FeatureTreePanel()
@@ -79,7 +136,7 @@ class PowerSurfacingMainWindow(QMainWindow):
         self.properties_panel = PropertiesPanel()
         self.properties_panel.setMinimumWidth(250)
         
-        # Add to splitter
+        # Add to horizontal splitter
         self.splitter.addWidget(self.feature_panel)
         self.splitter.addWidget(self.viewport)
         self.splitter.addWidget(self.properties_panel)
@@ -88,7 +145,31 @@ class PowerSurfacingMainWindow(QMainWindow):
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setStretchFactor(2, 0)
+
+        # Log Panel (bottom)
+        self.log_panel = QTextEdit()
+        self.log_panel.setReadOnly(True)
+        self.log_panel.setMaximumHeight(150)
+        self.log_panel.setStyleSheet(
+            "QTextEdit { font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; "
+            "background-color: #ffffff; color: #1e1e1e; border-top: 1px solid #c0c0c0; }"
+        )
+        self.log_panel.setPlaceholderText("Application log...")
+
+        # Add to vertical splitter
+        self.v_splitter.addWidget(self.splitter)
+        self.v_splitter.addWidget(self.log_panel)
+        self.v_splitter.setStretchFactor(0, 1)
+        self.v_splitter.setStretchFactor(1, 0)
         
+        # Redirect stdout/stderr to log panel
+        self._stdout_stream = LogStream(sys.stdout)
+        self._stderr_stream = LogStream(sys.stderr)
+        self._stdout_stream.message.connect(self._append_log)
+        self._stderr_stream.message.connect(lambda msg: self._append_log(msg, error=True))
+        sys.stdout = self._stdout_stream
+        sys.stderr = self._stderr_stream
+
         # Status Bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -98,6 +179,19 @@ class PowerSurfacingMainWindow(QMainWindow):
         self._create_actions()
         self._create_menus()
         self._create_toolbar()
+
+    def _append_log(self, text, error=False):
+        """Append a message to the in-GUI log panel."""
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        if error:
+            self.log_panel.append(f'<span style="color:#cc0000;">[{timestamp}] {text}</span>')
+        else:
+            self.log_panel.append(f'[{timestamp}] {text}')
+        self.log_panel.moveCursor(QTextCursor.End)
+
+    def log(self, message):
+        """Public method to log a message to the GUI log panel."""
+        print(message)  # goes through LogStream → _append_log
 
     def _setup_light_theme(self):
         palette = QPalette()
@@ -293,9 +387,30 @@ class PowerSurfacingMainWindow(QMainWindow):
             self.status_bar.showMessage(f"Error loading file: {e}")
 
     def on_export(self):
+        if not self.current_mesh:
+            QMessageBox.warning(self, "Export", "No mesh to export.")
+            return
         dlg = ExportDialog(self)
         if dlg.exec_():
-            self.status_bar.showMessage("Export triggered.")
+            fmt = dlg.format_combo.currentText().lower()
+            filepath, _ = QFileDialog.getSaveFileName(
+                self, "Export Mesh", "",
+                f"{fmt.upper()} Files (*.{fmt});;All Files (*)"
+            )
+            if not filepath:
+                return
+            try:
+                if fmt == 'stl' and export_stl:
+                    export_stl(self.current_mesh, filepath)
+                elif fmt == 'obj' and export_obj:
+                    export_obj(self.current_mesh, filepath)
+                else:
+                    self.log(f"Export format '{fmt}' not available.")
+                    return
+                self.log(f"Exported to {filepath}")
+                self.status_bar.showMessage(f"Exported to {os.path.basename(filepath)}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", str(e))
             
     def on_create_primitive(self):
         dlg = PrimitiveDialog(self)
@@ -304,18 +419,20 @@ class PowerSurfacingMainWindow(QMainWindow):
             if primitives and HalfEdgeMesh:
                 try:
                     ptype = params['type']
-                    # Using hypothetical API for primitives
-                    if ptype == 'box':
-                        self.current_mesh = primitives.create_box()
-                    elif ptype == 'cylinder':
-                        self.current_mesh = primitives.create_cylinder()
-                    elif ptype == 'plane':
-                        self.current_mesh = primitives.create_plane()
-                    else:
-                        self.current_mesh = primitives.create_box() # fallback
-                        
+                    create_fn = {
+                        'box': primitives.create_box,
+                        'cylinder': primitives.create_cylinder,
+                        'torus': primitives.create_torus,
+                        'cone': primitives.create_cone,
+                        'plane': primitives.create_plane,
+                        'sphere': primitives.create_sphere,
+                    }.get(ptype, primitives.create_box)
+                    self.current_mesh = create_fn()
                     self.viewport.set_mesh(self.current_mesh)
                     self.properties_panel.set_mesh_info(self.current_mesh)
+                    v = len(self.current_mesh.vertices)
+                    f = len(self.current_mesh.faces)
+                    self.log(f"Created {ptype} primitive — {v} vertices, {f} faces")
                     self.status_bar.showMessage(f"Created {ptype} primitive.")
                 except Exception as e:
                     QMessageBox.warning(self, "Error", f"Could not create primitive: {e}")
@@ -323,32 +440,129 @@ class PowerSurfacingMainWindow(QMainWindow):
                 QMessageBox.warning(self, "Error", "Backend modules (primitives) not available.")
 
     def on_subdivide(self):
-        if not self.current_mesh: return
+        if not self.current_mesh:
+            QMessageBox.information(self, "Subdivide", "No mesh loaded. Load or create a mesh first.")
+            return
         dlg = SubdivideDialog(self)
         if dlg.exec_():
             if catmull_clark:
                 try:
                     params = dlg.get_params()
+                    v_before = len(self.current_mesh.vertices)
+                    f_before = len(self.current_mesh.faces)
+                    self.log(f"Subdividing {params['levels']} level(s)... ({v_before} verts, {f_before} faces)")
+                    QApplication.processEvents()
                     self.current_mesh = catmull_clark.subdivide(self.current_mesh, params['levels'])
+                    v_after = len(self.current_mesh.vertices)
+                    f_after = len(self.current_mesh.faces)
                     self.viewport.update_mesh(self.current_mesh)
                     self.properties_panel.set_mesh_info(self.current_mesh)
+                    self.log(f"Subdivision complete — {v_after} vertices, {f_after} faces")
                 except Exception as e:
                     QMessageBox.warning(self, "Error", f"Subdivision failed: {e}")
+                    self.log(f"ERROR: Subdivision failed: {e}")
             else:
                 QMessageBox.warning(self, "Error", "Subdivision backend not available.")
 
     def on_shell(self):
+        if not self.current_mesh:
+            QMessageBox.information(self, "Shell/Thicken", "No mesh loaded.")
+            return
         dlg = ShellThickenDialog(self)
-        dlg.exec_()
+        if dlg.exec_():
+            thickness = dlg.thickness.value()
+            direction = dlg.direction.currentText().lower()
+            if shell_solid:
+                try:
+                    self.log(f"Running Shell/Thicken (thickness={thickness}, direction={direction})...")
+                    QApplication.processEvents()
+                    self.current_mesh = shell_solid(self.current_mesh, thickness=thickness, direction=direction)
+                    self.viewport.update_mesh(self.current_mesh)
+                    self.properties_panel.set_mesh_info(self.current_mesh)
+                    v = len(self.current_mesh.vertices)
+                    f = len(self.current_mesh.faces)
+                    self.log(f"Shell/Thicken complete — {v} vertices, {f} faces")
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Shell/Thicken failed: {e}")
+                    self.log(f"ERROR: Shell/Thicken failed: {e}")
+            else:
+                QMessageBox.warning(self, "Error", "Shell/Thicken backend not available.")
 
     def on_convert_nurbs(self):
+        if not self.current_mesh:
+            QMessageBox.information(self, "NURBS", "No mesh loaded.")
+            return
         dlg = ConvertNURBSDialog(self)
-        dlg.exec_()
+        if dlg.exec_():
+            if SubDToNURBSConverter:
+                try:
+                    continuity_map = {'G0 (Position)': 0, 'G1 (Tangent)': 1, 'G2 (Curvature)': 2}
+                    continuity = continuity_map.get(dlg.continuity.currentText(), 1)
+                    tolerance = dlg.tolerance.value()
+                    self.log(f"Converting to NURBS (continuity=G{continuity}, tol={tolerance})...")
+                    QApplication.processEvents()
+                    converter = SubDToNURBSConverter(continuity=continuity, tolerance=tolerance)
+                    result = converter.convert(self.current_mesh)
+                    patch_count = len(result.get('patches', []))
+                    self.log(f"NURBS conversion complete — {patch_count} patches generated")
+                    if result.get('mesh'):
+                        self.current_mesh = result['mesh']
+                        self.viewport.update_mesh(self.current_mesh)
+                        self.properties_panel.set_mesh_info(self.current_mesh)
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"NURBS conversion failed: {e}")
+                    self.log(f"ERROR: NURBS conversion failed: {e}")
+            else:
+                QMessageBox.warning(self, "Error", "NURBS converter not available.")
 
     def on_quad_wrap(self):
+        if not self.current_mesh:
+            QMessageBox.information(self, "Quad Wrap", "No mesh loaded.")
+            return
         dlg = QuadWrapDialog(self)
-        dlg.exec_()
+        if dlg.exec_():
+            if QuadWrapper:
+                try:
+                    target_count = dlg.target_count.value()
+                    self.log(f"Running Quad Wrap (target={target_count} faces)...")
+                    QApplication.processEvents()
+                    wrapper = QuadWrapper(target_face_count=target_count)
+                    result = wrapper.wrap(self.current_mesh)
+                    v = len(result.vertices)
+                    f = len(result.faces)
+                    self.current_mesh = result
+                    self.viewport.set_mesh(self.current_mesh)
+                    self.properties_panel.set_mesh_info(self.current_mesh)
+                    self.log(f"Quad Wrap complete — {v} vertices, {f} faces")
+                    self.status_bar.showMessage(f"Quad Wrap: {v} verts, {f} faces")
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Quad Wrap failed: {e}")
+                    self.log(f"ERROR: Quad Wrap failed: {e}")
+            else:
+                QMessageBox.warning(self, "Error", "Quad Wrap backend not available.")
 
     def on_shrink_wrap(self):
+        if not self.current_mesh:
+            QMessageBox.information(self, "Shrink Wrap", "No mesh loaded.")
+            return
         dlg = ShrinkWrapDialog(self)
-        dlg.exec_()
+        if dlg.exec_():
+            if ShrinkWrapper:
+                try:
+                    iterations = dlg.iterations.value()
+                    self.log(f"Running Shrink Wrap ({iterations} iterations)...")
+                    QApplication.processEvents()
+                    shrinker = ShrinkWrapper(iterations=iterations)
+                    result = shrinker.wrap(self.current_mesh, self.current_mesh)
+                    v = len(result.vertices)
+                    f = len(result.faces)
+                    self.current_mesh = result
+                    self.viewport.set_mesh(self.current_mesh)
+                    self.properties_panel.set_mesh_info(self.current_mesh)
+                    self.log(f"Shrink Wrap complete — {v} vertices, {f} faces")
+                    self.status_bar.showMessage(f"Shrink Wrap: {v} verts, {f} faces")
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Shrink Wrap failed: {e}")
+                    self.log(f"ERROR: Shrink Wrap failed: {e}")
+            else:
+                QMessageBox.warning(self, "Error", "Shrink Wrap backend not available.")
