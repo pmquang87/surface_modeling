@@ -231,6 +231,7 @@ class PowerSurfacingMainWindow(QMainWindow):
         
         self.act_save = QAction("Save", self)
         self.act_save.setShortcut("Ctrl+S")
+        self.act_save.triggered.connect(self.on_export)
         
         self.act_export = QAction("Export...", self)
         self.act_export.triggered.connect(self.on_export)
