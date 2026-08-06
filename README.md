@@ -154,6 +154,17 @@ python src/main.py
 └──────────────────────────────────────────────────────┘
 ```
 
+### Mouse Controls (SolidWorks Style)
+
+| Action | Control |
+|--------|---------|
+| **Select** | `Left-Click` (or drag for Box Select if active) |
+| **Rotate** | `Middle-Mouse Drag` |
+| **Pan** | `Ctrl` + `Middle-Mouse Drag` |
+| **Zoom** | `Shift` + `Middle-Mouse Drag` (or Scroll Wheel) |
+| **Set Rotation Center** | `Alt` + `Middle-Mouse Click` (on mesh) |
+| **Transform Gizmo** | Drag the yellow sphere in the viewport (appears when vertices/edges/faces are selected) |
+
 ### Keyboard Shortcuts
 
 | Shortcut | Action |
@@ -164,6 +175,7 @@ python src/main.py
 | `Ctrl+Y` | Redo |
 | `Ctrl+A` | Select All |
 | `Delete` | Delete selected |
+| `r` | Toggle Box Select Mode |
 | `1` | Solid display mode |
 | `2` | Wireframe display mode |
 | `3` | Solid + Wireframe display mode |
