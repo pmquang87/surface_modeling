@@ -158,14 +158,21 @@ class MeshViewport(QWidget):
             import vtk
         except ImportError:
             vtk = pv._vtk
+            
         picker = vtk.vtkCellPicker()
         picker.SetTolerance(0.005)
         
         # Only pick from our mesh_actor
-        picker.AddPickList(self.mesh_actor)
-        picker.PickFromListOn()
-        
-        picker.Pick(pos[0], pos[1], 0, self.plotter.renderer)
+        if self.mesh_actor:
+            picker.AddPickList(self.mesh_actor)
+            picker.PickFromListOn()
+            
+        # Use PyVista's cached mouse position which is already converted to VTK coordinates (bottom-left origin)
+        mouse_pos = self.plotter.mouse_position
+        if not mouse_pos:
+            return
+            
+        picker.Pick(mouse_pos[0], mouse_pos[1], 0, self.plotter.renderer)
         cell_id = picker.GetCellId()
         
         if cell_id < 0:
