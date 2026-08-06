@@ -373,8 +373,8 @@ class PowerSurfacingMainWindow(QMainWindow):
         
         toolbar.addWidget(QLabel("  View: "))
         self.combo_view = QComboBox()
-        self.combo_view.addItems(["", "Isometric", "Top", "Bottom", "Front", "Back", "Right", "Left"])
-        self.combo_view.currentIndexChanged.connect(self._on_view_combo_changed)
+        self.combo_view.addItems(["Custom", "Isometric", "Top", "Bottom", "Front", "Back", "Right", "Left"])
+        self.combo_view.activated.connect(self._on_view_combo_changed)
         toolbar.addWidget(self.combo_view)
 
     def _on_view_combo_changed(self, index):
@@ -385,7 +385,6 @@ class PowerSurfacingMainWindow(QMainWindow):
         elif index == 5: self.viewport.plotter.view_xz(negative=True)
         elif index == 6: self.viewport.plotter.view_yz()
         elif index == 7: self.viewport.plotter.view_yz(negative=True)
-        self.combo_view.setCurrentIndex(0)
 
     def on_selection_changed(self, indices):
         if not self.current_mesh: return
