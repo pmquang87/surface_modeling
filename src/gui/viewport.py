@@ -53,6 +53,9 @@ class MeshViewport(QWidget):
         
         # Setup left-click picking using custom logic
         self.plotter.track_click_position(self._on_click, side='left')
+        
+        # Setup box picking (press 'r' to activate)
+        self.plotter.enable_cell_picking(callback=self._on_box_picked, show=False, through=True)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Shift:
@@ -69,17 +72,17 @@ class MeshViewport(QWidget):
         super().keyReleaseEvent(event)
         
     def set_selection_method(self, method: str):
-        self.selection_method = method
-        if method == 'box':
-            # PyVista doesn't natively map left drag to box selection easily without overriding the entire interactor style.
-            # We will use enable_cell_picking if they press 'r' for now, but log it.
-            pass
+        self.selection_method = method.lower()
+        if self.selection_method == 'box':
+            print("Box selection active: Hover over viewport and press 'r' to drag a box. (Press 'r' again to cancel)")
 
     def set_selection_modifier(self, mod: str):
         self.selection_modifier = mod
 
     def set_box_select_through(self, through: bool):
         self.box_select_through = through
+        # Re-enable picking with new through setting
+        self.plotter.enable_cell_picking(callback=self._on_box_picked, show=False, through=self.box_select_through)
         
     def _apply_selection_modifier(self, new_ids: list):
         current = set(self._selected_indices)
@@ -215,6 +218,44 @@ class MeshViewport(QWidget):
                 if closest_edge is not None:
                     self._apply_selection_modifier([closest_edge])
                     self.edge_selected.emit(closest_edge)
+
+    def _on_box_picked(self, picked_mesh):
+        if not self.current_mesh or self.selection_mode == 'none' or not picked_mesh:
+            return
+            
+        cell_ids = None
+        if "orig_extract_id" in picked_mesh.cell_data:
+            cell_ids = picked_mesh.cell_data["orig_extract_id"]
+        elif "vtkOriginalCellIds" in picked_mesh.cell_data:
+            cell_ids = picked_mesh.cell_data["vtkOriginalCellIds"]
+            
+        if cell_ids is None or len(cell_ids) == 0:
+            return
+            
+        if self.selection_mode == 'face':
+            valid_ids = [fid for fid in cell_ids if fid < len(self.current_mesh.faces)]
+            if valid_ids:
+                self._apply_selection_modifier(valid_ids)
+                
+        elif self.selection_mode == 'vertex':
+            vert_ids = set()
+            for fid in cell_ids:
+                if fid < len(self.current_mesh.faces):
+                    face = self.current_mesh.faces[fid]
+                    for e in self.current_mesh.get_face_edges(face):
+                        vert_ids.add(e.half_edge.vertex.index)
+            if vert_ids:
+                self._apply_selection_modifier(list(vert_ids))
+                
+        elif self.selection_mode == 'edge':
+            edge_ids = set()
+            for fid in cell_ids:
+                if fid < len(self.current_mesh.faces):
+                    face = self.current_mesh.faces[fid]
+                    for e in self.current_mesh.get_face_edges(face):
+                        edge_ids.add(e.index)
+            if edge_ids:
+                self._apply_selection_modifier(list(edge_ids))
 
     def get_selected_faces(self) -> list:
         if self.selection_mode == 'face':
