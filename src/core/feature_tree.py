@@ -1,4 +1,4 @@
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Optional, Callable, Tuple
 from datetime import datetime
 from src.core.halfedge_mesh import HalfEdgeMesh
 

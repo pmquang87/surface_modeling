@@ -78,11 +78,15 @@ class ShrinkWrapper:
         
     def _project_to_surface(self, vertices: np.ndarray, reference_trimesh: trimesh.Trimesh) -> np.ndarray:
         """Find closest points on reference surface for each vertex."""
-        # Use trimesh's nearest.on_surface for efficient spatial queries
-        closest_points, distances, triangle_id = trimesh.proximity.closest_point(
-            reference_trimesh, vertices
-        )
-        return closest_points
+        try:
+            # Use trimesh's nearest.on_surface for efficient spatial queries
+            closest_points, distances, triangle_id = trimesh.proximity.closest_point(
+                reference_trimesh, vertices
+            )
+            return closest_points
+        except Exception as e:
+            print(f"Error projecting to surface: {e}")
+            return vertices
         
     def _laplacian_smooth(self, mesh: HalfEdgeMesh, weight: float, boundary_fixed: bool = True, frozen_set: set = None):
         """Apply one iteration of Laplacian smoothing."""

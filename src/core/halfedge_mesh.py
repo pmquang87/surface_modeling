@@ -103,12 +103,14 @@ class HalfEdgeMesh:
             return []
         vertices = []
         curr = face.half_edge
+        visited = set()
         while True:
-            # curr.vertex is the vertex the halfedge points to.
-            # to get vertices in order, we can collect prev.vertex
+            if id(curr) in visited:
+                break
+            visited.add(id(curr))
             vertices.append(curr.prev.vertex)
             curr = curr.next
-            if curr == face.half_edge:
+            if curr == face.half_edge or curr is None:
                 break
         return vertices
 
@@ -161,8 +163,12 @@ class HalfEdgeMesh:
         if face.half_edge is None:
             return []
         edges = []
+        visited = set()
         curr = face.half_edge
         while True:
+            if curr.index in visited:
+                break
+            visited.add(curr.index)
             edges.append(curr.edge)
             curr = curr.next
             if curr == face.half_edge:
@@ -175,8 +181,12 @@ class HalfEdgeMesh:
     def is_boundary_vertex(self, vertex: Vertex) -> bool:
         if vertex.half_edge is None:
             return True
+        visited = set()
         curr = vertex.half_edge
         while True:
+            if curr.index in visited:
+                break
+            visited.add(curr.index)
             if curr.twin is None:
                 return True
             curr = curr.twin.next
@@ -195,11 +205,19 @@ class HalfEdgeMesh:
             curr = start_edge.half_edge if direction == 0 else (start_edge.half_edge.twin if start_edge.half_edge.twin else None)
             if curr is None: continue
             
+            visited_loop = set()
             while curr is not None:
+                if curr.index in visited_loop:
+                    break
+                visited_loop.add(curr.index)
                 # Get opposite edge in quad
                 face_edges = []
+                visited_edges = set()
                 temp = curr.next
                 while temp != curr:
+                    if temp is None or temp.index in visited_edges:
+                        break
+                    visited_edges.add(temp.index)
                     face_edges.append(temp.edge)
                     temp = temp.next
                 if len(face_edges) == 3: # Quad face (3 remaining edges)
@@ -260,7 +278,11 @@ class HalfEdgeMesh:
                 continue
                 
             curr_he = he
+            visited_he = set()
             while True:
+                if curr_he is None or curr_he.index in visited_he:
+                    break
+                visited_he.add(curr_he.index)
                 if curr_he.twin is not None and curr_he.twin.face is not None:
                     neighbor_face = curr_he.twin.face
                     neighbor_id = neighbor_face.index
@@ -389,7 +411,10 @@ class HalfEdgeMesh:
             he = face.half_edge
             if not he: continue
             curr = he
+            visited = set()
             while True:
+                if curr is None or curr.index in visited: break
+                visited.add(curr.index)
                 if curr.twin and curr.twin.face:
                     adjacent.add(curr.twin.face.index)
                 curr = curr.next
@@ -436,7 +461,10 @@ class HalfEdgeMesh:
             if not he: continue
             
             curr_he = he
+            he_visited = set()
             while True:
+                if curr_he is None or curr_he.index in he_visited: break
+                he_visited.add(curr_he.index)
                 if curr_he.twin and curr_he.twin.face:
                     n_id = curr_he.twin.face.index
                     if n_id not in visited:

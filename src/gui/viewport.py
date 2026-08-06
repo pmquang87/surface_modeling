@@ -555,4 +555,7 @@ class MeshViewport(QWidget):
         self.plotter.reset_camera()
 
     def screenshot(self, filepath: str):
-        self.plotter.screenshot(filepath)
+        try:
+            self.plotter.screenshot(filepath)
+        except Exception as e:
+            print(f"Failed to save screenshot to {filepath}: {e}")

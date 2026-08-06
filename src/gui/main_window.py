@@ -28,7 +28,7 @@ except Exception as e:
 
 try:
     from src.io.importers import import_stl, import_obj, import_step
-    from src.io.exporters import export_stl, export_obj
+    from src.io.exporters import export_stl, export_obj, export_step
 except Exception as e:
     print(f"[WARNING] Could not import I/O modules: {e}")
     traceback.print_exc()
@@ -37,6 +37,7 @@ except Exception as e:
     import_step = None
     export_stl = None
     export_obj = None
+    export_step = None
 
 try:
     import src.subd.primitives as primitives
@@ -104,6 +105,7 @@ class PowerSurfacingMainWindow(QMainWindow):
         self.resize(1200, 800)
         
         self.current_mesh = None
+        self.current_shape = None
         if FeatureTree:
             self.feature_tree = FeatureTree()
         else:
@@ -160,6 +162,9 @@ class PowerSurfacingMainWindow(QMainWindow):
         self.selection_panel.selection_operation_requested.connect(self.viewport.run_selection_operation)
         self.selection_panel.tangent_selection_requested.connect(self.on_expand_selection)
         self.selection_panel.cb_through.toggled.connect(self.viewport.set_box_select_through)
+        
+        self.properties_panel.property_changed.connect(self.on_property_changed)
+
         
         # Set stretch factors (Viewport takes most space)
         self.splitter.setStretchFactor(0, 0)
@@ -420,6 +425,12 @@ class PowerSurfacingMainWindow(QMainWindow):
         elif self.viewport.selection_mode == 'face' and len(indices) > 0:
             self.properties_panel.set_face_properties(indices, self.current_mesh)
             
+    def on_property_changed(self, prop_name, value):
+        self.log(f"Property changed: {prop_name} -> {value}")
+        if self.current_mesh:
+            self.viewport.update_mesh(self.current_mesh)
+
+            
     def on_expand_selection(self, angle):
         if not self.current_mesh: return
         current_faces = self.viewport.get_selected_faces()
@@ -433,9 +444,11 @@ class PowerSurfacingMainWindow(QMainWindow):
             self.log(f"Expand selection failed: {e}")
 
     def on_new(self):
-        self.current_mesh = None
-        if HalfEdgeMesh:
-            self.current_mesh = HalfEdgeMesh()
+        if HalfEdgeMesh is None:
+            QMessageBox.warning(self, "Error", "Core modules not available.")
+            return
+        self.current_mesh = HalfEdgeMesh()
+        self.current_shape = None
         self.viewport.clear()
         self.properties_panel.clear()
         self.status_bar.showMessage("New mesh created.")
@@ -454,6 +467,7 @@ class PowerSurfacingMainWindow(QMainWindow):
 
         try:
             mesh = None
+            shape = None
             if ext == '.stl':
                 if import_stl:
                     mesh = import_stl(filepath)
@@ -470,6 +484,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                 if import_step:
                     result = import_step(filepath)
                     mesh = result.get('mesh')
+                    shape = result.get('shape')
                     if mesh is None or len(mesh.vertices) == 0:
                         QMessageBox.warning(
                             self, "STEP Import",
@@ -488,6 +503,7 @@ class PowerSurfacingMainWindow(QMainWindow):
 
             if mesh and len(mesh.vertices) > 0:
                 self.current_mesh = mesh
+                self.current_shape = shape
                 self.viewport.set_mesh(mesh)
                 self.properties_panel.set_mesh_info(mesh)
                 vcount = len(mesh.vertices)
@@ -556,9 +572,16 @@ class PowerSurfacingMainWindow(QMainWindow):
                 return
             try:
                 if fmt == 'stl' and export_stl:
-                    export_stl(self.current_mesh, filepath)
+                    binary = dlg.binary_check.isChecked()
+                    export_stl(self.current_mesh, filepath, binary=binary)
                 elif fmt == 'obj' and export_obj:
                     export_obj(self.current_mesh, filepath)
+                elif fmt == 'step' and export_step:
+                    if getattr(self, 'current_shape', None):
+                        export_step(self.current_shape, filepath)
+                    else:
+                        QMessageBox.warning(self, "Export", "No NURBS shape available to export. Please run 'Convert to NURBS' first.")
+                        return
                 else:
                     self.log(f"Export format '{fmt}' not available.")
                     return
@@ -583,6 +606,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                         'sphere': primitives.create_sphere,
                     }.get(ptype, primitives.create_box)
                     self.current_mesh = create_fn()
+                    self.current_shape = None
                     self.viewport.set_mesh(self.current_mesh)
                     self.properties_panel.set_mesh_info(self.current_mesh)
                     v = len(self.current_mesh.vertices)
@@ -651,13 +675,14 @@ class PowerSurfacingMainWindow(QMainWindow):
         if dlg.exec_():
             if SubDToNURBSConverter:
                 try:
-                    continuity_map = {'G0 (Position)': 0, 'G1 (Tangent)': 1, 'G2 (Curvature)': 2}
+                    continuity_map = {'G0 (Position)': 0, 'G1 (Tangent)': 1, 'G2 (Curvature)': 2, 'G3 (Torsion)': 3}
                     continuity = continuity_map.get(dlg.continuity.currentText(), 1)
                     tolerance = dlg.tolerance.value()
-                    self.log(f"Converting to NURBS (continuity=G{continuity}, tol={tolerance})...")
+                    simplify = dlg.simplify.isChecked()
+                    self.log(f"Converting to NURBS (continuity=G{continuity}, tol={tolerance}, simplify={simplify})...")
                     QApplication.processEvents()
                     converter = SubDToNURBSConverter(continuity=continuity, tolerance=tolerance)
-                    result = converter.convert(self.current_mesh)
+                    result = converter.convert(self.current_mesh, simplify=simplify)
                     patch_count = len(result.get('patches', []))
                     self.log(f"NURBS conversion complete — {patch_count} patches generated")
                     if patch_count == 0:
@@ -665,6 +690,8 @@ class PowerSurfacingMainWindow(QMainWindow):
                             "0 patches were generated because your mesh contains no quad (4-sided) faces.\n\n"
                             "NURBS conversion only works on quad faces. If you imported an STL, it only contains triangles. "
                             "Please run 'Reverse Engineering -> Quad Wrap' first to convert your mesh into a quad-dominant Sub-D cage.")
+                    if result.get('shape'):
+                        self.current_shape = result['shape']
                     if result.get('mesh'):
                         self.current_mesh = result['mesh']
                         self.viewport.update_mesh(self.current_mesh)

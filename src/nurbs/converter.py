@@ -77,7 +77,7 @@ class SubDToNURBSConverter:
         patches = fitter.fit_surface(quad_mesh_data)
         return patches
         
-    def build_shape(self, patches: List[Any], simplify: bool = True) -> Optional[Any]:
+    def build_shape(self, patches: List[Any], simplify: bool = False) -> Optional[Any]:
         try:
             from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
             from OCP.TColgp import TColgp_Array2OfPnt
@@ -118,7 +118,7 @@ class SubDToNURBSConverter:
             return shape
         return None
 
-    def convert(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3, simplify: bool = True) -> Dict[str, Any]:
+    def convert(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3, simplify: bool = False) -> Dict[str, Any]:
         """Convert Sub-D mesh to a sewed TopoDS_Shape using cadquery-ocp."""
         patches = self.generate_patches(mesh, subdivision_levels)
         shape = self.build_shape(patches, simplify=simplify)

@@ -64,8 +64,12 @@ def export_step(brep_shape: Any, filepath: str) -> None:
         
         status = writer.Transfer(brep_shape, STEPControl_AsIs)
         if status == 1:
-            writer.Write(filepath)
-            logger.info(f"Exported STEP to {filepath}")
+            write_status = writer.Write(filepath)
+            from OCP.IFSelect import IFSelect_RetDone
+            if write_status == IFSelect_RetDone:
+                logger.info(f"Exported STEP to {filepath}")
+            else:
+                logger.error(f"Failed to write STEP file. Return status: {write_status}")
         else:
             logger.error("Failed to transfer shape for STEP export.")
             

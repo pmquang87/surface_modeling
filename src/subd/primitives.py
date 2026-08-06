@@ -179,7 +179,7 @@ def create_sphere(radius: float = 0.5, segments: int = 8, rings: int = 6, subdiv
         v1 = row + j
         v2 = n_pole
         v3 = row + (j + 1) % segments
-        mesh.add_face([v1, v2, v3])
+        mesh.add_face([v1, v3, v2])
         
     if subdivisions > 0:
         mesh = subdivide(mesh, subdivisions)

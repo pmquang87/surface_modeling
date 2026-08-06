@@ -344,10 +344,14 @@ Contributions are welcome! Areas where help is particularly valuable:
 ### Development Setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/python-power-surfacing.git
-cd python-power-surfacing
+git clone https://github.com/pmquang87/surface_modeling.git
+cd surface_modeling
 pip install -r requirements.txt
-python -m pytest tests/          # Run tests
+
+# To run the deep testing suite (fuzzing & property-based tests)
+pip install hypothesis pytest-cov
+python -m pytest tests/deep_tests/
+
 python src/main.py               # Launch GUI
 ```
 

@@ -48,7 +48,11 @@ class FeatureTreePanel(QWidget):
         edit_action = menu.addAction("Edit")
         delete_action = menu.addAction("Delete")
         toggle_action = menu.addAction("Enable/Disable")
-        # Handle actions...
+        idx = self.tree_widget.indexOfTopLevelItem(item)
+        edit_action.triggered.connect(lambda checked=False, i=idx: self.feature_selected.emit(i))
+        delete_action.triggered.connect(lambda checked=False, i=idx: self.feature_deleted.emit(i))
+        toggle_action.triggered.connect(lambda checked=False, i=idx: self.feature_toggled.emit(i, True))
+        
         menu.exec_(self.tree_widget.viewport().mapToGlobal(position))
 
 class PropertiesPanel(QWidget):

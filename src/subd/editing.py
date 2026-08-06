@@ -46,6 +46,7 @@ def extrude_edges(mesh: HalfEdgeMesh, edge_indices: list[int], distance: float =
     for e_idx in edge_indices:
         if e_idx >= len(mesh.edges): continue
         e = mesh.edges[e_idx]
+        if e.half_edge is None or e.half_edge.prev is None: continue
         v1_idx = e.half_edge.prev.vertex.index
         v2_idx = e.half_edge.vertex.index
         
@@ -130,7 +131,11 @@ def insert_edge_loop(mesh: HalfEdgeMesh, edge_index: int, position: float = 0.5)
         f_edges = []
         he = f.half_edge
         start_he = he
+        if he is None: continue
+        visited = set()
         while True:
+            if he is None or he.index in visited: break
+            visited.add(he.index)
             f_edges.append(he)
             he = he.next
             if he == start_he: break
@@ -171,7 +176,11 @@ def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: 
             f = mesh.faces[f_idx]
             he = f.half_edge
             start_he = he
+            if he is None: continue
+            visited = set()
             while True:
+                if he is None or he.index in visited: break
+                visited.add(he.index)
                 twin_face_idx = he.twin.face.index if he.twin and he.twin.face else -1
                 if twin_face_idx not in group_indices:
                     boundary_edges.append(he)
@@ -184,12 +193,12 @@ def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: 
             last_v = loop[-1].vertex
             found = False
             for i, he in enumerate(boundary_edges):
-                if he.prev.vertex == last_v:
+                if he.prev and he.prev.vertex == last_v:
                     loop.append(boundary_edges.pop(i))
                     found = True
                     break
             if not found: break 
-        return [he.prev.vertex.index for he in loop]
+        return [he.prev.vertex.index for he in loop if he.prev]
 
     loop_a = get_boundary_loop(set(face_indices_a))
     loop_b = get_boundary_loop(set(face_indices_b))

@@ -150,8 +150,8 @@ class ConvertNURBSDialog(QDialog):
         self.form = QFormLayout()
         
         self.continuity = QComboBox()
-        self.continuity.addItems(["G0 (Position)", "G1 (Tangent)", "G2 (Curvature)"])
-        self.continuity.setCurrentIndex(1)
+        self.continuity.addItems(["G0 (Position)", "G1 (Tangent)", "G2 (Curvature)", "G3 (Torsion)"])
+        self.continuity.setCurrentIndex(2)
         self.form.addRow("Continuity:", self.continuity)
         
         self.tolerance = QDoubleSpinBox()
@@ -159,6 +159,11 @@ class ConvertNURBSDialog(QDialog):
         self.tolerance.setDecimals(4)
         self.tolerance.setValue(0.01)
         self.form.addRow("Tolerance:", self.tolerance)
+        
+        self.simplify = QCheckBox()
+        self.simplify.setChecked(False)
+        self.simplify.setToolTip("Attempts to merge identical patches using OpenCascade UnifySameDomain. Can crash on complex models.")
+        self.form.addRow("Simplify Topology:", self.simplify)
         
         self.layout.addLayout(self.form)
         

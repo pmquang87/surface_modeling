@@ -57,12 +57,21 @@ def import_step(filepath: str) -> Dict[str, Any]:
             logger.error("Error reading STEP file with OCP.")
             return result
         
-        reader.TransferRoots()
+        transfer_status = reader.TransferRoots()
+        if not transfer_status:
+            logger.error("Failed to transfer roots in STEP file.")
+            
         shape = reader.OneShape()
+        if shape.IsNull():
+            logger.error("STEP file contains a null shape.")
+            return result
+            
         result['shape'] = shape
         
         # Tessellate
-        BRepMesh_IncrementalMesh(shape, 0.1)
+        mesh_algo = BRepMesh_IncrementalMesh(shape, 0.1)
+        if not mesh_algo.IsDone():
+            logger.warning("BRepMesh_IncrementalMesh failed to generate a mesh.")
         
         explorer = TopExp_Explorer(shape, TopAbs_FACE)
         vertices = []

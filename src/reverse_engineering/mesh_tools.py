@@ -155,14 +155,19 @@ def decimate_mesh(mesh: HalfEdgeMesh, target_faces: int = None,
                 if v0 != v1 and v1 != v2 and v2 != v0:
                     new_faces.append([v0, v1, v2])
                     
-        import trimesh
-        new_t_mesh = trimesh.Trimesh(vertices=verts, faces=new_faces, process=True)
-        return HalfEdgeMesh.from_trimesh(new_t_mesh)
+        try:
+            import trimesh
+            new_t_mesh = trimesh.Trimesh(vertices=verts, faces=new_faces, process=True)
+            return HalfEdgeMesh.from_trimesh(new_t_mesh)
+        except Exception as e:
+            print(f"Error generating trimesh during decimation: {e}")
+            return mesh.copy()
 
     try:
         # Requires open3d or pyembree depending on trimesh installation
-        # Note: trimesh.simplify_quadratic_decimation is the current API
-        decimated = t_mesh.simplify_quadric_decimation(target_faces)
+        keep_fraction = target_faces / float(len(t_mesh.faces)) if len(t_mesh.faces) > 0 else 1.0
+        reduction = max(0.0, min(0.99, 1.0 - keep_fraction))
+        decimated = t_mesh.simplify_quadric_decimation(reduction)
         return HalfEdgeMesh.from_trimesh(decimated)
     except Exception:
         # Fallback if decimation fails (e.g. missing dependencies)
@@ -170,9 +175,13 @@ def decimate_mesh(mesh: HalfEdgeMesh, target_faces: int = None,
 
 def remove_duplicate_vertices(mesh: HalfEdgeMesh, tolerance: float = 1e-6) -> HalfEdgeMesh:
     """Merge vertices that are within tolerance distance of each other."""
-    t_mesh = mesh.to_trimesh()
-    t_mesh.merge_vertices(merge_tex=False, merge_norm=False, digits_or_tol=tolerance)
-    return HalfEdgeMesh.from_trimesh(t_mesh)
+    try:
+        t_mesh = mesh.to_trimesh()
+        t_mesh.merge_vertices(merge_tex=False, merge_norm=False, digits_or_tol=tolerance)
+        return HalfEdgeMesh.from_trimesh(t_mesh)
+    except Exception as e:
+        print(f"Error merging vertices: {e}")
+        return mesh.copy()
 
 def compute_mesh_quality(mesh: HalfEdgeMesh) -> dict:
     """Compute mesh quality metrics.

@@ -110,7 +110,11 @@ def _subdivide_once(mesh: HalfEdgeMesh) -> HalfEdgeMesh:
         hes = []
         if curr is None:
             continue
+        visited = set()
         while True:
+            if curr is None or curr.index in visited:
+                break
+            visited.add(curr.index)
             hes.append(curr)
             curr = curr.next
             if curr == f.half_edge:
@@ -183,7 +187,7 @@ def evaluate_limit_surface(mesh: HalfEdgeMesh) -> tuple[np.ndarray, np.ndarray]:
             curr = v.half_edge
             visited = set()
             while True:
-                if curr.index in visited:
+                if curr is None or curr.index in visited:
                     break
                 visited.add(curr.index)
                 if curr.edge:
