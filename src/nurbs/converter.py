@@ -32,6 +32,30 @@ class SubDToNURBSConverter:
             limit_positions = np.array([v.position for v in mesh.vertices])
             limit_normals = []
             
+        if str(self.continuity) in ('3', 'G3'):
+            try:
+                from src.nurbs.g3_fitter import G3Fitter
+                fitter = G3Fitter()
+                quads = []
+                for face in mesh.faces:
+                    vertices = mesh.get_face_vertices(face)
+                    if len(vertices) == 4:
+                        corners = [limit_positions[v.index] for v in vertices]
+                        quads.append({'corners': corners})
+                raw_patches = fitter.fit_surface(quads)
+                patches = []
+                for ctrl_pts in raw_patches:
+                    patches.append({
+                        'control_points': ctrl_pts,
+                        'degree_u': 5,
+                        'degree_v': 5,
+                        'knots_u': [0]*6 + [1]*6,
+                        'knots_v': [0]*6 + [1]*6
+                    })
+                return patches
+            except Exception as e:
+                print(f"Failed to use G3Fitter: {e}, falling back to G2.")
+
         patches = []
         for face in mesh.faces:
             vertices = mesh.get_face_vertices(face)
@@ -167,9 +191,11 @@ class SubDToNURBSConverter:
                 kv = patch['knots_v']
                 
                 # Convert arrays
-                poles = TColgp_Array2OfPnt(1, 4, 1, 4)
-                for i in range(4):
-                    for j in range(4):
+                num_u = deg_u + 1
+                num_v = deg_v + 1
+                poles = TColgp_Array2OfPnt(1, num_u, 1, num_v)
+                for i in range(num_u):
+                    for j in range(num_v):
                         p = ctrl_pts[i, j]
                         poles.SetValue(i+1, j+1, gp_Pnt(float(p[0]), float(p[1]), float(p[2])))
                         
@@ -179,16 +205,16 @@ class SubDToNURBSConverter:
                 knots_u.SetValue(2, 1.0)
                 
                 mults_u = TColStd_Array1OfInteger(1, 2)
-                mults_u.SetValue(1, 4)
-                mults_u.SetValue(2, 4)
+                mults_u.SetValue(1, num_u)
+                mults_u.SetValue(2, num_u)
                 
                 knots_v = TColStd_Array1OfReal(1, 2)
                 knots_v.SetValue(1, 0.0)
                 knots_v.SetValue(2, 1.0)
                 
                 mults_v = TColStd_Array1OfInteger(1, 2)
-                mults_v.SetValue(1, 4)
-                mults_v.SetValue(2, 4)
+                mults_v.SetValue(1, num_v)
+                mults_v.SetValue(2, num_v)
                 
                 surf = Geom_BSplineSurface(poles, knots_u, knots_v, mults_u, mults_v, deg_u, deg_v)
                 face = BRepBuilderAPI_MakeFace(surf, self.tolerance).Face()
