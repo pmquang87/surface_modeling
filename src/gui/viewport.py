@@ -39,6 +39,9 @@ class MeshViewport(QWidget):
         self.ref_actor = None
         self.selection_actors = []
         
+        # Transform Gizmo state
+        self._last_gizmo_pos = None
+        
         self.current_mesh = None
         self.display_mode = 'solid+wireframe'
         self.selection_mode = 'none'
@@ -303,9 +306,11 @@ class MeshViewport(QWidget):
 
     def clear(self):
         self.plotter.clear_actors()
+        self.plotter.clear_sphere_widgets()
         self.mesh_actor = None
         self.ref_actor = None
         self.selection_actors = []
+        self._last_gizmo_pos = None
         self.current_mesh = None
         self.plotter.update()
 
@@ -319,12 +324,15 @@ class MeshViewport(QWidget):
         self._selected_indices = []
         self.highlight_selection([], mode)
 
-    def highlight_selection(self, indices: list, element_type: str):
+    def highlight_selection(self, indices: list, element_type: str, update_gizmo: bool = True):
         self._selected_indices = indices
         # clear previous highlights
         for actor in self.selection_actors:
             self.plotter.remove_actor(actor)
         self.selection_actors.clear()
+
+        if update_gizmo:
+            self.plotter.clear_sphere_widgets()
 
         if not self.current_mesh or not indices:
             self.plotter.update()
@@ -360,7 +368,81 @@ class MeshViewport(QWidget):
                 actor = self.plotter.add_mesh(pd, color='red', line_width=6, render_lines_as_tubes=True, pickable=False, reset_camera=False)
                 self.selection_actors.append(actor)
                 
+        if update_gizmo:
+            self._update_gizmo()
+            
         self.plotter.update()
+
+    def _get_selected_vertex_indices(self) -> list:
+        if not self.current_mesh or not self._selected_indices:
+            return []
+            
+        v_indices = set()
+        if self.selection_mode == 'vertex':
+            v_indices.update(self._selected_indices)
+        elif self.selection_mode == 'edge':
+            for e_idx in self._selected_indices:
+                if e_idx < len(self.current_mesh.edges):
+                    e = self.current_mesh.edges[e_idx]
+                    v_indices.add(e.half_edge.vertex.index)
+                    v_indices.add(e.half_edge.prev.vertex.index)
+        elif self.selection_mode == 'face':
+            for f_idx in self._selected_indices:
+                if f_idx < len(self.current_mesh.faces):
+                    face = self.current_mesh.faces[f_idx]
+                    for v in self.current_mesh.get_face_vertices(face):
+                        v_indices.add(v.index)
+        return list(v_indices)
+
+    def _update_gizmo(self):
+        v_indices = self._get_selected_vertex_indices()
+        if not v_indices:
+            return
+            
+        pts = np.array([self.current_mesh.vertices[i].position for i in v_indices])
+        center = (pts.min(axis=0) + pts.max(axis=0)) / 2.0
+        self._last_gizmo_pos = np.array(center)
+        
+        # Calculate a reasonable radius based on mesh bounds
+        pv_mesh = self.current_mesh.to_pyvista()
+        bounds = pv_mesh.bounds
+        diag = np.linalg.norm([bounds[1]-bounds[0], bounds[3]-bounds[2], bounds[5]-bounds[4]])
+        radius = max(diag * 0.05, 0.01)
+        
+        self.plotter.add_sphere_widget(
+            callback=self._on_gizmo_moved,
+            center=center,
+            radius=radius,
+            color='yellow',
+            test_callback=False
+        )
+
+    def _on_gizmo_moved(self, new_center):
+        if self._last_gizmo_pos is None:
+            return
+            
+        new_pos = np.array(new_center)
+        delta = new_pos - self._last_gizmo_pos
+        
+        if np.allclose(delta, 0):
+            return
+            
+        v_indices = self._get_selected_vertex_indices()
+        if not v_indices:
+            return
+            
+        for i in v_indices:
+            self.current_mesh.vertices[i].position += delta
+            
+        self._last_gizmo_pos = new_pos
+        
+        # update mesh display
+        if self.mesh_actor:
+            pts = np.array([v.position for v in self.current_mesh.vertices])
+            self.mesh_actor.mapper.dataset.points = pts
+            
+        # Highlight without re-creating the gizmo
+        self.highlight_selection(self._selected_indices, self.selection_mode, update_gizmo=False)
 
     def set_reference_mesh(self, mesh):
         if self.ref_actor:
