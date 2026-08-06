@@ -77,7 +77,7 @@ class MeshViewport(QWidget):
         
         # Apply SolidWorks interactor style
         self._custom_style = SolidWorksStyle()
-        self.plotter.iren.set_interactor_style(self._custom_style)
+        self.plotter.iren.interactor.SetInteractorStyle(self._custom_style)
         
         # Set background
         self.plotter.set_background(color="#f0f0f0", top="#e0e5ea")
