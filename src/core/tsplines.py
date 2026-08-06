@@ -131,6 +131,9 @@ class TMesh:
         knots_neg = []
         curr_v = v
         for _ in range(degree // 2 + 1):
+            if curr_v is None:
+                knots_neg.append(0.0)
+                continue
             edge = curr_v.edges.get(dir_neg)
             if edge is None:
                 # Boundary condition: repeat the last knot interval (0)
@@ -142,6 +145,9 @@ class TMesh:
         knots_pos = []
         curr_v = v
         for _ in range(degree // 2 + 1):
+            if curr_v is None:
+                knots_pos.append(0.0)
+                continue
             edge = curr_v.edges.get(dir_pos)
             if edge is None:
                 knots_pos.append(0.0)

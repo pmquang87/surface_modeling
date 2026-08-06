@@ -113,7 +113,7 @@ class ShrinkWrapper:
                     projected.append(valid_locations[closest_idx])
                 else:
                     # Fallback to closest point
-                    closest_pt, _, _ = trimesh.proximity.closest_point(reference_trimesh, [v])
+                    closest_pt = self._project_to_surface(np.array([v]), reference_trimesh)
                     projected.append(closest_pt[0])
                     
             return np.array(projected)

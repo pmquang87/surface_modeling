@@ -121,6 +121,7 @@ def insert_edge_loop(mesh: HalfEdgeMesh, edge_index: int, position: float = 0.5)
     
     edge_to_new_vert = {}
     for e in ring_edges:
+        if e.half_edge is None or e.half_edge.prev is None: continue
         v1 = e.half_edge.prev.vertex.position
         v2 = e.half_edge.vertex.position
         new_pos = v1 * (1.0 - position) + v2 * position
@@ -336,10 +337,11 @@ def bevel_edges(mesh: HalfEdgeMesh, edge_indices: list[int], distance: float = 0
     for e_idx in edge_indices:
         if e_idx >= len(mesh.edges): continue
         e = mesh.edges[e_idx]
-        if e.half_edge and e.half_edge.face:
-            face_indices.add(e.half_edge.face.index)
-        if e.half_edge.twin and e.half_edge.twin.face:
-            face_indices.add(e.half_edge.twin.face.index)
+        if e.half_edge:
+            if e.half_edge.face:
+                face_indices.add(e.half_edge.face.index)
+            if e.half_edge.twin and e.half_edge.twin.face:
+                face_indices.add(e.half_edge.twin.face.index)
             
     return inset_faces(mesh, list(face_indices), inset_amount=distance)
 

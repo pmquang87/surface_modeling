@@ -165,9 +165,7 @@ def decimate_mesh(mesh: HalfEdgeMesh, target_faces: int = None,
 
     try:
         # Requires open3d or pyembree depending on trimesh installation
-        keep_fraction = target_faces / float(len(t_mesh.faces)) if len(t_mesh.faces) > 0 else 1.0
-        reduction = max(0.0, min(0.99, 1.0 - keep_fraction))
-        decimated = t_mesh.simplify_quadric_decimation(reduction)
+        decimated = t_mesh.simplify_quadric_decimation(target_faces)
         return HalfEdgeMesh.from_trimesh(decimated)
     except Exception:
         # Fallback if decimation fails (e.g. missing dependencies)

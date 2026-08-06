@@ -186,6 +186,10 @@ class ExportDialog(QDialog):
         
         self.binary_check = QCheckBox()
         self.binary_check.setChecked(True)
+        self.binary_check.setEnabled(self.format_combo.currentText() == "STL")
+        self.format_combo.currentTextChanged.connect(
+            lambda text: self.binary_check.setEnabled(text == "STL")
+        )
         self.form.addRow("Binary (STL only):", self.binary_check)
         
         self.layout.addLayout(self.form)

@@ -58,7 +58,7 @@ class QuadWrapper:
             he_mesh.add_face([vertex_map[v] for v in q])
             
         # 5. Relax the final quad mesh (Shrinkwrap/Laplacian)
-        self._relax_mesh(he_mesh, reference_mesh)
+        he_mesh = self._relax_mesh(he_mesh, reference_mesh)
         
         return he_mesh
         
@@ -106,9 +106,7 @@ class QuadWrapper:
         """Simulates a Mixed-Integer Quadrangulation (MIQ) solver parametrization."""
         target_triangles = max(4, int(self.target_face_count * 2.1))
         try:
-            keep_fraction = target_triangles / float(len(mesh.faces)) if len(mesh.faces) > 0 else 1.0
-            reduction = max(0.0, min(0.99, 1.0 - keep_fraction))
-            decimated = mesh.simplify_quadric_decimation(reduction)
+            decimated = mesh.simplify_quadric_decimation(target_triangles)
         except Exception:
             decimated = mesh
             
@@ -229,9 +227,9 @@ class QuadWrapper:
             
         return np.array(new_V), new_quads
         
-    def _relax_mesh(self, mesh: HalfEdgeMesh, reference: HalfEdgeMesh):
+    def _relax_mesh(self, mesh: HalfEdgeMesh, reference: HalfEdgeMesh) -> HalfEdgeMesh:
         """Laplacian smoothing & Shrinkwrap onto reference mesh."""
         from src.reverse_engineering.shrink_wrap import ShrinkWrapper
         wrapper = ShrinkWrapper(iterations=3, smooth_weight=self.smoothing_weight, projection_mode='ray_cast')
-        wrapper.wrap(mesh, reference)
+        return wrapper.wrap(mesh, reference)
 

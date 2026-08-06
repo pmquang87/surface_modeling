@@ -105,10 +105,11 @@ class HalfEdgeMesh:
         curr = face.half_edge
         visited = set()
         while True:
-            if id(curr) in visited:
+            if curr is None or id(curr) in visited:
                 break
             visited.add(id(curr))
-            vertices.append(curr.prev.vertex)
+            if curr.prev is not None:
+                vertices.append(curr.prev.vertex)
             curr = curr.next
             if curr == face.half_edge or curr is None:
                 break
@@ -121,7 +122,7 @@ class HalfEdgeMesh:
         visited = set()
         curr = vertex.half_edge
         while True:
-            if curr.index in visited:
+            if curr is None or curr.index in visited:
                 break
             visited.add(curr.index)
             
@@ -141,7 +142,7 @@ class HalfEdgeMesh:
         visited = set()
         curr = vertex.half_edge
         while True:
-            if curr.index in visited:
+            if curr is None or curr.index in visited:
                 break
             visited.add(curr.index)
             
@@ -153,7 +154,9 @@ class HalfEdgeMesh:
                 break
         return neighbors
 
-    def get_edge_faces(self, edge: Edge) -> Tuple[Face, Optional[Face]]:
+    def get_edge_faces(self, edge: Edge) -> Tuple[Optional[Face], Optional[Face]]:
+        if edge.half_edge is None:
+            return (None, None)
         he = edge.half_edge
         f1 = he.face
         f2 = he.twin.face if he.twin else None
@@ -166,7 +169,7 @@ class HalfEdgeMesh:
         visited = set()
         curr = face.half_edge
         while True:
-            if curr.index in visited:
+            if curr is None or curr.index in visited:
                 break
             visited.add(curr.index)
             edges.append(curr.edge)
@@ -184,7 +187,7 @@ class HalfEdgeMesh:
         visited = set()
         curr = vertex.half_edge
         while True:
-            if curr.index in visited:
+            if curr is None or curr.index in visited:
                 break
             visited.add(curr.index)
             if curr.twin is None:
@@ -195,6 +198,8 @@ class HalfEdgeMesh:
         return False
 
     def is_boundary_edge(self, edge: Edge) -> bool:
+        if edge.half_edge is None:
+            return True
         return edge.half_edge.twin is None
 
     def get_edge_loop(self, start_edge: Edge) -> List[Edge]:
@@ -438,7 +443,7 @@ class HalfEdgeMesh:
             if e_id < 0 or e_id >= len(self.edges): continue
             e = self.edges[e_id]
             he1 = e.half_edge
-            he2 = e.half_edge.twin
+            he2 = e.half_edge.twin if e.half_edge else None
             for he in [he1, he2]:
                 if not he: continue
                 if he.next and he.next.edge: adjacent.add(he.next.edge.index)
@@ -502,7 +507,7 @@ class HalfEdgeMesh:
             if curr_id < 0 or curr_id >= len(self.edges): continue
             e = self.edges[curr_id]
             he1 = e.half_edge
-            he2 = e.half_edge.twin
+            he2 = e.half_edge.twin if e.half_edge else None
             for he in [he1, he2]:
                 if not he: continue
                 if he.next and he.next.edge and he.next.edge.index not in visited:

@@ -172,6 +172,11 @@ class PowerSurfacingMainWindow(QMainWindow):
         self.selection_panel.cb_through.toggled.connect(self.viewport.set_box_select_through)
         
         self.properties_panel.property_changed.connect(self.on_property_changed)
+        
+        # Connect FeatureTreePanel signals
+        self.feature_panel.feature_selected.connect(lambda idx: self.log(f"Feature {idx} selected"))
+        self.feature_panel.feature_toggled.connect(lambda idx, state: self.log(f"Feature {idx} toggled to {state}"))
+        self.feature_panel.feature_deleted.connect(lambda idx: self.log(f"Feature {idx} deleted"))
 
         
         # Set stretch factors (Viewport takes most space)
@@ -613,7 +618,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                         'plane': primitives.create_plane,
                         'sphere': primitives.create_sphere,
                     }.get(ptype, primitives.create_box)
-                    self.current_mesh = create_fn()
+                    self.current_mesh = create_fn(size=params['size'])
                     self.current_shape = None
                     self.viewport.set_mesh(self.current_mesh)
                     self.properties_panel.set_mesh_info(self.current_mesh)
@@ -639,7 +644,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                     f_before = len(self.current_mesh.faces)
                     self.log(f"Subdividing {params['levels']} level(s)... ({v_before} verts, {f_before} faces)")
                     QApplication.processEvents()
-                    self.current_mesh = catmull_clark.subdivide(self.current_mesh, params['levels'])
+                    self.current_mesh = catmull_clark.subdivide(self.current_mesh, params['levels'], smooth=params['smooth'])
                     v_after = len(self.current_mesh.vertices)
                     f_after = len(self.current_mesh.faces)
                     self.viewport.update_mesh(self.current_mesh)
