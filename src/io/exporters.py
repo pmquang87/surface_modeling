@@ -13,6 +13,10 @@ def export_stl(mesh: 'HalfEdgeMesh', filepath: str, binary: bool = True) -> None
     Converts to trimesh first to handle tessellation of arbitrary polygons if needed,
     and then exports.
     """
+    if len(mesh.faces) == 0:
+        logger.warning(f"Mesh is empty, cannot export STL to {filepath}")
+        return
+        
     try:
         t_mesh = mesh.to_trimesh()
         t_mesh.export(filepath, file_type='stl' + ('' if binary else '_ascii'))

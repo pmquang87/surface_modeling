@@ -189,12 +189,11 @@ class MeshViewport(QWidget):
             # find closest point in the exact picked face to the pick position
             if cell_id < len(self.current_mesh.faces):
                 face = self.current_mesh.faces[cell_id]
-                edges = self.current_mesh.get_face_edges(face)
+                vertices = self.current_mesh.get_face_vertices(face)
                 min_dist = float('inf')
                 closest_vert = None
                 
-                for e in edges:
-                    v = e.half_edge.vertex
+                for v in vertices:
                     dist = np.linalg.norm(v.position - np.array(p3d))
                     if dist < min_dist:
                         min_dist = dist
@@ -249,8 +248,8 @@ class MeshViewport(QWidget):
             for fid in cell_ids:
                 if fid < len(self.current_mesh.faces):
                     face = self.current_mesh.faces[fid]
-                    for e in self.current_mesh.get_face_edges(face):
-                        vert_ids.add(e.half_edge.vertex.index)
+                    for v in self.current_mesh.get_face_vertices(face):
+                        vert_ids.add(v.index)
             if vert_ids:
                 self._apply_selection_modifier(list(vert_ids))
                 
