@@ -553,6 +553,16 @@ class MeshViewport(QWidget):
 
     def reset_camera(self):
         self.plotter.reset_camera()
+        if self.current_mesh and len(self.current_mesh.vertices) > 0:
+            import numpy as np
+            pts = np.array([v.position for v in self.current_mesh.vertices])
+            avg_center = np.mean(pts, axis=0)
+            
+            # Shift the camera to look at the average center instead of bounding box center
+            cam = self.plotter.camera
+            delta = avg_center - np.array(cam.focal_point)
+            cam.position = np.array(cam.position) + delta
+            cam.focal_point = avg_center
 
     def screenshot(self, filepath: str):
         try:
