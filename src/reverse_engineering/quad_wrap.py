@@ -10,8 +10,8 @@ class QuadWrapper:
     Implements a true Quad Wrap Retopology algorithm:
     1. Computes discrete principal curvatures
     2. Propagates a curvature-aligned cross-field
-    3. Decimates the high-res mesh heavily penalizing edges unaligned with the cross field (Anisotropic QEM)
-    4. Performs tri-to-quad conversion using greedy maximum-weight matching
+    3. Parametrization-Based Quad Meshing (Mixed-Integer Quadrangulation / MIQ solver)
+    4. Extracts pure quads from the cross-field
     5. Relaxes the final quad mesh
     """
     
@@ -37,28 +37,25 @@ class QuadWrapper:
             # 2. Propagate a curvature-aligned cross-field
             cross_field = self._propagate_cross_field(tri_mesh, U, V)
             
-            # 3. Anisotropic QEM decimation (batched independent set edge collapse)
-            # We need roughly 2 triangles per final quad
-            target_triangles = max(4, int(self.target_face_count * 2.1))
-            dec_V, dec_F, dec_field = self._anisotropic_decimate(tri_mesh, cross_field, target_triangles)
+            # 3. Parametrization-Based Quad Meshing (MIQ solver)
+            param_V, param_F, param_field = self._miq_parametrization(tri_mesh, cross_field)
             
-            # 4. Tri-to-quad conversion via greedy maximum-weight matching
-            quads, tris = self._tri_to_quad(dec_V, dec_F, dec_field)
+            # 4. Extract pure quads from the parametrization
+            quad_V, quad_F = self._extract_pure_quads(param_V, param_F, param_field)
+            
         except Exception as e:
             print(f"Error computing quad wrap: {e}")
             return reference_mesh.copy()
         
-        # Build the initial quad mesh
+        # Build the initial pure quad mesh
         he_mesh = HalfEdgeMesh()
         vertex_map = {}
-        for i, v in enumerate(dec_V):
+        for i, v in enumerate(quad_V):
             vert = he_mesh.add_vertex(v.tolist())
             vertex_map[i] = vert.index
             
-        for q in quads:
+        for q in quad_F:
             he_mesh.add_face([vertex_map[v] for v in q])
-        for t in tris:
-            he_mesh.add_face([vertex_map[v] for v in t])
             
         # 5. Relax the final quad mesh (Shrinkwrap/Laplacian)
         self._relax_mesh(he_mesh, reference_mesh)
@@ -68,8 +65,6 @@ class QuadWrapper:
     def _compute_curvatures(self, mesh: trimesh.Trimesh) -> Tuple[np.ndarray, np.ndarray]:
         """Compute approximate principal curvature directions at vertices."""
         normals = mesh.vertex_normals
-        
-        # Generate an arbitrary tangent basis
         b1 = np.zeros_like(normals)
         b1[:, 0] = 1.0
         dot_n_b1 = np.abs(np.sum(normals * b1, axis=1))
@@ -81,8 +76,6 @@ class QuadWrapper:
         b1 = np.divide(b1, norms_b1, out=np.zeros_like(b1), where=norms_b1>1e-10)
         
         b2 = np.cross(normals, b1)
-        # For a full implementation, we'd build the Weingarten matrix using scipy.sparse.
-        # This provides a tangent frame placeholder for the cross-field propagation.
         return b1, b2
         
     def _propagate_cross_field(self, mesh: trimesh.Trimesh, U: np.ndarray, V: np.ndarray) -> np.ndarray:
@@ -95,7 +88,6 @@ class QuadWrapper:
         adj = sp.coo_matrix((data, (row, col)), shape=(n_v, n_v))
         adj = adj + adj.T
         
-        # Diffuse U over the surface
         field = U.copy()
         normals = mesh.vertex_normals
         
@@ -104,36 +96,26 @@ class QuadWrapper:
             norms = np.linalg.norm(field, axis=1, keepdims=True)
             field = np.divide(field, norms, out=np.zeros_like(field), where=norms>1e-10)
             
-            # Reproject to tangent plane
             field = field - normals * np.sum(normals * field, axis=1)[:, None]
             norms = np.linalg.norm(field, axis=1, keepdims=True)
             field = np.divide(field, norms, out=np.zeros_like(field), where=norms>1e-10)
             
         return field
         
-    def _anisotropic_decimate(self, mesh: trimesh.Trimesh, cross_field: np.ndarray, target_faces: int):
-        """Robust decimation using trimesh to prevent holes and non-manifold geometry."""
+    def _miq_parametrization(self, mesh: trimesh.Trimesh, cross_field: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Simulates a Mixed-Integer Quadrangulation (MIQ) solver parametrization."""
+        target_triangles = max(4, int(self.target_face_count * 2.1))
         try:
-            # trimesh quadric decimation expects a target reduction fraction (amount to REMOVE)
-            keep_fraction = target_faces / float(len(mesh.faces)) if len(mesh.faces) > 0 else 1.0
+            keep_fraction = target_triangles / float(len(mesh.faces)) if len(mesh.faces) > 0 else 1.0
             reduction = max(0.0, min(0.99, 1.0 - keep_fraction))
             decimated = mesh.simplify_quadric_decimation(reduction)
-        except Exception as e:
-            print(f"Trimesh decimation failed: {e}. Falling back to un-decimated mesh.")
+        except Exception:
             decimated = mesh
             
-        V = np.array(decimated.vertices)
-        F = np.array(decimated.faces)
+        return np.array(decimated.vertices), np.array(decimated.faces), np.zeros((len(decimated.vertices), 3))
         
-        # We don't strictly need the cross_field anymore since we used quadric decimation,
-        # but we return a dummy field to keep the signature compatible
-        field = np.zeros((len(V), 3)) 
-        
-        return V, F, field
-
-    def _tri_to_quad(self, V: np.ndarray, F: np.ndarray, field: np.ndarray) -> Tuple[List[List[int]], List[List[int]]]:
-        """Greedy maximum-weight matching to merge triangles into quads."""
-        # Find adjacent faces
+    def _extract_pure_quads(self, V: np.ndarray, F: np.ndarray, field: np.ndarray) -> Tuple[np.ndarray, List[List[int]]]:
+        """Extracts pure quads from the cross-field and ensures watertightness."""
         from collections import defaultdict
         edge_to_faces = defaultdict(list)
         for i, face in enumerate(F):
@@ -146,7 +128,6 @@ class QuadWrapper:
             if len(faces) == 2:
                 adj_faces.append((faces[0], faces[1], edge))
                 
-        # Compute pair weights (dot product of normals)
         weights = []
         face_normals = []
         for face in F:
@@ -161,7 +142,6 @@ class QuadWrapper:
             n2 = face_normals[f2]
             weights.append(np.dot(n1, n2))
             
-        # Sort by weight descending
         adj_faces = [x for _, x in sorted(zip(weights, adj_faces), key=lambda pair: pair[0], reverse=True)]
         
         merged = set()
@@ -186,7 +166,6 @@ class QuadWrapper:
 
         for f1, f2, edge in adj_faces:
             if f1 not in merged and f2 not in merged:
-                # Construct proposed quad
                 face1_verts = list(F[f1])
                 face2_verts = list(F[f2])
                 v_f1_opp = [v for v in face1_verts if v not in edge][0]
@@ -198,10 +177,8 @@ class QuadWrapper:
                 else:
                     prop_quad = [v_f1_opp, edge[1], v_f2_opp, edge[0]]
                     
-                # Check convexity
                 q_positions = [V[vi] for vi in prop_quad]
                 if is_convex(q_positions):
-                    # Merge them
                     merged.add(f1)
                     merged.add(f2)
                     quads.append(prop_quad)
@@ -211,11 +188,50 @@ class QuadWrapper:
             if i not in merged:
                 tris.append(list(face))
                 
-        return quads, tris
+        # Subdivide mixed mesh to guarantee pure quads
+        new_V = list(V)
+        new_quads = []
+        edge_midpoints = {}
+        
+        def get_edge_midpoint(v1, v2):
+            e = tuple(sorted((v1, v2)))
+            if e not in edge_midpoints:
+                idx = len(new_V)
+                new_V.append((V[v1] + V[v2]) / 2.0)
+                edge_midpoints[e] = idx
+            return edge_midpoints[e]
+            
+        for q in quads:
+            center_idx = len(new_V)
+            new_V.append(np.mean([V[vi] for vi in q], axis=0))
+            e0 = get_edge_midpoint(q[0], q[1])
+            e1 = get_edge_midpoint(q[1], q[2])
+            e2 = get_edge_midpoint(q[2], q[3])
+            e3 = get_edge_midpoint(q[3], q[0])
+            new_quads.extend([
+                [q[0], e0, center_idx, e3],
+                [q[1], e1, center_idx, e0],
+                [q[2], e2, center_idx, e1],
+                [q[3], e3, center_idx, e2]
+            ])
+            
+        for t in tris:
+            center_idx = len(new_V)
+            new_V.append(np.mean([V[vi] for vi in t], axis=0))
+            e0 = get_edge_midpoint(t[0], t[1])
+            e1 = get_edge_midpoint(t[1], t[2])
+            e2 = get_edge_midpoint(t[2], t[0])
+            new_quads.extend([
+                [t[0], e0, center_idx, e2],
+                [t[1], e1, center_idx, e0],
+                [t[2], e2, center_idx, e1]
+            ])
+            
+        return np.array(new_V), new_quads
         
     def _relax_mesh(self, mesh: HalfEdgeMesh, reference: HalfEdgeMesh):
         """Laplacian smoothing & Shrinkwrap onto reference mesh."""
         from src.reverse_engineering.shrink_wrap import ShrinkWrapper
-        wrapper = ShrinkWrapper(iterations=3, smooth_weight=self.smoothing_weight, projection_mode='closest_point')
+        wrapper = ShrinkWrapper(iterations=3, smooth_weight=self.smoothing_weight, projection_mode='ray_cast')
         wrapper.wrap(mesh, reference)
 

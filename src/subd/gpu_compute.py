@@ -163,6 +163,74 @@ __kernel void compute_vertex_points(
         }
     }
 }
+__kernel void compute_limit_surface(
+    __global const float* vertices,
+    __global const float* face_points,
+    __global const int* edge_vertices,
+    __global const int* edge_faces,
+    __global const int* vertex_faces,
+    __global const int* vertex_face_offsets,
+    __global const int* vertex_edges,
+    __global const int* vertex_edge_offsets,
+    __global float* limit_points_out,
+    const int num_vertices)
+{
+    int i = get_global_id(0);
+    if (i >= num_vertices) return;
+    
+    float px = vertices[i * 3 + 0];
+    float py = vertices[i * 3 + 1];
+    float pz = vertices[i * 3 + 2];
+    
+    int e_start = vertex_edge_offsets[i];
+    int e_end = vertex_edge_offsets[i+1];
+    int n_edges = e_end - e_start;
+    
+    int f_start = vertex_face_offsets[i];
+    int f_end = vertex_face_offsets[i+1];
+    int n_faces = f_end - f_start;
+    
+    bool is_boundary = false;
+    for (int j = e_start; j < e_end; ++j) {
+        int e_idx = vertex_edges[j];
+        if (edge_faces[e_idx * 2 + 1] == -1) {
+            is_boundary = true;
+            break;
+        }
+    }
+    
+    if (is_boundary || n_edges == 0) {
+        limit_points_out[i * 3 + 0] = px;
+        limit_points_out[i * 3 + 1] = py;
+        limit_points_out[i * 3 + 2] = pz;
+    } else {
+        float sum_Fx = 0.0f, sum_Fy = 0.0f, sum_Fz = 0.0f;
+        for (int j = f_start; j < f_end; ++j) {
+            int f_idx = vertex_faces[j];
+            sum_Fx += face_points[f_idx * 3 + 0];
+            sum_Fy += face_points[f_idx * 3 + 1];
+            sum_Fz += face_points[f_idx * 3 + 2];
+        }
+        
+        float sum_Rx = 0.0f, sum_Ry = 0.0f, sum_Rz = 0.0f;
+        for (int j = e_start; j < e_end; ++j) {
+            int e_idx = vertex_edges[j];
+            int v0 = edge_vertices[e_idx * 2 + 0];
+            int v1 = edge_vertices[e_idx * 2 + 1];
+            sum_Rx += (vertices[v0 * 3 + 0] + vertices[v1 * 3 + 0]) / 2.0f;
+            sum_Ry += (vertices[v0 * 3 + 1] + vertices[v1 * 3 + 1]) / 2.0f;
+            sum_Rz += (vertices[v0 * 3 + 2] + vertices[v1 * 3 + 2]) / 2.0f;
+        }
+        
+        float n = (float)n_edges;
+        float factor_P = (n - 2.0f) / n;
+        float factor_RF = 1.0f / (n * n);
+        
+        limit_points_out[i * 3 + 0] = factor_P * px + factor_RF * sum_Rx + factor_RF * sum_Fx;
+        limit_points_out[i * 3 + 1] = factor_P * py + factor_RF * sum_Ry + factor_RF * sum_Fy;
+        limit_points_out[i * 3 + 2] = factor_P * pz + factor_RF * sum_Rz + factor_RF * sum_Fz;
+    }
+}
 """
 
 class OpenCLSubdivider:
@@ -388,3 +456,63 @@ class OpenCLSubdivider:
         new_vertices = np.vstack([vertex_points, edge_points, face_points])
         
         return new_vertices, new_face_vertices, new_face_offsets
+
+    def evaluate_limit_surface(self, vertices, face_vertices, face_offsets=None):
+        """
+        Evaluate limit surface positions using OpenCL kernel.
+        """
+        if face_offsets is None:
+            faces_2d = np.asarray(face_vertices)
+            num_faces, n_verts = faces_2d.shape
+            face_vertices = faces_2d.flatten().astype(np.int32)
+            face_offsets = np.arange(0, (num_faces + 1) * n_verts, n_verts, dtype=np.int32)
+        else:
+            face_vertices = np.asarray(face_vertices, dtype=np.int32)
+            face_offsets = np.asarray(face_offsets, dtype=np.int32)
+            
+        vertices = np.asarray(vertices, dtype=np.float32)
+        num_vertices = len(vertices)
+        num_faces = len(face_offsets) - 1
+        
+        (edge_vertices, edge_faces, 
+         vertex_faces, vertex_face_offsets, 
+         vertex_edges, vertex_edge_offsets, edge_map) = self._extract_topology(
+            num_vertices, face_vertices, face_offsets
+        )
+        
+        mf = cl.mem_flags
+        
+        d_vertices = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=vertices)
+        d_face_vertices = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=face_vertices)
+        d_face_offsets = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=face_offsets)
+        
+        d_edge_vertices = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=edge_vertices)
+        d_edge_faces = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=edge_faces)
+        
+        d_vertex_faces = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=vertex_faces)
+        d_vertex_face_offsets = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=vertex_face_offsets)
+        d_vertex_edges = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=vertex_edges)
+        d_vertex_edge_offsets = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=vertex_edge_offsets)
+        
+        face_points = np.empty((num_faces, 3), dtype=np.float32)
+        limit_points = np.empty((num_vertices, 3), dtype=np.float32)
+        
+        d_face_points = cl.Buffer(self.ctx, mf.READ_WRITE, face_points.nbytes)
+        d_limit_points = cl.Buffer(self.ctx, mf.READ_WRITE, limit_points.nbytes)
+        
+        self.prg.compute_face_points(
+            self.queue, (num_faces,), None,
+            d_vertices, d_face_vertices, d_face_offsets, d_face_points, np.int32(num_faces)
+        )
+        
+        self.prg.compute_limit_surface(
+            self.queue, (num_vertices,), None,
+            d_vertices, d_face_points, d_edge_vertices, d_edge_faces,
+            d_vertex_faces, d_vertex_face_offsets, d_vertex_edges, d_vertex_edge_offsets,
+            d_limit_points, np.int32(num_vertices)
+        )
+        
+        cl.enqueue_copy(self.queue, limit_points, d_limit_points)
+        self.queue.finish()
+        
+        return limit_points

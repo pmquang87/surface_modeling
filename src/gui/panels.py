@@ -137,6 +137,29 @@ class PropertiesPanel(QWidget):
         self.group_box.setTitle("Feature")
         # Add dynamic fields based on feature properties...
 
+    def set_tool_ui(self, title: str, tool_widget: QWidget, apply_callback=None, cancel_callback=None):
+        self.clear()
+        self.group_box.setTitle(title)
+        
+        # Add the custom tool parameters widget
+        self.form_layout.addRow(tool_widget)
+        
+        # Add Apply / Cancel buttons
+        btn_layout = QHBoxLayout()
+        if apply_callback:
+            apply_btn = QPushButton("Apply")
+            apply_btn.setStyleSheet("background-color: #2e7d32; color: white;")
+            apply_btn.clicked.connect(apply_callback)
+            btn_layout.addWidget(apply_btn)
+            
+        if cancel_callback:
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.clicked.connect(cancel_callback)
+            btn_layout.addWidget(cancel_btn)
+            
+        if apply_callback or cancel_callback:
+            self.form_layout.addRow(btn_layout)
+
 
 from PySide6.QtWidgets import QRadioButton, QButtonGroup, QCheckBox, QHBoxLayout, QGridLayout
 

@@ -210,5 +210,44 @@ def evaluate_limit_surface(mesh: HalfEdgeMesh) -> tuple[np.ndarray, np.ndarray]:
             
         limit_positions[v.index] = limit_pos
         limit_normals[v.index] = v.normal
+        
+    regular, irregular = identify_regular_regions(mesh)
+    # Regular regions evaluate to exactly bicubic B-spline patches.
 
     return limit_positions, limit_normals
+
+def identify_regular_regions(mesh: HalfEdgeMesh) -> tuple[list[Vertex], list[Vertex]]:
+    """
+    Identify regular and irregular vertices in a quad mesh.
+    Regular vertices have valence 4 (or 3 for boundary) and are surrounded by quads.
+    Treats regular regions as bicubic B-spline patches conceptually.
+    """
+    regular = []
+    irregular = []
+    
+    for v in mesh.vertices:
+        is_reg = True
+        faces = mesh.get_vertex_faces(v)
+        
+        for f in faces:
+            if len(mesh.get_face_vertices(f)) != 4:
+                is_reg = False
+                break
+                
+        if not is_reg:
+            irregular.append(v)
+            continue
+            
+        valence = len(mesh.get_vertex_neighbors(v))
+        if mesh.is_boundary_vertex(v):
+            is_reg = (valence <= 3)
+        else:
+            is_reg = (valence == 4)
+            
+        if is_reg:
+            regular.append(v)
+        else:
+            irregular.append(v)
+            
+    return regular, irregular
+

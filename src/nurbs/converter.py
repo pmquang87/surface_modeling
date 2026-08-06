@@ -62,17 +62,35 @@ class SubDToNURBSConverter:
         from src.nurbs.g3_fitter import G3Fitter
         fitter = G3Fitter()
         
+        quad_faces = [f for f in mesh.faces if len(mesh.get_face_vertices(f)) == 4]
+        face_to_idx = {f.index: idx for idx, f in enumerate(quad_faces)}
+        
         quad_mesh_data = []
-        for face in mesh.faces:
+        for face in quad_faces:
             vertices = mesh.get_face_vertices(face)
-            if len(vertices) == 4:
-                corners = []
-                for v in vertices:
-                    if v.index < len(limit_positions):
-                        corners.append(limit_positions[v.index])
-                    else:
-                        corners.append(v.position)
-                quad_mesh_data.append({'corners': corners})
+            corners = []
+            for v in vertices:
+                if v.index < len(limit_positions):
+                    corners.append(limit_positions[v.index])
+                else:
+                    corners.append(v.position)
+            
+            neighbors = []
+            he = face.half_edge
+            curr = he
+            for _ in range(4):
+                if curr.twin and curr.twin.face and curr.twin.face.index in face_to_idx:
+                    neighbors.append(face_to_idx[curr.twin.face.index])
+                else:
+                    neighbors.append(-1)
+                curr = curr.next
+                
+            dense_points = self._evaluate_dense_grid(mesh, face, limit_positions, grid_size=6)
+            quad_mesh_data.append({
+                'corners': corners,
+                'dense_points': dense_points,
+                'neighbors': neighbors
+            })
                 
         patches = fitter.fit_surface(quad_mesh_data)
         return patches

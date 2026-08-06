@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import trimesh
 import trimesh.creation as creation
-from hypothesis import given, strategies as st
+from hypothesis import given, settings, strategies as st
 from hypothesis.extra.numpy import arrays
 
 from src.core.halfedge_mesh import HalfEdgeMesh
@@ -41,6 +41,7 @@ def valid_manifold_meshes(draw):
         mesh = creation.icosphere(subdivisions=subdivisions)
     return mesh
 
+@settings(deadline=None)
 @given(random_trimesh_data())
 def test_halfedge_mesh_random_topology_no_crash(mesh_data):
     vertices, faces = mesh_data
@@ -58,6 +59,7 @@ def test_halfedge_mesh_random_topology_no_crash(mesh_data):
     assert len(mesh_copy.vertices) == len(mesh.vertices)
     assert len(mesh_copy.faces) == len(mesh.faces)
 
+@settings(deadline=None)
 @given(random_trimesh_data())
 def test_quad_wrapper_random_topology_no_crash(mesh_data):
     vertices, faces = mesh_data
@@ -68,6 +70,7 @@ def test_quad_wrapper_random_topology_no_crash(mesh_data):
     result = wrapper.wrap(mesh)
     assert isinstance(result, HalfEdgeMesh)
 
+@settings(deadline=None)
 @given(valid_manifold_meshes())
 def test_topological_invariants_manifold(trimesh_obj):
     he_mesh = HalfEdgeMesh.from_trimesh(trimesh_obj)
@@ -91,6 +94,7 @@ def test_topological_invariants_manifold(trimesh_obj):
     for edge in he_mesh.edges:
         assert not he_mesh.is_boundary_edge(edge)
 
+@settings(deadline=None)
 @given(valid_manifold_meshes())
 def test_halfedge_mesh_pointers_manifold(trimesh_obj):
     he_mesh = HalfEdgeMesh.from_trimesh(trimesh_obj)

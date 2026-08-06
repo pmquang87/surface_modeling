@@ -106,6 +106,14 @@ class PowerSurfacingMainWindow(QMainWindow):
         
         self.current_mesh = None
         self.current_shape = None
+        
+        # Initialize Command Manager for Undo/Redo
+        try:
+            from src.core.command import CommandManager
+            self.command_manager = CommandManager(max_history=50)
+        except ImportError:
+            self.command_manager = None
+            
         if FeatureTree:
             self.feature_tree = FeatureTree()
         else:

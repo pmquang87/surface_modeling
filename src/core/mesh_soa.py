@@ -32,6 +32,40 @@ class MeshSOA:
         self._vv_offsets: Optional[np.ndarray] = None
         self._vv_vertices: Optional[np.ndarray] = None
         
+    @classmethod
+    def from_halfedge_mesh(cls, mesh) -> 'MeshSOA':
+        """
+        Creates a MeshSOA from a HalfEdgeMesh. 
+        Triangulates polygons using simple fan triangulation if necessary.
+        """
+        vertices = np.array([v.position for v in mesh.vertices], dtype=np.float64)
+        
+        faces_list = []
+        for f in mesh.faces:
+            v_idx = [v.index for v in mesh.get_face_vertices(f)]
+            if len(v_idx) == 3:
+                faces_list.append(v_idx)
+            elif len(v_idx) > 3:
+                # Basic fan triangulation
+                v0 = v_idx[0]
+                for i in range(1, len(v_idx) - 1):
+                    faces_list.append([v0, v_idx[i], v_idx[i+1]])
+                    
+        faces = np.array(faces_list, dtype=np.int64) if faces_list else np.empty((0, 3), dtype=np.int64)
+        return cls(vertices, faces)
+        
+    def to_halfedge_mesh(self):
+        """
+        Converts the SoA structure back to a HalfEdgeMesh.
+        """
+        from src.core.halfedge_mesh import HalfEdgeMesh
+        mesh = HalfEdgeMesh()
+        for v in self.vertices:
+            mesh.add_vertex(v.tolist())
+        for f in self.faces:
+            mesh.add_face(f.tolist())
+        return mesh
+
     def _build_topology(self):
         """Builds the vectorized half-edge topology arrays."""
         # v0 and v1 are the source and target vertices for each half-edge
