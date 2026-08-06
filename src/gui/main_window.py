@@ -4,12 +4,13 @@ import io
 import datetime
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QSplitter, QMenuBar, QMenu, QToolBar, QStatusBar,
-                               QFileDialog, QMessageBox, QApplication, QTextEdit)
+                               QFileDialog, QMessageBox, QApplication, QTextEdit,
+                               QComboBox, QLabel, QPushButton)
 from PySide6.QtCore import Qt, QObject, Signal
 from PySide6.QtGui import QAction, QPalette, QColor, QKeySequence, QIcon, QTextCursor
 
 from src.gui.viewport import MeshViewport
-from src.gui.panels import FeatureTreePanel, PropertiesPanel
+from src.gui.panels import FeatureTreePanel, PropertiesPanel, SelectionPanel
 from src.gui.dialogs import (PrimitiveDialog, SubdivideDialog, QuadWrapDialog, 
                              ShrinkWrapDialog, ShellThickenDialog, 
                              ConvertNURBSDialog, ExportDialog)
@@ -132,18 +133,33 @@ class PowerSurfacingMainWindow(QMainWindow):
         # Center (Viewport)
         self.viewport = MeshViewport()
         
-        # Right Panel (Properties)
+        # Right Panel (Selection + Properties)
+        self.right_panel_widget = QWidget()
+        right_layout = QVBoxLayout(self.right_panel_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.selection_panel = SelectionPanel()
         self.properties_panel = PropertiesPanel()
-        self.properties_panel.setMinimumWidth(250)
+        
+        right_layout.addWidget(self.selection_panel)
+        right_layout.addWidget(self.properties_panel)
+        self.right_panel_widget.setMinimumWidth(250)
         
         # Add to horizontal splitter
         self.splitter.addWidget(self.feature_panel)
         self.splitter.addWidget(self.viewport)
-        self.splitter.addWidget(self.properties_panel)
+        self.splitter.addWidget(self.right_panel_widget)
         
-        # Wire up viewport and properties panel
+        # Wire up viewport and panels
         self.viewport.selection_changed.connect(self.on_selection_changed)
-        self.properties_panel.expand_selection_requested.connect(self.on_expand_selection)
+        
+        # Connect SelectionPanel signals to Viewport
+        self.selection_panel.selection_mode_changed.connect(self.viewport.set_selection_mode)
+        self.selection_panel.selection_method_changed.connect(self.viewport.set_selection_method)
+        self.selection_panel.selection_modifier_changed.connect(self.viewport.set_selection_modifier)
+        self.selection_panel.selection_operation_requested.connect(self.viewport.run_selection_operation)
+        self.selection_panel.tangent_selection_requested.connect(self.on_expand_selection)
+        self.selection_panel.cb_through.toggled.connect(self.viewport.set_box_select_through)
         
         # Set stretch factors (Viewport takes most space)
         self.splitter.setStretchFactor(0, 0)
@@ -255,8 +271,30 @@ class PowerSurfacingMainWindow(QMainWindow):
         self.act_view_wire.triggered.connect(lambda: self.viewport.set_display_mode('wireframe'))
         self.act_view_solid_wire = QAction("Solid + Wireframe", self)
         self.act_view_solid_wire.triggered.connect(lambda: self.viewport.set_display_mode('solid+wireframe'))
-        self.act_view_reset = QAction("Reset Camera", self)
+        self.act_view_reset = QAction("Re-center Camera", self)
         self.act_view_reset.triggered.connect(self.viewport.reset_camera)
+
+        # Camera Views
+        self.act_cam_iso = QAction("Isometric", self)
+        self.act_cam_iso.triggered.connect(self.viewport.plotter.view_isometric)
+        
+        self.act_cam_top = QAction("Top (XY)", self)
+        self.act_cam_top.triggered.connect(self.viewport.plotter.view_xy)
+        
+        self.act_cam_bottom = QAction("Bottom", self)
+        self.act_cam_bottom.triggered.connect(lambda: self.viewport.plotter.view_xy(negative=True))
+        
+        self.act_cam_front = QAction("Front (XZ)", self)
+        self.act_cam_front.triggered.connect(self.viewport.plotter.view_xz)
+        
+        self.act_cam_back = QAction("Back", self)
+        self.act_cam_back.triggered.connect(lambda: self.viewport.plotter.view_xz(negative=True))
+        
+        self.act_cam_right = QAction("Right (YZ)", self)
+        self.act_cam_right.triggered.connect(self.viewport.plotter.view_yz)
+        
+        self.act_cam_left = QAction("Left", self)
+        self.act_cam_left.triggered.connect(lambda: self.viewport.plotter.view_yz(negative=True))
 
         # Select Actions
         self.act_sel_vertex = QAction("Select Vertex", self)
@@ -299,6 +337,14 @@ class PowerSurfacingMainWindow(QMainWindow):
         menu_view.addAction(self.act_view_solid_wire)
         menu_view.addSeparator()
         menu_view.addAction(self.act_view_reset)
+        menu_view.addSeparator()
+        menu_view.addAction(self.act_cam_iso)
+        menu_view.addAction(self.act_cam_top)
+        menu_view.addAction(self.act_cam_bottom)
+        menu_view.addAction(self.act_cam_front)
+        menu_view.addAction(self.act_cam_back)
+        menu_view.addAction(self.act_cam_right)
+        menu_view.addAction(self.act_cam_left)
 
         menu_select = menubar.addMenu("&Select")
         menu_select.addAction(self.act_sel_vertex)
@@ -319,6 +365,26 @@ class PowerSurfacingMainWindow(QMainWindow):
         toolbar.addAction(self.act_sel_vertex)
         toolbar.addAction(self.act_sel_edge)
         toolbar.addAction(self.act_sel_face)
+        
+        toolbar.addSeparator()
+        btn_recenter = QPushButton("Re-center")
+        btn_recenter.clicked.connect(self.viewport.reset_camera)
+        toolbar.addWidget(btn_recenter)
+        
+        toolbar.addWidget(QLabel("  View: "))
+        self.combo_view = QComboBox()
+        self.combo_view.addItems(["Custom", "Isometric", "Top", "Bottom", "Front", "Back", "Right", "Left"])
+        self.combo_view.activated.connect(self._on_view_combo_changed)
+        toolbar.addWidget(self.combo_view)
+
+    def _on_view_combo_changed(self, index):
+        if index == 1: self.viewport.plotter.view_isometric()
+        elif index == 2: self.viewport.plotter.view_xy()
+        elif index == 3: self.viewport.plotter.view_xy(negative=True)
+        elif index == 4: self.viewport.plotter.view_xz()
+        elif index == 5: self.viewport.plotter.view_xz(negative=True)
+        elif index == 6: self.viewport.plotter.view_yz()
+        elif index == 7: self.viewport.plotter.view_yz(negative=True)
 
     def on_selection_changed(self, indices):
         if not self.current_mesh: return

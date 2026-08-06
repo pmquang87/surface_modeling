@@ -128,17 +128,120 @@ class PropertiesPanel(QWidget):
         else:
             self.group_box.setTitle(f"Selected Faces ({len(face_indices)})")
 
-        self.tolerance_spin = QDoubleSpinBox()
-        self.tolerance_spin.setRange(0.0, 180.0)
-        self.tolerance_spin.setValue(15.0)
-        
-        self.select_tangent_btn = QPushButton("Select Tangent Faces")
-        self.select_tangent_btn.clicked.connect(lambda: self.expand_selection_requested.emit(self.tolerance_spin.value()))
-        
-        self.form_layout.addRow("Tolerance Angle:", self.tolerance_spin)
-        self.form_layout.addRow(self.select_tangent_btn)
-
     def set_feature_properties(self, feature):
         self.clear()
         self.group_box.setTitle("Feature")
         # Add dynamic fields based on feature properties...
+
+
+from PySide6.QtWidgets import QRadioButton, QButtonGroup, QCheckBox, QHBoxLayout, QGridLayout
+
+class SelectionPanel(QWidget):
+    """Unified Selection Tool Panel with modifiers and operations."""
+    
+    selection_mode_changed = Signal(str)
+    selection_method_changed = Signal(str)
+    selection_modifier_changed = Signal(str)
+    selection_operation_requested = Signal(str)
+    tangent_selection_requested = Signal(float)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.layout = QVBoxLayout(self)
+        
+        # Method & Entity Type
+        grid = QGridLayout()
+        
+        # Tools
+        self.tool_group = QButtonGroup(self)
+        self.rb_pick = QRadioButton("Pick")
+        self.rb_box = QRadioButton("Box (Area)")
+        self.rb_pick.setChecked(True)
+        self.tool_group.addButton(self.rb_pick, 1)
+        self.tool_group.addButton(self.rb_box, 2)
+        grid.addWidget(self.rb_pick, 0, 0)
+        grid.addWidget(self.rb_box, 1, 0)
+        
+        self.cb_through = QCheckBox("Select Through")
+        self.cb_through.setToolTip("If unchecked, selects visible only.")
+        self.cb_through.setEnabled(False)
+        grid.addWidget(self.cb_through, 2, 0)
+        self.rb_box.toggled.connect(self.cb_through.setEnabled)
+        
+        self.tool_group.idClicked.connect(lambda id: self.selection_method_changed.emit('box' if id == 2 else 'pick'))
+        
+        # Modifiers
+        self.mod_group = QButtonGroup(self)
+        self.rb_new = QRadioButton("New")
+        self.rb_add = QRadioButton("Add")
+        self.rb_remove = QRadioButton("Remove")
+        self.rb_new.setChecked(True)
+        self.mod_group.addButton(self.rb_new, 1)
+        self.mod_group.addButton(self.rb_add, 2)
+        self.mod_group.addButton(self.rb_remove, 3)
+        grid.addWidget(self.rb_new, 0, 1)
+        grid.addWidget(self.rb_add, 1, 1)
+        grid.addWidget(self.rb_remove, 2, 1)
+        
+        def mod_emit(id):
+            modes = {1: 'new', 2: 'add', 3: 'remove'}
+            self.selection_modifier_changed.emit(modes[id])
+        self.mod_group.idClicked.connect(mod_emit)
+        
+        # Entity Type
+        self.entity_group = QButtonGroup(self)
+        self.rb_vertex = QRadioButton("Vertex")
+        self.rb_edge = QRadioButton("Edge")
+        self.rb_face = QRadioButton("Face")
+        self.rb_face.setChecked(True)
+        self.entity_group.addButton(self.rb_vertex, 1)
+        self.entity_group.addButton(self.rb_edge, 2)
+        self.entity_group.addButton(self.rb_face, 3)
+        grid.addWidget(self.rb_vertex, 0, 2)
+        grid.addWidget(self.rb_edge, 1, 2)
+        grid.addWidget(self.rb_face, 2, 2)
+        
+        def entity_emit(id):
+            entities = {1: 'vertex', 2: 'edge', 3: 'face'}
+            self.selection_mode_changed.emit(entities[id])
+        self.entity_group.idClicked.connect(entity_emit)
+        
+        gb = QGroupBox("Selection Method & Type")
+        gb.setLayout(grid)
+        self.layout.addWidget(gb)
+        
+        # Operations
+        ops_group = QGroupBox("Operations")
+        ops_layout = QVBoxLayout(ops_group)
+        
+        self.btn_adj = QPushButton("Adjacent")
+        self.btn_adj.clicked.connect(lambda: self.selection_operation_requested.emit("adjacent"))
+        ops_layout.addWidget(self.btn_adj)
+        
+        self.btn_conn = QPushButton("Connected (Attach)")
+        self.btn_conn.clicked.connect(lambda: self.selection_operation_requested.emit("connected"))
+        ops_layout.addWidget(self.btn_conn)
+        
+        self.btn_inv = QPushButton("Reverse (Invert)")
+        self.btn_inv.clicked.connect(lambda: self.selection_operation_requested.emit("invert"))
+        ops_layout.addWidget(self.btn_inv)
+        
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.clicked.connect(lambda: self.selection_operation_requested.emit("clear"))
+        ops_layout.addWidget(self.btn_clear)
+        
+        # Tangency Tools
+        tangent_layout = QHBoxLayout()
+        tangent_layout.addWidget(QLabel("Angle:"))
+        self.tolerance_spin = QDoubleSpinBox()
+        self.tolerance_spin.setRange(0.0, 180.0)
+        self.tolerance_spin.setValue(15.0)
+        tangent_layout.addWidget(self.tolerance_spin)
+        ops_layout.addLayout(tangent_layout)
+        
+        self.btn_tan = QPushButton("Expand Tangent")
+        self.btn_tan.clicked.connect(lambda: self.tangent_selection_requested.emit(self.tolerance_spin.value()))
+        ops_layout.addWidget(self.btn_tan)
+        
+        self.layout.addWidget(ops_group)
+        self.layout.addStretch()
