@@ -45,23 +45,110 @@ class MeshViewport(QWidget):
 
         self._selected_indices = []
 
+        self.selection_method = 'pick'
+        self.selection_modifier = 'new'
+        self.box_select_through = False
+        
+        self._ctrl_pressed = False
+        
         # Setup left-click picking using custom logic
         self.plotter.track_click_position(self._on_click, side='left')
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Shift:
             self._shift_pressed = True
+        elif event.key() == Qt.Key_Control:
+            self._ctrl_pressed = True
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key_Shift:
             self._shift_pressed = False
+        elif event.key() == Qt.Key_Control:
+            self._ctrl_pressed = False
         super().keyReleaseEvent(event)
+        
+    def set_selection_method(self, method: str):
+        self.selection_method = method
+        if method == 'box':
+            # PyVista doesn't natively map left drag to box selection easily without overriding the entire interactor style.
+            # We will use enable_cell_picking if they press 'r' for now, but log it.
+            pass
+
+    def set_selection_modifier(self, mod: str):
+        self.selection_modifier = mod
+
+    def set_box_select_through(self, through: bool):
+        self.box_select_through = through
+        
+    def _apply_selection_modifier(self, new_ids: list):
+        current = set(self._selected_indices)
+        incoming = set(new_ids)
+        
+        mod = self.selection_modifier
+        if self._shift_pressed and mod == 'new':
+            mod = 'add'
+        elif self._ctrl_pressed and mod == 'new':
+            mod = 'remove'
+            
+        if mod == 'new':
+            current = incoming
+        elif mod == 'add':
+            current.update(incoming)
+        elif mod == 'remove':
+            current.difference_update(incoming)
+            
+        self._selected_indices = list(current)
+        self.selection_changed.emit(self._selected_indices)
+        self.highlight_selection(self._selected_indices, self.selection_mode)
+        
+    def run_selection_operation(self, op: str):
+        if not self.current_mesh: return
+        if op == 'clear':
+            self._selected_indices = []
+            self.selection_changed.emit(self._selected_indices)
+            self.highlight_selection(self._selected_indices, self.selection_mode)
+            return
+            
+        if not self._selected_indices and op != 'invert': return
+        
+        new_sel = set(self._selected_indices)
+        
+        if op == 'adjacent':
+            if self.selection_mode == 'face':
+                new_sel.update(self.current_mesh.get_adjacent_faces(self._selected_indices))
+            elif self.selection_mode == 'vertex':
+                new_sel.update(self.current_mesh.get_adjacent_vertices(self._selected_indices))
+            elif self.selection_mode == 'edge':
+                new_sel.update(self.current_mesh.get_adjacent_edges(self._selected_indices))
+                
+        elif op == 'connected':
+            if self.selection_mode == 'face':
+                new_sel.update(self.current_mesh.get_connected_faces(self._selected_indices))
+            elif self.selection_mode == 'vertex':
+                new_sel.update(self.current_mesh.get_connected_vertices(self._selected_indices))
+            elif self.selection_mode == 'edge':
+                new_sel.update(self.current_mesh.get_connected_edges(self._selected_indices))
+                
+        elif op == 'invert':
+            if self.selection_mode == 'face':
+                all_ids = set(range(len(self.current_mesh.faces)))
+            elif self.selection_mode == 'vertex':
+                all_ids = set(range(len(self.current_mesh.vertices)))
+            elif self.selection_mode == 'edge':
+                all_ids = set(range(len(self.current_mesh.edges)))
+            new_sel = all_ids - new_sel
+            
+        self._selected_indices = list(new_sel)
+        self.selection_changed.emit(self._selected_indices)
+        self.highlight_selection(self._selected_indices, self.selection_mode)
 
     def _on_click(self, pos):
         if not self.current_mesh or self.selection_mode == 'none': 
             return
             
+        # If method is box, we might handle it differently later
+        
         try:
             p3d = self.plotter.pick_mouse_position()
             if p3d is None: 
@@ -74,26 +161,14 @@ class MeshViewport(QWidget):
         if self.selection_mode == 'face':
             face_id = pv_mesh.find_closest_cell(p3d)
             if face_id < 0 or face_id >= len(self.current_mesh.faces): return
-            if self._shift_pressed:
-                if face_id not in self._selected_indices:
-                    self._selected_indices.append(face_id)
-            else:
-                self._selected_indices = [face_id]
+            self._apply_selection_modifier([face_id])
             self.face_selected.emit(face_id)
-            self.selection_changed.emit(self._selected_indices)
-            self.highlight_selection(self._selected_indices, 'face')
             
         elif self.selection_mode == 'vertex':
             vert_id = pv_mesh.find_closest_point(p3d)
             if vert_id < 0 or vert_id >= len(self.current_mesh.vertices): return
-            if self._shift_pressed:
-                if vert_id not in self._selected_indices:
-                    self._selected_indices.append(vert_id)
-            else:
-                self._selected_indices = [vert_id]
+            self._apply_selection_modifier([vert_id])
             self.vertex_selected.emit(vert_id)
-            self.selection_changed.emit(self._selected_indices)
-            self.highlight_selection(self._selected_indices, 'vertex')
             
         elif self.selection_mode == 'edge':
             face_id = pv_mesh.find_closest_cell(p3d)
@@ -107,7 +182,6 @@ class MeshViewport(QWidget):
                 for e in edges:
                     v1 = e.half_edge.vertex.position
                     v2 = e.half_edge.prev.vertex.position
-                    # mid point approximation for edge picking
                     mid = (v1 + v2) / 2.0
                     dist = np.linalg.norm(np.array(p3d) - mid)
                     if dist < min_dist:
@@ -115,14 +189,8 @@ class MeshViewport(QWidget):
                         closest_edge = e.index
                         
                 if closest_edge is not None:
-                    if self._shift_pressed:
-                        if closest_edge not in self._selected_indices:
-                            self._selected_indices.append(closest_edge)
-                    else:
-                        self._selected_indices = [closest_edge]
+                    self._apply_selection_modifier([closest_edge])
                     self.edge_selected.emit(closest_edge)
-                    self.selection_changed.emit(self._selected_indices)
-                    self.highlight_selection(self._selected_indices, 'edge')
 
     def get_selected_faces(self) -> list:
         if self.selection_mode == 'face':

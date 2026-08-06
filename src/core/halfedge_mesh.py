@@ -370,3 +370,107 @@ class HalfEdgeMesh:
             
         m._he_dict = {(k[0], k[1]): m.half_edges[v.index] for k, v in self._he_dict.items()}
         return m
+
+    def get_adjacent_faces(self, face_ids: List[int]) -> List[int]:
+        adjacent = set()
+        for f_id in face_ids:
+            if f_id < 0 or f_id >= len(self.faces): continue
+            face = self.faces[f_id]
+            he = face.half_edge
+            if not he: continue
+            curr = he
+            while True:
+                if curr.twin and curr.twin.face:
+                    adjacent.add(curr.twin.face.index)
+                curr = curr.next
+                if curr == he: break
+        # Do not include the originally selected faces in the "adjacent" boundary
+        return list(adjacent - set(face_ids))
+
+    def get_adjacent_vertices(self, vertex_ids: List[int]) -> List[int]:
+        adjacent = set()
+        for v_id in vertex_ids:
+            if v_id < 0 or v_id >= len(self.vertices): continue
+            v = self.vertices[v_id]
+            neighbors = self.get_vertex_neighbors(v)
+            for n in neighbors:
+                adjacent.add(n.index)
+        return list(adjacent - set(vertex_ids))
+
+    def get_adjacent_edges(self, edge_ids: List[int]) -> List[int]:
+        adjacent = set()
+        for e_id in edge_ids:
+            if e_id < 0 or e_id >= len(self.edges): continue
+            e = self.edges[e_id]
+            he1 = e.half_edge
+            he2 = e.half_edge.twin
+            for he in [he1, he2]:
+                if not he: continue
+                if he.next and he.next.edge: adjacent.add(he.next.edge.index)
+                if he.prev and he.prev.edge: adjacent.add(he.prev.edge.index)
+        return list(adjacent - set(edge_ids))
+
+    def get_connected_faces(self, start_face_ids: List[int]) -> List[int]:
+        if not start_face_ids: return []
+        visited = set(start_face_ids)
+        queue = list(start_face_ids)
+        
+        idx = 0
+        while idx < len(queue):
+            curr_id = queue[idx]
+            idx += 1
+            if curr_id < 0 or curr_id >= len(self.faces): continue
+            
+            face = self.faces[curr_id]
+            he = face.half_edge
+            if not he: continue
+            
+            curr_he = he
+            while True:
+                if curr_he.twin and curr_he.twin.face:
+                    n_id = curr_he.twin.face.index
+                    if n_id not in visited:
+                        visited.add(n_id)
+                        queue.append(n_id)
+                curr_he = curr_he.next
+                if curr_he == he: break
+                
+        return list(visited)
+
+    def get_connected_vertices(self, start_vertex_ids: List[int]) -> List[int]:
+        if not start_vertex_ids: return []
+        visited = set(start_vertex_ids)
+        queue = list(start_vertex_ids)
+        idx = 0
+        while idx < len(queue):
+            curr_id = queue[idx]
+            idx += 1
+            if curr_id < 0 or curr_id >= len(self.vertices): continue
+            v = self.vertices[curr_id]
+            for n in self.get_vertex_neighbors(v):
+                if n.index not in visited:
+                    visited.add(n.index)
+                    queue.append(n.index)
+        return list(visited)
+
+    def get_connected_edges(self, start_edge_ids: List[int]) -> List[int]:
+        if not start_edge_ids: return []
+        visited = set(start_edge_ids)
+        queue = list(start_edge_ids)
+        idx = 0
+        while idx < len(queue):
+            curr_id = queue[idx]
+            idx += 1
+            if curr_id < 0 or curr_id >= len(self.edges): continue
+            e = self.edges[curr_id]
+            he1 = e.half_edge
+            he2 = e.half_edge.twin
+            for he in [he1, he2]:
+                if not he: continue
+                if he.next and he.next.edge and he.next.edge.index not in visited:
+                    visited.add(he.next.edge.index)
+                    queue.append(he.next.edge.index)
+                if he.prev and he.prev.edge and he.prev.edge.index not in visited:
+                    visited.add(he.prev.edge.index)
+                    queue.append(he.prev.edge.index)
+        return list(visited)

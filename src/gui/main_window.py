@@ -9,7 +9,7 @@ from PySide6.QtCore import Qt, QObject, Signal
 from PySide6.QtGui import QAction, QPalette, QColor, QKeySequence, QIcon, QTextCursor
 
 from src.gui.viewport import MeshViewport
-from src.gui.panels import FeatureTreePanel, PropertiesPanel
+from src.gui.panels import FeatureTreePanel, PropertiesPanel, SelectionPanel
 from src.gui.dialogs import (PrimitiveDialog, SubdivideDialog, QuadWrapDialog, 
                              ShrinkWrapDialog, ShellThickenDialog, 
                              ConvertNURBSDialog, ExportDialog)
@@ -132,18 +132,33 @@ class PowerSurfacingMainWindow(QMainWindow):
         # Center (Viewport)
         self.viewport = MeshViewport()
         
-        # Right Panel (Properties)
+        # Right Panel (Selection + Properties)
+        self.right_panel_widget = QWidget()
+        right_layout = QVBoxLayout(self.right_panel_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.selection_panel = SelectionPanel()
         self.properties_panel = PropertiesPanel()
-        self.properties_panel.setMinimumWidth(250)
+        
+        right_layout.addWidget(self.selection_panel)
+        right_layout.addWidget(self.properties_panel)
+        self.right_panel_widget.setMinimumWidth(250)
         
         # Add to horizontal splitter
         self.splitter.addWidget(self.feature_panel)
         self.splitter.addWidget(self.viewport)
-        self.splitter.addWidget(self.properties_panel)
+        self.splitter.addWidget(self.right_panel_widget)
         
-        # Wire up viewport and properties panel
+        # Wire up viewport and panels
         self.viewport.selection_changed.connect(self.on_selection_changed)
-        self.properties_panel.expand_selection_requested.connect(self.on_expand_selection)
+        
+        # Connect SelectionPanel signals to Viewport
+        self.selection_panel.selection_mode_changed.connect(self.viewport.set_selection_mode)
+        self.selection_panel.selection_method_changed.connect(self.viewport.set_selection_method)
+        self.selection_panel.selection_modifier_changed.connect(self.viewport.set_selection_modifier)
+        self.selection_panel.selection_operation_requested.connect(self.viewport.run_selection_operation)
+        self.selection_panel.tangent_selection_requested.connect(self.on_expand_selection)
+        self.selection_panel.cb_through.toggled.connect(self.viewport.set_box_select_through)
         
         # Set stretch factors (Viewport takes most space)
         self.splitter.setStretchFactor(0, 0)
