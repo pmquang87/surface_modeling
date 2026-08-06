@@ -23,18 +23,14 @@ class SubDToNURBSConverter:
         self.continuity = continuity
         self.tolerance = tolerance
 
-    def convert(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3) -> Dict[str, Any]:
-        result = {
-            'patches': [],
-            'shape': None,
-            'mesh': mesh
-        }
-        
+    def generate_patches(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3) -> List[Dict[str, Any]]:
+        """Generate raw Python patch data without building the final solid."""
         try:
             from src.subd.catmull_clark import evaluate_limit_surface
             limit_positions, limit_normals = evaluate_limit_surface(mesh)
         except Exception:
             limit_positions = np.array([v.position for v in mesh.vertices])
+            limit_normals = []
             
         patches = []
         for face in mesh.faces:
@@ -43,32 +39,41 @@ class SubDToNURBSConverter:
                 corners = [limit_positions[v.index] for v in vertices]
                 edge_tangents = [] 
                 
-                # compute approximate center of the limit surface patch
-                # using the face's limit position roughly as average of corners
-                # But actually evaluate_limit_surface doesn't give us the face center limit.
-                # Let's just use the mesh's face center and project it?
-                # Actually, the average of corner limit positions is decent.
                 center_pt = np.mean(corners, axis=0)
-                # pull it out slightly along normal to create curvature
-                normal = np.mean([limit_normals[v.index] for v in vertices], axis=0)
+                
+                if limit_normals is not None and len(limit_normals) > 0:
+                    normal = np.mean([limit_normals[v.index] for v in vertices], axis=0)
+                else:
+                    v1 = corners[1] - corners[0]
+                    v2 = corners[3] - corners[0]
+                    normal = np.cross(v1, v2)
+                    
                 n_len = np.linalg.norm(normal)
                 if n_len > 1e-6:
                     normal = normal / n_len
                     
-                # Base quad side length
                 side_len = np.linalg.norm(corners[0] - corners[1])
-                # Add a small bubble effect if it's not perfectly flat
                 interior_points = [center_pt + normal * (side_len * 0.1)]
                 
                 patch_data = self._fit_bspline_patch(corners, edge_tangents, interior_points)
                 if patch_data:
                     patches.append(patch_data)
                     
-        patches = self._enforce_continuity(patches)
-        result['patches'] = patches
-        result['shape'] = self._build_occ_shape(patches)
+        return self._enforce_continuity(patches)
         
-        return result
+    def build_shape(self, patches: List[Dict[str, Any]]) -> Optional[Any]:
+        """Build the final OCC shape from raw patches."""
+        return self._build_occ_shape(patches)
+
+    def convert(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3) -> Dict[str, Any]:
+        """Convenience method to generate patches and build shape."""
+        patches = self.generate_patches(mesh, subdivision_levels)
+        shape = self.build_shape(patches)
+        return {
+            'patches': patches,
+            'shape': shape,
+            'mesh': mesh
+        }
 
     def _fit_bspline_patch(self, corners: List[np.ndarray], edge_tangents: List[Any], interior_points: List[Any]) -> Dict[str, Any]:
         """Fit a single bicubic B-spline patch to a quad region.
