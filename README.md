@@ -16,7 +16,7 @@
 
 ## Overview
 
-**Python Surfacing** is a desktop application for subdivision surface modeling and reverse engineering, inspired by [nPower Software's Power Surfacing](https://www.npowersoftware.com/) for SOLIDWORKS. It bridges the gap between **fluid organic design** (Sub-D modeling) and **precise CAD engineering** (NURBS/B-Rep), enabling users to:
+**Python Surfacing** is a desktop application for subdivision surface modeling and reverse engineering, inspired by modern CAD modeling tools. It bridges the gap between **fluid organic design** (Sub-D modeling) and **precise CAD engineering** (NURBS/B-Rep), enabling users to:
 
 - 🎨 **Create** organic shapes using Catmull-Clark subdivision surfaces
 - 🔄 **Convert** Sub-D meshes to NURBS B-spline patches
@@ -65,7 +65,7 @@
 ### ⚙️ Advanced Operations
 - **Shell**: Create thin-walled solids using SDF/voxel-based approach (handles self-intersections)
 - **Thicken**: Convert surfaces to solids with uniform wall thickness
-- Uses signed distance fields + marching cubes — inspired by Power Surfacing's "never-fail" offset
+- Uses signed distance fields + marching cubes — inspired by "never-fail" offset techniques
 
 ### 🖥️ Professional GUI
 - Dark-themed PySide6 desktop application
@@ -298,7 +298,7 @@ python-power-surfacing/
 
 ## Technical Background
 
-This project implements concepts from [Power Surfacing for SOLIDWORKS](https://www.npowersoftware.com/) by nPower Software (IntegrityWare, Inc.), translating them into an open-source Python framework:
+This project implements concepts from advanced subdivision surface tools, translating them into an open-source Python framework:
 
 ### Catmull-Clark Subdivision
 The core algorithm recursively smooths a coarse polygon mesh toward a theoretical **limit surface**. Each subdivision step computes:
@@ -347,7 +347,7 @@ This project is licensed under the MIT License — see [LICENSE](LICENSE) for de
 
 ## Acknowledgments
 
-- **[nPower Software](https://www.npowersoftware.com/)** — Power Surfacing for SOLIDWORKS, the inspiration for this project
+- **Commercial Sub-D CAD Tools** — The inspiration for this project's workflows
 - **[IntegrityWare](https://www.integrityware.com/)** — Solids# kernel and Catmull-Clark NURBS conversion research
 - **[Catmull & Clark (1978)](https://en.wikipedia.org/wiki/Catmull%E2%80%93Clark_subdivision_surface)** — Original subdivision surface algorithm
 - **[PyVista](https://pyvista.org/)** — 3D visualization framework

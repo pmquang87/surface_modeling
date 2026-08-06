@@ -7,7 +7,7 @@ from src.core.halfedge_mesh import HalfEdgeMesh
 class QuadWrapper:
     """Generates a quad-dominant control cage wrapped around a dense reference mesh.
     
-    Inspired by Power Surfacing RE's Quad Wrap: analyzes curvature flow,
+    Inspired by commercial Quad Wrap tools: analyzes curvature flow,
     generates a coarse quad mesh aligned to geometric features.
     """
     
