@@ -298,13 +298,13 @@ class PowerSurfacingMainWindow(QMainWindow):
 
         # Select Actions
         self.act_sel_vertex = QAction("Select Vertex", self)
-        self.act_sel_vertex.triggered.connect(lambda: self.viewport.set_selection_mode('vertex'))
+        self.act_sel_vertex.triggered.connect(lambda: self.selection_panel.set_selection_mode('vertex') if hasattr(self, 'selection_panel') else None)
         self.act_sel_edge = QAction("Select Edge", self)
-        self.act_sel_edge.triggered.connect(lambda: self.viewport.set_selection_mode('edge'))
+        self.act_sel_edge.triggered.connect(lambda: self.selection_panel.set_selection_mode('edge') if hasattr(self, 'selection_panel') else None)
         self.act_sel_face = QAction("Select Face", self)
-        self.act_sel_face.triggered.connect(lambda: self.viewport.set_selection_mode('face'))
+        self.act_sel_face.triggered.connect(lambda: self.selection_panel.set_selection_mode('face') if hasattr(self, 'selection_panel') else None)
         self.act_sel_none = QAction("Select None", self)
-        self.act_sel_none.triggered.connect(lambda: self.viewport.set_selection_mode('none'))
+        self.act_sel_none.triggered.connect(lambda: self.selection_panel.set_selection_mode('none') if hasattr(self, 'selection_panel') else None)
 
     def _create_menus(self):
         menubar = self.menuBar()

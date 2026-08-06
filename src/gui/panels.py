@@ -245,3 +245,21 @@ class SelectionPanel(QWidget):
         
         self.layout.addWidget(ops_group)
         self.layout.addStretch()
+
+    def set_selection_mode(self, mode: str):
+        self.entity_group.blockSignals(True)
+        if mode == 'vertex':
+            self.rb_vertex.setChecked(True)
+        elif mode == 'edge':
+            self.rb_edge.setChecked(True)
+        elif mode == 'face':
+            self.rb_face.setChecked(True)
+        elif mode == 'none':
+            self.entity_group.setExclusive(False)
+            self.rb_vertex.setChecked(False)
+            self.rb_edge.setChecked(False)
+            self.rb_face.setChecked(False)
+            self.entity_group.setExclusive(True)
+        self.entity_group.blockSignals(False)
+        self.selection_mode_changed.emit(mode)
+
