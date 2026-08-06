@@ -223,6 +223,54 @@ class HalfEdgeMesh:
         for f in self.faces:
             f.selected = f.index in indices
 
+    def expand_selection_by_angle(self, start_face_ids: List[int], max_angle_degrees: float) -> List[int]:
+        if not self.faces:
+            return []
+            
+        if np.allclose(self.faces[0].normal, np.zeros(3)):
+            self.compute_face_normals()
+            
+        selected = set(start_face_ids)
+        queue = list(start_face_ids)
+        max_angle_rad = np.radians(max_angle_degrees)
+        
+        idx = 0
+        while idx < len(queue):
+            curr_id = queue[idx]
+            idx += 1
+            
+            if curr_id < 0 or curr_id >= len(self.faces):
+                continue
+                
+            curr_face = self.faces[curr_id]
+            curr_normal = curr_face.normal
+            
+            he = curr_face.half_edge
+            if he is None:
+                continue
+                
+            curr_he = he
+            while True:
+                if curr_he.twin is not None and curr_he.twin.face is not None:
+                    neighbor_face = curr_he.twin.face
+                    neighbor_id = neighbor_face.index
+                    
+                    if neighbor_id not in selected:
+                        neighbor_normal = neighbor_face.normal
+                        dot = np.dot(curr_normal, neighbor_normal)
+                        dot = np.clip(dot, -1.0, 1.0)
+                        angle_rad = np.arccos(dot)
+                        
+                        if angle_rad <= max_angle_rad + 1e-6:
+                            selected.add(neighbor_id)
+                            queue.append(neighbor_id)
+                            
+                curr_he = curr_he.next
+                if curr_he == he:
+                    break
+                    
+        return list(selected)
+
     def to_arrays(self) -> Dict[str, Any]:
         verts = np.array([v.position for v in self.vertices], dtype=np.float64)
         faces = [ [v.index for v in self.get_face_vertices(f)] for f in self.faces ]

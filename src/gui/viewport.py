@@ -22,6 +22,9 @@ class MeshViewport(QWidget):
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
         
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._shift_pressed = False
+        
         # PyVista interactor
         self.plotter = QtInteractor(self)
         self.layout.addWidget(self.plotter.interactor)
@@ -45,15 +48,35 @@ class MeshViewport(QWidget):
         # Setup picking — deferred to set_selection_mode()
         # Don't enable picking at startup to avoid conflicts
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Shift:
+            self._shift_pressed = True
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key_Shift:
+            self._shift_pressed = False
+        super().keyReleaseEvent(event)
+
     def _on_cell_picked(self, cell):
         if not self.current_mesh: return
         if hasattr(cell, 'cell_data') and "vtkOriginalCellIds" in cell.cell_data:
             original_ids = cell.cell_data["vtkOriginalCellIds"]
             if len(original_ids) > 0:
                 face_id = original_ids[0]
+                if self._shift_pressed:
+                    if face_id not in self._selected_indices:
+                        self._selected_indices.append(face_id)
+                else:
+                    self._selected_indices = [face_id]
                 self.face_selected.emit(face_id)
-                self.selection_changed.emit([face_id])
-                self.highlight_selection([face_id], 'face')
+                self.selection_changed.emit(self._selected_indices)
+                self.highlight_selection(self._selected_indices, 'face')
+
+    def get_selected_faces(self) -> list:
+        if self.selection_mode == 'face':
+            return list(self._selected_indices)
+        return []
 
     def _on_point_picked(self, point):
         if not self.current_mesh: return

@@ -141,6 +141,10 @@ class PowerSurfacingMainWindow(QMainWindow):
         self.splitter.addWidget(self.viewport)
         self.splitter.addWidget(self.properties_panel)
         
+        # Wire up viewport and properties panel
+        self.viewport.selection_changed.connect(self.on_selection_changed)
+        self.properties_panel.expand_selection_requested.connect(self.on_expand_selection)
+        
         # Set stretch factors (Viewport takes most space)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
@@ -315,6 +319,27 @@ class PowerSurfacingMainWindow(QMainWindow):
         toolbar.addAction(self.act_sel_vertex)
         toolbar.addAction(self.act_sel_edge)
         toolbar.addAction(self.act_sel_face)
+
+    def on_selection_changed(self, indices):
+        if not self.current_mesh: return
+        if self.viewport.selection_mode == 'vertex' and len(indices) == 1:
+            self.properties_panel.set_vertex_properties(indices[0], self.current_mesh)
+        elif self.viewport.selection_mode == 'edge' and len(indices) == 1:
+            self.properties_panel.set_edge_properties(indices[0], self.current_mesh)
+        elif self.viewport.selection_mode == 'face' and len(indices) > 0:
+            self.properties_panel.set_face_properties(indices, self.current_mesh)
+            
+    def on_expand_selection(self, angle):
+        if not self.current_mesh: return
+        current_faces = self.viewport.get_selected_faces()
+        if not current_faces: return
+        
+        try:
+            new_faces = self.current_mesh.expand_selection_by_angle(current_faces, angle)
+            self.viewport.highlight_selection(new_faces, 'face')
+            self.properties_panel.set_face_properties(new_faces, self.current_mesh)
+        except Exception as e:
+            self.log(f"Expand selection failed: {e}")
 
     def on_new(self):
         self.current_mesh = None
@@ -531,10 +556,15 @@ class PowerSurfacingMainWindow(QMainWindow):
                 try:
                     target_count = dlg.target_count.value()
                     smooth_weight = dlg.smoothing_weight.value()
+                    
+                    frozen_faces = None
+                    if dlg.lock_faces.isChecked():
+                        frozen_faces = self.viewport.get_selected_faces()
+                        
                     self.log(f"Running Quad Wrap (target={target_count} faces, smooth={smooth_weight})...")
                     QApplication.processEvents()
                     wrapper = QuadWrapper(target_face_count=target_count, smoothing_weight=smooth_weight)
-                    result = wrapper.wrap(self.current_mesh)
+                    result = wrapper.wrap(self.current_mesh, frozen_face_ids=frozen_faces)
                     v = len(result.vertices)
                     f = len(result.faces)
                     self.current_mesh = result
@@ -557,10 +587,30 @@ class PowerSurfacingMainWindow(QMainWindow):
             if ShrinkWrapper:
                 try:
                     iterations = dlg.iterations.value()
+                    
+                    frozen_verts = None
+                    if dlg.lock_faces.isChecked():
+                        selected_faces = self.viewport.get_selected_faces()
+                        if selected_faces:
+                            vert_set = set()
+                            for f_id in selected_faces:
+                                if f_id < len(self.current_mesh.faces):
+                                    face = self.current_mesh.faces[f_id]
+                                    if face and face.halfedge:
+                                        he = face.halfedge
+                                        start = he
+                                        while True:
+                                            if he.vertex:
+                                                vert_set.add(he.vertex.index)
+                                            he = he.next
+                                            if he == start or not he:
+                                                break
+                            frozen_verts = list(vert_set)
+                            
                     self.log(f"Running Shrink Wrap ({iterations} iterations)...")
                     QApplication.processEvents()
                     shrinker = ShrinkWrapper(iterations=iterations)
-                    result = shrinker.wrap(self.current_mesh, self.current_mesh)
+                    result = shrinker.wrap(self.current_mesh, self.current_mesh, frozen_vertices=frozen_verts)
                     v = len(result.vertices)
                     f = len(result.faces)
                     self.current_mesh = result

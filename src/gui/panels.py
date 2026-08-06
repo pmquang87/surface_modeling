@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem, 
                                QLabel, QFormLayout, QSpinBox, QDoubleSpinBox, QGroupBox,
-                               QMenu)
+                               QMenu, QPushButton)
 from PySide6.QtCore import Signal, Qt
 
 try:
@@ -55,6 +55,7 @@ class PropertiesPanel(QWidget):
     """Right panel showing properties of the current selection/operation."""
     
     property_changed = Signal(str, object)
+    expand_selection_requested = Signal(float)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -108,16 +109,34 @@ class PropertiesPanel(QWidget):
         spin.valueChanged.connect(lambda val: self.property_changed.emit("crease_weight", val / 100.0))
         self.form_layout.addRow("Crease %:", spin)
 
-    def set_face_properties(self, face_index: int, mesh):
+    def set_face_properties(self, face_indices, mesh):
         self.clear()
-        if not mesh or face_index >= len(mesh.faces): return
+        if not mesh or not face_indices: return
         
-        f = mesh.faces[face_index]
-        self.group_box.setTitle(f"Face {face_index}")
+        if isinstance(face_indices, int):
+            face_indices = [face_indices]
+            
+        if len(face_indices) == 1:
+            face_index = face_indices[0]
+            if face_index >= len(mesh.faces): return
+            f = mesh.faces[face_index]
+            self.group_box.setTitle(f"Face {face_index}")
+            
+            self.form_layout.addRow("Normal X:", QLabel(f"{f.normal[0]:.3f}"))
+            self.form_layout.addRow("Normal Y:", QLabel(f"{f.normal[1]:.3f}"))
+            self.form_layout.addRow("Normal Z:", QLabel(f"{f.normal[2]:.3f}"))
+        else:
+            self.group_box.setTitle(f"Selected Faces ({len(face_indices)})")
+
+        self.tolerance_spin = QDoubleSpinBox()
+        self.tolerance_spin.setRange(0.0, 180.0)
+        self.tolerance_spin.setValue(15.0)
         
-        self.form_layout.addRow("Normal X:", QLabel(f"{f.normal[0]:.3f}"))
-        self.form_layout.addRow("Normal Y:", QLabel(f"{f.normal[1]:.3f}"))
-        self.form_layout.addRow("Normal Z:", QLabel(f"{f.normal[2]:.3f}"))
+        self.select_tangent_btn = QPushButton("Select Tangent Faces")
+        self.select_tangent_btn.clicked.connect(lambda: self.expand_selection_requested.emit(self.tolerance_spin.value()))
+        
+        self.form_layout.addRow("Tolerance Angle:", self.tolerance_spin)
+        self.form_layout.addRow(self.select_tangent_btn)
 
     def set_feature_properties(self, feature):
         self.clear()
