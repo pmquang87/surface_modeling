@@ -82,6 +82,10 @@ class QuadWrapDialog(QDialog):
         self.smoothing_weight.setValue(0.6) # Default 0.6 is very smooth, 0.1 preserves geometry
         self.form.addRow("Smoothing Weight (0=sharp, 1=blob):", self.smoothing_weight)
         
+        self.lock_faces = QCheckBox()
+        self.lock_faces.setChecked(False)
+        self.form.addRow("Lock Selected Faces:", self.lock_faces)
+        
         self.layout.addLayout(self.form)
         
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -101,6 +105,10 @@ class ShrinkWrapDialog(QDialog):
         self.iterations.setRange(1, 100)
         self.iterations.setValue(10)
         self.form.addRow("Iterations:", self.iterations)
+        
+        self.lock_faces = QCheckBox()
+        self.lock_faces.setChecked(False)
+        self.form.addRow("Lock Selected Faces:", self.lock_faces)
         
         self.layout.addLayout(self.form)
         

@@ -13,20 +13,23 @@ class ShrinkWrapper:
     def __init__(self, iterations: int = 5, 
                  subdivision_levels: int = 2,
                  smooth_weight: float = 0.5,
-                 projection_mode: str = 'closest_point'):
+                 projection_mode: str = 'closest_point',
+                 frozen_vertices: Optional[List[int]] = None):
         """
         Args:
             iterations: number of project-then-smooth cycles
             subdivision_levels: subdivide the control cage this many times before projecting
             smooth_weight: Laplacian smoothing weight (0 = no smooth, 1 = full smooth)
             projection_mode: 'closest_point' or 'ray_cast' (project along normals)
+            frozen_vertices: list of vertex indices to keep frozen during projection and smoothing
         """
         self.iterations = iterations
         self.subdivision_levels = subdivision_levels
         self.smooth_weight = smooth_weight
         self.projection_mode = projection_mode
+        self.frozen_vertices = frozen_vertices or []
         
-    def wrap(self, cage_mesh: HalfEdgeMesh, reference_mesh: HalfEdgeMesh) -> HalfEdgeMesh:
+    def wrap(self, cage_mesh: HalfEdgeMesh, reference_mesh: HalfEdgeMesh, frozen_vertices: Optional[List[int]] = None) -> HalfEdgeMesh:
         """Project cage mesh onto reference surface.
         
         Pipeline:
@@ -48,6 +51,9 @@ class ShrinkWrapper:
         
         # Subdivide logic would go here if implemented in HalfEdgeMesh
         
+        active_frozen = frozen_vertices if frozen_vertices is not None else self.frozen_vertices
+        frozen_set = set(active_frozen)
+
         for it in range(self.iterations):
             # a. Project vertices
             vertices = np.array([v.position for v in result_mesh.vertices])
@@ -60,11 +66,12 @@ class ShrinkWrapper:
                 
             # Update positions
             for i, v in enumerate(result_mesh.vertices):
-                v.position = projected_pts[i]
+                if i not in frozen_set:
+                    v.position = projected_pts[i]
                 
             # b. Apply smoothing (except on last iteration to keep points on surface)
             if it < self.iterations - 1 and self.smooth_weight > 0:
-                self._laplacian_smooth(result_mesh, self.smooth_weight)
+                self._laplacian_smooth(result_mesh, self.smooth_weight, frozen_set=frozen_set)
                 
         result_mesh.compute_vertex_normals()
         return result_mesh
@@ -77,11 +84,12 @@ class ShrinkWrapper:
         )
         return closest_points
         
-    def _laplacian_smooth(self, mesh: HalfEdgeMesh, weight: float, boundary_fixed: bool = True):
+    def _laplacian_smooth(self, mesh: HalfEdgeMesh, weight: float, boundary_fixed: bool = True, frozen_set: set = None):
         """Apply one iteration of Laplacian smoothing."""
+        frozen_set = frozen_set or set()
         new_positions = []
-        for v in mesh.vertices:
-            if boundary_fixed and mesh.is_boundary_vertex(v):
+        for i, v in enumerate(mesh.vertices):
+            if i in frozen_set or (boundary_fixed and mesh.is_boundary_vertex(v)):
                 new_positions.append(v.position.copy())
                 continue
                 

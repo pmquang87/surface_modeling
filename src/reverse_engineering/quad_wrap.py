@@ -13,18 +13,21 @@ class QuadWrapper:
     
     def __init__(self, target_face_count: int = 500, 
                  smoothing_weight: float = 0.6,
-                 feature_angle: float = 30.0):
+                 feature_angle: float = 30.0,
+                 frozen_face_ids: Optional[List[int]] = None):
         """
         Args:
             target_face_count: approximate number of quads in output
             smoothing_weight: laplacian smoothing weight (0.0 = sharp, 0.6 = smooth)
             feature_angle: dihedral angle threshold for sharp feature detection
+            frozen_face_ids: face ids on the reference mesh that should be preserved
         """
         self.target_face_count = target_face_count
         self.smoothing_weight = smoothing_weight
         self.feature_angle = feature_angle
+        self.frozen_face_ids = frozen_face_ids or []
         
-    def wrap(self, reference_mesh: HalfEdgeMesh) -> HalfEdgeMesh:
+    def wrap(self, reference_mesh: HalfEdgeMesh, frozen_face_ids: Optional[List[int]] = None) -> HalfEdgeMesh:
         """Generate quad-dominant mesh wrapping the reference.
         
         Pipeline:
@@ -49,7 +52,24 @@ class QuadWrapper:
         # So we need to decimate the STL down to (target_face_count / 3) triangles.
         target_triangles = max(4, int(self.target_face_count / 3))
         
-        base_cage = decimate_mesh(reference_mesh, target_faces=target_triangles)
+        active_frozen_faces = frozen_face_ids if frozen_face_ids is not None else self.frozen_face_ids
+        frozen_vertices = []
+        if active_frozen_faces:
+            vertex_to_index = {v: i for i, v in enumerate(reference_mesh.vertices)}
+            for face_id in active_frozen_faces:
+                if face_id < len(reference_mesh.faces):
+                    face = reference_mesh.faces[face_id]
+                    he = face.halfedge if hasattr(face, 'halfedge') else face.half_edge
+                    start_he = he
+                    while he:
+                        if he.vertex in vertex_to_index:
+                            frozen_vertices.append(vertex_to_index[he.vertex])
+                        he = he.next
+                        if he == start_he:
+                            break
+            frozen_vertices = list(set(frozen_vertices))
+        
+        base_cage = decimate_mesh(reference_mesh, target_faces=target_triangles, frozen_vertices=frozen_vertices)
         
         # 3. Subdivide once to convert all triangles to quads
         if len(base_cage.faces) > 0:
