@@ -95,6 +95,10 @@ class MeshViewport(QWidget):
         self._last_gizmo_pos = None
         self.gizmo_enabled = False
         
+        # Snap to Reference state
+        self.snap_to_reference = False
+        self.proximity_query = None
+        
         self.current_mesh = None
         self.display_mode = 'solid+wireframe'
         self.selection_mode = 'none'
@@ -455,6 +459,12 @@ class MeshViewport(QWidget):
             self.plotter.clear_sphere_widgets()
             self.plotter.update()
 
+    def set_snap_to_reference(self, enabled: bool):
+        self.snap_to_reference = enabled
+        # Update immediately if gizmo is being moved? Just setting flag is enough.
+        if enabled and self.proximity_query is None:
+            print("[WARNING] Snap enabled but no reference mesh loaded.")
+
     def _update_gizmo(self):
         if not self.gizmo_enabled:
             return
@@ -498,6 +508,17 @@ class MeshViewport(QWidget):
         for i in v_indices:
             self.current_mesh.vertices[i].position += delta
             
+        if self.snap_to_reference and self.proximity_query is not None:
+            # Snap vertices to the nearest point on the reference mesh
+            import trimesh
+            pts = np.array([self.current_mesh.vertices[i].position for i in v_indices])
+            closest_pts, _, _ = self.proximity_query.on_surface(pts)
+            for idx, i in enumerate(v_indices):
+                self.current_mesh.vertices[i].position = closest_pts[idx]
+            
+            # Update gizmo position to average of snapped points
+            new_pos = closest_pts.mean(axis=0)
+            
         self._last_gizmo_pos = new_pos
         
         # update mesh display
@@ -513,9 +534,13 @@ class MeshViewport(QWidget):
             self.plotter.remove_actor(self.ref_actor)
             
         if not mesh:
+            self.proximity_query = None
             self.plotter.update()
             return
             
+        import trimesh
+        self.proximity_query = trimesh.proximity.ProximityQuery(mesh.to_trimesh())
+        
         pv_mesh = mesh.to_pyvista()
         self.ref_actor = self.plotter.add_mesh(
             pv_mesh,

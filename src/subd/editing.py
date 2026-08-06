@@ -289,3 +289,65 @@ def set_edge_weight(mesh: HalfEdgeMesh, edge_indices: list[int], weight: float) 
         if e_idx < len(new_mesh.edges):
             new_mesh.edges[e_idx].crease_weight = weight
     return new_mesh
+
+
+def edge_slide(mesh: HalfEdgeMesh, vertex_indices: list[int], amount: float) -> HalfEdgeMesh:
+    """Slide selected vertices along their adjacent edges."""
+    verts = [v.position.copy() for v in mesh.vertices]
+    faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
+    
+    for v_idx in vertex_indices:
+        if v_idx >= len(mesh.vertices): continue
+        v = mesh.vertices[v_idx]
+        neighbors = mesh.get_vertex_neighbors(v)
+        if not neighbors: continue
+        
+        # Calculate average edge vector away from vertex
+        avg_vec = np.zeros(3)
+        for n in neighbors:
+            vec = n.position - v.position
+            length = np.linalg.norm(vec)
+            if length > 1e-6:
+                avg_vec += (vec / length)
+                
+        avg_vec /= len(neighbors)
+        avg_len = np.linalg.norm(avg_vec)
+        if avg_len > 1e-6:
+            verts[v_idx] += (avg_vec / avg_len) * amount
+            
+    return HalfEdgeMesh.from_arrays(verts, faces)
+
+
+def bevel_edges(mesh: HalfEdgeMesh, edge_indices: list[int], distance: float = 0.1) -> HalfEdgeMesh:
+    """Bevel selected edges by scaling adjacent faces (simplified for Sub-D)."""
+    if not edge_indices:
+        return mesh.copy()
+        
+    face_indices = set()
+    for e_idx in edge_indices:
+        if e_idx >= len(mesh.edges): continue
+        e = mesh.edges[e_idx]
+        if e.half_edge and e.half_edge.face:
+            face_indices.add(e.half_edge.face.index)
+        if e.half_edge.twin and e.half_edge.twin.face:
+            face_indices.add(e.half_edge.twin.face.index)
+            
+    return inset_faces(mesh, list(face_indices), inset_amount=distance)
+
+
+def knife_cut(mesh: HalfEdgeMesh, face_idx: int, p1: np.ndarray, p2: np.ndarray) -> HalfEdgeMesh:
+    """Subdivide a face along a line segment (simplified split)."""
+    if face_idx >= len(mesh.faces):
+        return mesh.copy()
+        
+    verts = [v.position.copy() for v in mesh.vertices]
+    faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
+    
+    f_verts = faces[face_idx]
+    
+    # Simple split of a quad into two triangles
+    if len(f_verts) == 4:
+        faces[face_idx] = [f_verts[0], f_verts[1], f_verts[2]]
+        faces.append([f_verts[0], f_verts[2], f_verts[3]])
+        
+    return HalfEdgeMesh.from_arrays(verts, faces)

@@ -51,20 +51,7 @@ class SubDToNURBSConverter:
                 
         return grid
 
-    def convert(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3) -> Dict[str, Any]:
-        """Convert Sub-D mesh to a sewed TopoDS_Shape using cadquery-ocp."""
-        try:
-            from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
-            from OCP.TColgp import TColgp_Array2OfPnt
-            from OCP.gp import gp_Pnt
-            from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_Sewing
-            from OCP.GeomAbs import GeomAbs_C2
-            OCP_AVAILABLE = True
-        except ImportError:
-            OCP_AVAILABLE = False
-            print("cadquery-ocp not installed. Cannot perform NURBS conversion.")
-            return {'shape': None, 'mesh': mesh}
-
+    def generate_patches(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3) -> List[Any]:
         try:
             from src.subd.catmull_clark import evaluate_limit_surface
             limit_positions, limit_normals = evaluate_limit_surface(mesh)
@@ -72,47 +59,72 @@ class SubDToNURBSConverter:
             limit_positions = np.array([v.position for v in mesh.vertices])
             limit_normals = []
 
-        sewing = BRepBuilderAPI_Sewing(self.tolerance)
-        faces_added = 0
-        grid_size = 17
-
+        from src.nurbs.g3_fitter import G3Fitter
+        fitter = G3Fitter()
+        
+        quad_mesh_data = []
         for face in mesh.faces:
             vertices = mesh.get_face_vertices(face)
             if len(vertices) == 4:
-                grid = self._evaluate_dense_grid(mesh, face, limit_positions, grid_size=grid_size)
+                corners = []
+                for v in vertices:
+                    if v.index < len(limit_positions):
+                        corners.append(limit_positions[v.index])
+                    else:
+                        corners.append(v.position)
+                quad_mesh_data.append({'corners': corners})
                 
-                # Convert to TColgp_Array2OfPnt
-                pts_array = TColgp_Array2OfPnt(1, grid_size, 1, grid_size)
-                for i in range(grid_size):
-                    for j in range(grid_size):
-                        p = grid[i, j]
-                        pts_array.SetValue(i + 1, j + 1, gp_Pnt(float(p[0]), float(p[1]), float(p[2])))
-                
-                # Fit B-Spline surface
-                # Degree 3, tolerance
-                fitter = GeomAPI_PointsToBSplineSurface(pts_array, 3, 3, GeomAbs_C2, self.tolerance)
-                if fitter.IsDone():
-                    bspline_surf = fitter.Surface()
-                    make_face = BRepBuilderAPI_MakeFace(bspline_surf, self.tolerance)
-                    if make_face.IsDone():
-                        sewing.Add(make_face.Face())
-                        faces_added += 1
+        patches = fitter.fit_surface(quad_mesh_data)
+        return patches
+        
+    def build_shape(self, patches: List[Any], simplify: bool = True) -> Optional[Any]:
+        try:
+            from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
+            from OCP.TColgp import TColgp_Array2OfPnt
+            from OCP.gp import gp_Pnt
+            from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_Sewing
+            from OCP.GeomAbs import GeomAbs_C2
+            from OCP.Geom import Geom_BezierSurface
+        except ImportError:
+            print("cadquery-ocp not installed. Cannot perform NURBS conversion.")
+            return None
+
+        sewing = BRepBuilderAPI_Sewing(self.tolerance)
+        faces_added = 0
+        
+        for patch_ctrl_pts in patches:
+            pts_array = TColgp_Array2OfPnt(1, 6, 1, 6)
+            for i in range(6):
+                for j in range(6):
+                    p = patch_ctrl_pts[i, j]
+                    pts_array.SetValue(i + 1, j + 1, gp_Pnt(float(p[0]), float(p[1]), float(p[2])))
+            
+            bezier_surf = Geom_BezierSurface(pts_array)
+            make_face = BRepBuilderAPI_MakeFace(bezier_surf, self.tolerance)
+            if make_face.IsDone():
+                sewing.Add(make_face.Face())
+                faces_added += 1
 
         if faces_added > 0:
             sewing.Perform()
-            sewed_shape = sewing.SewedShape()
-        else:
-            sewed_shape = None
-
-        return {
-            'shape': sewed_shape,
-            'mesh': mesh
-        }
-
-    # Keep these for backward compatibility if needed by tests, but they just call convert now
-    def generate_patches(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3) -> List[Dict[str, Any]]:
-        return []
-        
-    def build_shape(self, patches: List[Dict[str, Any]]) -> Optional[Any]:
+            shape = sewing.SewedShape()
+            if simplify:
+                try:
+                    from src.nurbs.simplifier import NURBSSimplifier
+                    simplifier = NURBSSimplifier(linear_tolerance=self.tolerance, angular_tolerance=self.tolerance)
+                    shape = simplifier.simplify(shape)
+                except Exception as e:
+                    print(f"Simplification failed: {e}")
+            return shape
         return None
+
+    def convert(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3, simplify: bool = True) -> Dict[str, Any]:
+        """Convert Sub-D mesh to a sewed TopoDS_Shape using cadquery-ocp."""
+        patches = self.generate_patches(mesh, subdivision_levels)
+        shape = self.build_shape(patches, simplify=simplify)
+        return {
+            'shape': shape,
+            'mesh': mesh,
+            'patches': patches
+        }
 

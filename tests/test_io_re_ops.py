@@ -16,8 +16,27 @@ from src.subd.primitives import create_box, create_plane
 from src.nurbs.converter import SubDToNURBSConverter
 from src.core.halfedge_mesh import HalfEdgeMesh
 
-STL_FILE = r'E:\foxcore_data\_MITEB\20260728_vorbereitungSLM\7_LLzugdruck_maxstress_smooth_iso03_newtry_red50.STL'
-STEP_FILE = r'E:\foxcore_data\_MITEB\20260728_vorbereitungSLM\7_LLzugdruck_maxstress_smooth_iso03_newtry_red50.stp'
+STL_FILE = None
+STEP_FILE = None
+
+def setup_test_files():
+    global STL_FILE, STEP_FILE
+    import trimesh
+    mesh = trimesh.creation.box()
+    f_stl = tempfile.NamedTemporaryFile(suffix='.stl', delete=False)
+    f_stl.close()
+    STL_FILE = f_stl.name
+    mesh.export(STL_FILE)
+
+    # For STEP, we will just use a dummy text file to avoid full test crashes, 
+    # though importer_step might fail if it's not a real STEP.
+    # We can try exporting a real STEP with trimesh if it supports it, else just empty.
+    f_stp = tempfile.NamedTemporaryFile(suffix='.stp', delete=False)
+    f_stp.write(b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n")
+    f_stp.close()
+    STEP_FILE = f_stp.name
+
+setup_test_files()
 
 results = {"PASS": 0, "FAIL": 0}
 

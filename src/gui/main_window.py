@@ -278,6 +278,15 @@ class PowerSurfacingMainWindow(QMainWindow):
         self.act_toggle_gizmo.setCheckable(True)
         self.act_toggle_gizmo.setChecked(False)
         self.act_toggle_gizmo.toggled.connect(self.viewport.set_gizmo_enabled)
+        
+        # Reference Mesh Actions
+        self.act_load_ref = QAction("Load Reference Mesh...", self)
+        self.act_load_ref.triggered.connect(self.on_load_reference)
+        
+        self.act_snap_ref = QAction("Snap to Reference", self)
+        self.act_snap_ref.setCheckable(True)
+        self.act_snap_ref.setChecked(False)
+        self.act_snap_ref.toggled.connect(self.viewport.set_snap_to_reference)
 
         # Camera Views
         self.act_cam_iso = QAction("Isometric", self)
@@ -333,6 +342,9 @@ class PowerSurfacingMainWindow(QMainWindow):
         menu_ops.addAction("Convert to NURBS...", self.on_convert_nurbs)
         
         menu_rev = menubar.addMenu("&Reverse Engineering")
+        menu_rev.addAction(self.act_load_ref)
+        menu_rev.addAction(self.act_snap_ref)
+        menu_rev.addSeparator()
         menu_rev.addAction("Quad Wrap...", self.on_quad_wrap)
         menu_rev.addAction("Shrink Wrap...", self.on_shrink_wrap)
         
@@ -370,9 +382,14 @@ class PowerSurfacingMainWindow(QMainWindow):
         toolbar.addAction(self.act_sel_vertex)
         toolbar.addAction(self.act_sel_edge)
         toolbar.addAction(self.act_sel_face)
+        toolbar.addAction(self.act_sel_none)
         
         toolbar.addSeparator()
         toolbar.addAction(self.act_toggle_gizmo)
+        
+        toolbar.addSeparator()
+        toolbar.addAction(self.act_load_ref)
+        toolbar.addAction(self.act_snap_ref)
         
         toolbar.addSeparator()
         btn_recenter = QPushButton("Re-center")
@@ -485,6 +502,44 @@ class PowerSurfacingMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Import Error", f"Failed to load file:\n{e}")
             self.status_bar.showMessage(f"Error loading file: {e}")
+
+    def on_load_reference(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Open Reference Mesh", "",
+            "All Supported (*.stl *.obj *.stp *.step);;STL Files (*.stl);;OBJ Files (*.obj);;STEP Files (*.stp *.step);;All Files (*)"
+        )
+        if not filepath:
+            return
+
+        ext = os.path.splitext(filepath)[1].lower()
+        self.status_bar.showMessage(f"Loading reference {os.path.basename(filepath)}...")
+        QApplication.processEvents()
+        
+        try:
+            mesh = None
+            if ext == '.stl' and import_stl:
+                mesh = import_stl(filepath)
+            elif ext == '.obj' and import_obj:
+                mesh = import_obj(filepath)
+            elif ext in ('.stp', '.step') and import_step:
+                result = import_step(filepath)
+                mesh = result.get('mesh')
+            else:
+                QMessageBox.warning(self, "Error", f"Unsupported or unavailable format: {ext}")
+                return
+                
+            if mesh and len(mesh.vertices) > 0:
+                self.viewport.set_reference_mesh(mesh)
+                vcount = len(mesh.vertices)
+                self.status_bar.showMessage(
+                    f"Loaded Reference {os.path.basename(filepath)} — {vcount:,} vertices"
+                )
+            else:
+                QMessageBox.warning(self, "Error", "Reference file loaded but mesh is empty.")
+                self.status_bar.showMessage("Load Reference failed — empty mesh.")
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", f"Failed to load reference file:\n{e}")
+            self.status_bar.showMessage(f"Error loading reference: {e}")
 
     def on_export(self):
         if not self.current_mesh:

@@ -179,9 +179,20 @@ def evaluate_limit_surface(mesh: HalfEdgeMesh) -> tuple[np.ndarray, np.ndarray]:
             
         faces = mesh.get_vertex_faces(v)
         inc_edges = []
-        for e in mesh.edges:
-            if e.half_edge.vertex == v or e.half_edge.prev.vertex == v:
-                inc_edges.append(e)
+        if v.half_edge:
+            curr = v.half_edge
+            visited = set()
+            while True:
+                if curr.index in visited:
+                    break
+                visited.add(curr.index)
+                if curr.edge:
+                    inc_edges.append(curr.edge)
+                if curr.twin is None:
+                    break
+                curr = curr.twin.next
+                if curr == v.half_edge:
+                    break
                 
         n = len(inc_edges)
         P = v.position

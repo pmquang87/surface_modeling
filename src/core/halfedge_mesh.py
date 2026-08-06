@@ -116,8 +116,13 @@ class HalfEdgeMesh:
         if vertex.half_edge is None:
             return []
         faces = []
+        visited = set()
         curr = vertex.half_edge
         while True:
+            if curr.index in visited:
+                break
+            visited.add(curr.index)
+            
             if curr.face is not None:
                 faces.append(curr.face)
             if curr.twin is None:
@@ -131,8 +136,13 @@ class HalfEdgeMesh:
         if vertex.half_edge is None:
             return []
         neighbors = []
+        visited = set()
         curr = vertex.half_edge
         while True:
+            if curr.index in visited:
+                break
+            visited.add(curr.index)
+            
             neighbors.append(curr.vertex)
             if curr.twin is None:
                 break
