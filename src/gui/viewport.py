@@ -131,6 +131,8 @@ class MeshViewport(QWidget):
                 new_sel.update(self.current_mesh.get_connected_edges(self._selected_indices))
                 
         elif op == 'invert':
+            if self.selection_mode == 'none':
+                return
             if self.selection_mode == 'face':
                 all_ids = set(range(len(self.current_mesh.faces)))
             elif self.selection_mode == 'vertex':
@@ -149,7 +151,11 @@ class MeshViewport(QWidget):
             
         # Use robust VTK hardware picking to get the exact cell at the mouse pixel
         import pyvista as pv
-        picker = pv.vtk.vtkCellPicker()
+        try:
+            import vtk
+        except ImportError:
+            vtk = pv._vtk
+        picker = vtk.vtkCellPicker()
         picker.SetTolerance(0.005)
         
         # Only pick from our mesh_actor
