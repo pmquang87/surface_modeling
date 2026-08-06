@@ -206,7 +206,9 @@ class SelectionPanel(QWidget):
             self.selection_mode_changed.emit(entities[id])
         self.entity_group.idClicked.connect(entity_emit)
         
-        self.layout.addWidget(QGroupBox("Selection Method & Type").setLayout(grid).parent())
+        gb = QGroupBox("Selection Method & Type")
+        gb.setLayout(grid)
+        self.layout.addWidget(gb)
         
         # Operations
         ops_group = QGroupBox("Operations")
