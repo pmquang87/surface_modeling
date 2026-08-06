@@ -9,6 +9,52 @@ try:
 except ImportError:
     HalfEdgeMesh = None
 
+try:
+    import vtk
+except ImportError:
+    vtk = pv._vtk
+
+class SolidWorksStyle(vtk.vtkInteractorStyleTrackballCamera):
+    def __init__(self):
+        super().__init__()
+        self.AddObserver("MiddleButtonPressEvent", self.on_middle_down)
+        self.AddObserver("MiddleButtonReleaseEvent", self.on_middle_up)
+        self.AddObserver("LeftButtonPressEvent", self.on_left_down)
+        self.AddObserver("LeftButtonReleaseEvent", self.on_left_up)
+        
+    def on_middle_down(self, obj, event):
+        iren = self.GetInteractor()
+        if iren.GetShiftKey():
+            self.StartDolly()
+        elif iren.GetControlKey():
+            self.StartPan()
+        else:
+            # Alt + MMB to choose new center of rotation
+            if iren.GetAltKey():
+                clickPos = iren.GetEventPosition()
+                picker = vtk.vtkCellPicker()
+                picker.Pick(clickPos[0], clickPos[1], 0, self.GetCurrentRenderer())
+                if picker.GetCellId() != -1:
+                    p3d = picker.GetPickPosition()
+                    self.GetCurrentRenderer().GetActiveCamera().SetFocalPoint(*p3d)
+            self.StartRotate()
+            
+    def on_middle_up(self, obj, event):
+        state = self.GetState()
+        if state == 1: # VTKIS_ROTATE
+            self.EndRotate()
+        elif state == 2: # VTKIS_PAN
+            self.EndPan()
+        elif state == 4: # VTKIS_DOLLY
+            self.EndDolly()
+            
+    def on_left_down(self, obj, event):
+        # Disable default left click rotate so we can use it purely for picking
+        pass
+        
+    def on_left_up(self, obj, event):
+        pass
+
 class MeshViewport(QWidget):
     """3D viewport for interactive mesh visualization and editing."""
     
@@ -28,6 +74,10 @@ class MeshViewport(QWidget):
         # PyVista interactor
         self.plotter = QtInteractor(self)
         self.layout.addWidget(self.plotter.interactor)
+        
+        # Apply SolidWorks interactor style
+        self._custom_style = SolidWorksStyle()
+        self.plotter.iren.set_interactor_style(self._custom_style)
         
         # Set background
         self.plotter.set_background(color="#f0f0f0", top="#e0e5ea")
