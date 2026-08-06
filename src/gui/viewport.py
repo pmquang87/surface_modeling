@@ -147,41 +147,59 @@ class MeshViewport(QWidget):
         if not self.current_mesh or self.selection_mode == 'none': 
             return
             
-        # If method is box, we might handle it differently later
+        # Use robust VTK hardware picking to get the exact cell at the mouse pixel
+        import pyvista as pv
+        picker = pv.vtk.vtkCellPicker()
+        picker.SetTolerance(0.005)
         
-        try:
-            p3d = self.plotter.pick_mouse_position()
-            if p3d is None: 
-                return
-        except Exception:
+        # Only pick from our mesh_actor
+        picker.AddPickList(self.mesh_actor)
+        picker.PickFromListOn()
+        
+        picker.Pick(pos[0], pos[1], 0, self.plotter.renderer)
+        cell_id = picker.GetCellId()
+        
+        if cell_id < 0:
             return
             
-        pv_mesh = self.current_mesh.to_pyvista()
+        p3d = picker.GetPickPosition()
         
         if self.selection_mode == 'face':
-            face_id = pv_mesh.find_closest_cell(p3d)
-            if face_id < 0 or face_id >= len(self.current_mesh.faces): return
-            self._apply_selection_modifier([face_id])
-            self.face_selected.emit(face_id)
-            
-        elif self.selection_mode == 'vertex':
-            vert_id = pv_mesh.find_closest_point(p3d)
-            if vert_id < 0 or vert_id >= len(self.current_mesh.vertices): return
-            self._apply_selection_modifier([vert_id])
-            self.vertex_selected.emit(vert_id)
-            
-        elif self.selection_mode == 'edge':
-            face_id = pv_mesh.find_closest_cell(p3d)
-            if face_id >= 0 and face_id < len(self.current_mesh.faces):
-                face = self.current_mesh.faces[face_id]
-                edges = self.current_mesh.get_face_edges(face)
+            if cell_id < len(self.current_mesh.faces):
+                self._apply_selection_modifier([cell_id])
+                self.face_selected.emit(cell_id)
                 
+        elif self.selection_mode == 'vertex':
+            # find closest point in the exact picked face to the pick position
+            if cell_id < len(self.current_mesh.faces):
+                face = self.current_mesh.faces[cell_id]
+                edges = self.current_mesh.get_face_edges(face)
+                min_dist = float('inf')
+                closest_vert = None
+                
+                for e in edges:
+                    v = e.half_edge.vertex
+                    dist = np.linalg.norm(v.position - np.array(p3d))
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest_vert = v.index
+                        
+                if closest_vert is not None:
+                    self._apply_selection_modifier([closest_vert])
+                    self.vertex_selected.emit(closest_vert)
+                    
+        elif self.selection_mode == 'edge':
+            # find closest edge in the exact picked face to the pick position
+            if cell_id < len(self.current_mesh.faces):
+                face = self.current_mesh.faces[cell_id]
+                edges = self.current_mesh.get_face_edges(face)
                 closest_edge = None
                 min_dist = float('inf')
                 
                 for e in edges:
                     v1 = e.half_edge.vertex.position
                     v2 = e.half_edge.prev.vertex.position
+                    # simplified distance to segment (using midpoint)
                     mid = (v1 + v2) / 2.0
                     dist = np.linalg.norm(np.array(p3d) - mid)
                     if dist < min_dist:

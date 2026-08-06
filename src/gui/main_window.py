@@ -4,7 +4,8 @@ import io
 import datetime
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QSplitter, QMenuBar, QMenu, QToolBar, QStatusBar,
-                               QFileDialog, QMessageBox, QApplication, QTextEdit)
+                               QFileDialog, QMessageBox, QApplication, QTextEdit,
+                               QComboBox, QLabel, QPushButton)
 from PySide6.QtCore import Qt, QObject, Signal
 from PySide6.QtGui import QAction, QPalette, QColor, QKeySequence, QIcon, QTextCursor
 
@@ -270,8 +271,30 @@ class PowerSurfacingMainWindow(QMainWindow):
         self.act_view_wire.triggered.connect(lambda: self.viewport.set_display_mode('wireframe'))
         self.act_view_solid_wire = QAction("Solid + Wireframe", self)
         self.act_view_solid_wire.triggered.connect(lambda: self.viewport.set_display_mode('solid+wireframe'))
-        self.act_view_reset = QAction("Reset Camera", self)
+        self.act_view_reset = QAction("Re-center Camera", self)
         self.act_view_reset.triggered.connect(self.viewport.reset_camera)
+
+        # Camera Views
+        self.act_cam_iso = QAction("Isometric", self)
+        self.act_cam_iso.triggered.connect(self.viewport.plotter.view_isometric)
+        
+        self.act_cam_top = QAction("Top (XY)", self)
+        self.act_cam_top.triggered.connect(self.viewport.plotter.view_xy)
+        
+        self.act_cam_bottom = QAction("Bottom", self)
+        self.act_cam_bottom.triggered.connect(lambda: self.viewport.plotter.view_xy(negative=True))
+        
+        self.act_cam_front = QAction("Front (XZ)", self)
+        self.act_cam_front.triggered.connect(self.viewport.plotter.view_xz)
+        
+        self.act_cam_back = QAction("Back", self)
+        self.act_cam_back.triggered.connect(lambda: self.viewport.plotter.view_xz(negative=True))
+        
+        self.act_cam_right = QAction("Right (YZ)", self)
+        self.act_cam_right.triggered.connect(self.viewport.plotter.view_yz)
+        
+        self.act_cam_left = QAction("Left", self)
+        self.act_cam_left.triggered.connect(lambda: self.viewport.plotter.view_yz(negative=True))
 
         # Select Actions
         self.act_sel_vertex = QAction("Select Vertex", self)
@@ -314,6 +337,14 @@ class PowerSurfacingMainWindow(QMainWindow):
         menu_view.addAction(self.act_view_solid_wire)
         menu_view.addSeparator()
         menu_view.addAction(self.act_view_reset)
+        menu_view.addSeparator()
+        menu_view.addAction(self.act_cam_iso)
+        menu_view.addAction(self.act_cam_top)
+        menu_view.addAction(self.act_cam_bottom)
+        menu_view.addAction(self.act_cam_front)
+        menu_view.addAction(self.act_cam_back)
+        menu_view.addAction(self.act_cam_right)
+        menu_view.addAction(self.act_cam_left)
 
         menu_select = menubar.addMenu("&Select")
         menu_select.addAction(self.act_sel_vertex)
@@ -334,6 +365,27 @@ class PowerSurfacingMainWindow(QMainWindow):
         toolbar.addAction(self.act_sel_vertex)
         toolbar.addAction(self.act_sel_edge)
         toolbar.addAction(self.act_sel_face)
+        
+        toolbar.addSeparator()
+        btn_recenter = QPushButton("Re-center")
+        btn_recenter.clicked.connect(self.viewport.reset_camera)
+        toolbar.addWidget(btn_recenter)
+        
+        toolbar.addWidget(QLabel("  View: "))
+        self.combo_view = QComboBox()
+        self.combo_view.addItems(["", "Isometric", "Top", "Bottom", "Front", "Back", "Right", "Left"])
+        self.combo_view.currentIndexChanged.connect(self._on_view_combo_changed)
+        toolbar.addWidget(self.combo_view)
+
+    def _on_view_combo_changed(self, index):
+        if index == 1: self.viewport.plotter.view_isometric()
+        elif index == 2: self.viewport.plotter.view_xy()
+        elif index == 3: self.viewport.plotter.view_xy(negative=True)
+        elif index == 4: self.viewport.plotter.view_xz()
+        elif index == 5: self.viewport.plotter.view_xz(negative=True)
+        elif index == 6: self.viewport.plotter.view_yz()
+        elif index == 7: self.viewport.plotter.view_yz(negative=True)
+        self.combo_view.setCurrentIndex(0)
 
     def on_selection_changed(self, indices):
         if not self.current_mesh: return
