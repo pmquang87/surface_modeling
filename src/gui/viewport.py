@@ -91,6 +91,7 @@ class MeshViewport(QWidget):
         
         # Transform Gizmo state
         self._last_gizmo_pos = None
+        self.gizmo_enabled = False
         
         self.current_mesh = None
         self.display_mode = 'solid+wireframe'
@@ -444,7 +445,18 @@ class MeshViewport(QWidget):
                         v_indices.add(v.index)
         return list(v_indices)
 
+    def set_gizmo_enabled(self, enabled: bool):
+        self.gizmo_enabled = enabled
+        if enabled:
+            self._update_gizmo()
+        else:
+            self.plotter.clear_sphere_widgets()
+            self.plotter.update()
+
     def _update_gizmo(self):
+        if not self.gizmo_enabled:
+            return
+            
         v_indices = self._get_selected_vertex_indices()
         if not v_indices:
             return

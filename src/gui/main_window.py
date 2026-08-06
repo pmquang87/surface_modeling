@@ -273,6 +273,11 @@ class PowerSurfacingMainWindow(QMainWindow):
         self.act_view_solid_wire.triggered.connect(lambda: self.viewport.set_display_mode('solid+wireframe'))
         self.act_view_reset = QAction("Re-center Camera", self)
         self.act_view_reset.triggered.connect(self.viewport.reset_camera)
+        
+        self.act_toggle_gizmo = QAction("Toggle Gizmo", self)
+        self.act_toggle_gizmo.setCheckable(True)
+        self.act_toggle_gizmo.setChecked(False)
+        self.act_toggle_gizmo.toggled.connect(self.viewport.set_gizmo_enabled)
 
         # Camera Views
         self.act_cam_iso = QAction("Isometric", self)
@@ -365,6 +370,9 @@ class PowerSurfacingMainWindow(QMainWindow):
         toolbar.addAction(self.act_sel_vertex)
         toolbar.addAction(self.act_sel_edge)
         toolbar.addAction(self.act_sel_face)
+        
+        toolbar.addSeparator()
+        toolbar.addAction(self.act_toggle_gizmo)
         
         toolbar.addSeparator()
         btn_recenter = QPushButton("Re-center")
