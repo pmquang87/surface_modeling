@@ -265,14 +265,11 @@ class MeshViewport(QWidget):
             pts = pv_mesh.points[indices]
             pc = pv.PolyData(pts)
             actor = self.plotter.add_mesh(pc, color='red', point_size=12, render_points_as_spheres=True, pickable=False, reset_camera=False, render_lines_as_tubes=True)
-            # slightly pull points forward to prevent z-fighting
-            actor.mapper.SetResolveCoincidentTopologyToPolygonOffset()
             self.selection_actors.append(actor)
             
         elif element_type == 'face':
             extracted = pv_mesh.extract_cells(indices)
-            actor = self.plotter.add_mesh(extracted, color='red', show_edges=True, edge_color='darkred', line_width=2, pickable=False, reset_camera=False, opacity=0.8)
-            actor.mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            actor = self.plotter.add_mesh(extracted, color='red', show_edges=True, edge_color='red', line_width=3, pickable=False, reset_camera=False)
             self.selection_actors.append(actor)
             
         elif element_type == 'edge':
@@ -290,7 +287,6 @@ class MeshViewport(QWidget):
             if pts:
                 pd = pv.PolyData(np.array(pts), lines=np.array(lines))
                 actor = self.plotter.add_mesh(pd, color='red', line_width=6, render_lines_as_tubes=True, pickable=False, reset_camera=False)
-                actor.mapper.SetResolveCoincidentTopologyToPolygonOffset()
                 self.selection_actors.append(actor)
                 
         self.plotter.update()
