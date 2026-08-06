@@ -15,8 +15,9 @@ except ImportError:
     vtk = pv._vtk
 
 class SolidWorksStyle(vtk.vtkInteractorStyleTrackballCamera):
-    def __init__(self):
+    def __init__(self, plotter=None):
         super().__init__()
+        self.plotter = plotter
         self.AddObserver("MiddleButtonPressEvent", self.on_middle_down)
         self.AddObserver("MiddleButtonReleaseEvent", self.on_middle_up)
         self.AddObserver("LeftButtonPressEvent", self.on_left_down)
@@ -30,13 +31,14 @@ class SolidWorksStyle(vtk.vtkInteractorStyleTrackballCamera):
             self.StartPan()
         else:
             # Alt + MMB to choose new center of rotation
-            if iren.GetAltKey():
+            if iren.GetAltKey() and self.plotter is not None:
                 clickPos = iren.GetEventPosition()
-                picker = vtk.vtkCellPicker()
-                picker.Pick(clickPos[0], clickPos[1], 0, self.GetCurrentRenderer())
-                if picker.GetCellId() != -1:
+                picker = vtk.vtkPropPicker()
+                picker.Pick(clickPos[0], clickPos[1], 0, self.plotter.renderer)
+                if picker.GetActor() is not None:
                     p3d = picker.GetPickPosition()
-                    self.GetCurrentRenderer().GetActiveCamera().SetFocalPoint(*p3d)
+                    self.plotter.camera.focal_point = p3d
+                    self.plotter.render()
             self.StartRotate()
             
     def on_middle_up(self, obj, event):
@@ -76,7 +78,7 @@ class MeshViewport(QWidget):
         self.layout.addWidget(self.plotter.interactor)
         
         # Apply SolidWorks interactor style
-        self._custom_style = SolidWorksStyle()
+        self._custom_style = SolidWorksStyle(self.plotter)
         self.plotter.iren.interactor.SetInteractorStyle(self._custom_style)
         
         # Set background
