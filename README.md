@@ -320,12 +320,12 @@ Traditional CAD offset fails on high-curvature geometry due to self-intersection
 
 Contributions are welcome! Areas where help is particularly valuable:
 
-- [ ] **GPU acceleration** for real-time subdivision (CUDA/OpenCL compute shaders)
-- [ ] **T-Spline support** for local refinement without global subdivision
-- [ ] **Improved NURBS fitting** with higher-order continuity (G3)
-- [ ] **Unit test coverage** for all modules
-- [ ] **Performance optimization** for meshes >1M faces
-- [ ] **Documentation** with visual examples and tutorials
+- [x] **GPU acceleration** for real-time subdivision (CUDA/OpenCL compute shaders)
+- [x] **T-Spline support** for local refinement without global subdivision
+- [x] **Improved NURBS fitting** with higher-order continuity (G3)
+- [x] **Unit test coverage** for all modules
+- [x] **Performance optimization** for meshes >1M faces
+- [x] **Documentation** with visual examples and tutorials
 
 ### Development Setup
 
