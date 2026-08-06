@@ -78,6 +78,8 @@
 
 ## Screenshots
 
+![Quad Wrap Interface](docs/screenshot.png)
+
 > *Launch the application to see the dark-themed CAD interface with 3D viewport, feature tree, and properties panel.*
 
 ---
