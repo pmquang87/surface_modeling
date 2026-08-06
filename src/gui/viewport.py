@@ -45,8 +45,8 @@ class MeshViewport(QWidget):
 
         self._selected_indices = []
 
-        # Setup picking — deferred to set_selection_mode()
-        # Don't enable picking at startup to avoid conflicts
+        # Setup left-click picking using custom logic
+        self.plotter.track_click_position(self._on_click, side='left')
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Shift:
@@ -58,36 +58,76 @@ class MeshViewport(QWidget):
             self._shift_pressed = False
         super().keyReleaseEvent(event)
 
-    def _on_cell_picked(self, cell):
-        if not self.current_mesh: return
-        if hasattr(cell, 'cell_data') and "vtkOriginalCellIds" in cell.cell_data:
-            original_ids = cell.cell_data["vtkOriginalCellIds"]
-            if len(original_ids) > 0:
-                face_id = original_ids[0]
-                if self._shift_pressed:
-                    if face_id not in self._selected_indices:
-                        self._selected_indices.append(face_id)
-                else:
-                    self._selected_indices = [face_id]
-                self.face_selected.emit(face_id)
-                self.selection_changed.emit(self._selected_indices)
-                self.highlight_selection(self._selected_indices, 'face')
+    def _on_click(self, pos):
+        if not self.current_mesh or self.selection_mode == 'none': 
+            return
+            
+        try:
+            p3d = self.plotter.pick_mouse_position()
+            if p3d is None: 
+                return
+        except Exception:
+            return
+            
+        pv_mesh = self.current_mesh.to_pyvista()
+        
+        if self.selection_mode == 'face':
+            face_id = pv_mesh.find_closest_cell(p3d)
+            if face_id < 0 or face_id >= len(self.current_mesh.faces): return
+            if self._shift_pressed:
+                if face_id not in self._selected_indices:
+                    self._selected_indices.append(face_id)
+            else:
+                self._selected_indices = [face_id]
+            self.face_selected.emit(face_id)
+            self.selection_changed.emit(self._selected_indices)
+            self.highlight_selection(self._selected_indices, 'face')
+            
+        elif self.selection_mode == 'vertex':
+            vert_id = pv_mesh.find_closest_point(p3d)
+            if vert_id < 0 or vert_id >= len(self.current_mesh.vertices): return
+            if self._shift_pressed:
+                if vert_id not in self._selected_indices:
+                    self._selected_indices.append(vert_id)
+            else:
+                self._selected_indices = [vert_id]
+            self.vertex_selected.emit(vert_id)
+            self.selection_changed.emit(self._selected_indices)
+            self.highlight_selection(self._selected_indices, 'vertex')
+            
+        elif self.selection_mode == 'edge':
+            face_id = pv_mesh.find_closest_cell(p3d)
+            if face_id >= 0 and face_id < len(self.current_mesh.faces):
+                face = self.current_mesh.faces[face_id]
+                edges = self.current_mesh.get_face_edges(face)
+                
+                closest_edge = None
+                min_dist = float('inf')
+                
+                for e in edges:
+                    v1 = e.half_edge.vertex.position
+                    v2 = e.half_edge.prev.vertex.position
+                    # mid point approximation for edge picking
+                    mid = (v1 + v2) / 2.0
+                    dist = np.linalg.norm(np.array(p3d) - mid)
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest_edge = e.index
+                        
+                if closest_edge is not None:
+                    if self._shift_pressed:
+                        if closest_edge not in self._selected_indices:
+                            self._selected_indices.append(closest_edge)
+                    else:
+                        self._selected_indices = [closest_edge]
+                    self.edge_selected.emit(closest_edge)
+                    self.selection_changed.emit(self._selected_indices)
+                    self.highlight_selection(self._selected_indices, 'edge')
 
     def get_selected_faces(self) -> list:
         if self.selection_mode == 'face':
             return list(self._selected_indices)
         return []
-
-    def _on_point_picked(self, point):
-        if not self.current_mesh: return
-        # point is [x, y, z] coordinate. Find nearest vertex.
-        verts = np.array(self.current_mesh.vertices)
-        if len(verts) == 0: return
-        dists = np.linalg.norm(verts - point, axis=1)
-        vert_id = int(np.argmin(dists))
-        self.vertex_selected.emit(vert_id)
-        self.selection_changed.emit([vert_id])
-        self.highlight_selection([vert_id], 'vertex')
 
     def set_mesh(self, mesh, name: str = 'default'):
         self.update_mesh(mesh, name)
@@ -137,18 +177,6 @@ class MeshViewport(QWidget):
     def set_selection_mode(self, mode: str):
         self.selection_mode = mode
         self._selected_indices = []
-        
-        # Always disable existing picking first
-        try:
-            self.plotter.disable_picking()
-        except Exception:
-            pass
-        
-        if mode == 'face':
-            self.plotter.enable_cell_picking(callback=self._on_cell_picked, show_message=False, through=False)
-        elif mode == 'vertex':
-            self.plotter.enable_point_picking(callback=self._on_point_picked, show_message=False)
-        # mode == 'none' or 'edge': picking stays disabled
         self.highlight_selection([], mode)
 
     def highlight_selection(self, indices: list, element_type: str):
@@ -175,6 +203,23 @@ class MeshViewport(QWidget):
             actor = self.plotter.add_mesh(extracted, color='red', show_edges=True, edge_color='black', pickable=False)
             self.selection_actors.append(actor)
             
+        elif element_type == 'edge':
+            lines = []
+            pts = []
+            pt_idx = 0
+            for e_idx in indices:
+                e = self.current_mesh.edges[e_idx]
+                v1 = e.half_edge.vertex.position
+                v2 = e.half_edge.prev.vertex.position
+                pts.extend([v1, v2])
+                lines.extend([2, pt_idx, pt_idx+1])
+                pt_idx += 2
+                
+            if pts:
+                pd = pv.PolyData(np.array(pts), lines=np.array(lines))
+                actor = self.plotter.add_mesh(pd, color='red', line_width=5, pickable=False)
+                self.selection_actors.append(actor)
+                
         self.plotter.update()
 
     def set_reference_mesh(self, mesh):
