@@ -1,4 +1,6 @@
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem, 
+import numpy as np
+
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem,
                                QLabel, QFormLayout, QSpinBox, QDoubleSpinBox, QGroupBox,
                                QMenu, QPushButton)
 from PySide6.QtCore import Signal, Qt
@@ -7,6 +9,44 @@ try:
     from src.core.feature_tree import FeatureTree
 except ImportError:
     FeatureTree = None
+
+
+def face_normal(mesh, face) -> np.ndarray:
+    """Newell normal of a single face, computed on demand and cached on it.
+
+    Importers and the primitive factories leave ``Face.normal`` at (0, 0, 0) —
+    only ``HalfEdgeMesh.compute_face_normals()`` ever fills it in, and nothing on
+    the display path used to call it, so the properties panel showed
+    (0.000, 0.000, 0.000) for every imported mesh. Doing it per displayed face
+    keeps this off the O(faces) path (positions can change at any time, so a
+    non-zero cached value is no proof it is still current).
+
+    Mirrors ``HalfEdgeMesh.compute_face_normals`` (Newell over every edge), which
+    is orientation-correct for reflex corners and warped quads alike.
+    """
+    try:
+        verts = [v.position for v in mesh.get_face_vertices(face)]
+    except Exception:
+        return np.zeros(3, dtype=np.float64)
+    if len(verts) < 3:
+        return np.zeros(3, dtype=np.float64)
+
+    P = np.asarray(verts, dtype=np.float64)
+    Q = np.roll(P, -1, axis=0)
+    d = P - Q
+    s = P + Q
+    n = np.array([
+        np.dot(d[:, 1], s[:, 2]),
+        np.dot(d[:, 2], s[:, 0]),
+        np.dot(d[:, 0], s[:, 1]),
+    ], dtype=np.float64)
+    norm = np.linalg.norm(n)
+    n = n / norm if norm > 1e-8 else np.zeros(3, dtype=np.float64)
+    try:
+        face.normal = n
+    except Exception:
+        pass  # read-only/slotted face implementations
+    return n
 
 class FeatureTreePanel(QWidget):
     """Left panel showing the feature history tree."""
@@ -66,7 +106,12 @@ class PropertiesPanel(QWidget):
         self.layout = QVBoxLayout(self)
         self.group_box = QGroupBox("Properties")
         self.form_layout = QFormLayout(self.group_box)
-        
+
+        # What the currently shown editors write to: (kind, index) with kind in
+        # {'vertex', 'edge', 'face', 'mesh'}. Consumers of property_changed need
+        # this to know which element an edit belongs to.
+        self.current_target = None
+
         self.layout.addWidget(self.group_box)
         self.layout.addStretch()
 
@@ -77,10 +122,12 @@ class PropertiesPanel(QWidget):
             if widget:
                 widget.deleteLater()
         self.group_box.setTitle("Properties")
+        self.current_target = None
 
     def set_mesh_info(self, mesh):
         self.clear()
         if not mesh: return
+        self.current_target = ('mesh', None)
         self.group_box.setTitle("Mesh Info")
         self.form_layout.addRow("Vertices:", QLabel(str(len(mesh.vertices))))
         self.form_layout.addRow("Edges:", QLabel(str(len(mesh.edges))))
@@ -89,24 +136,29 @@ class PropertiesPanel(QWidget):
     def set_vertex_properties(self, vertex_index: int, mesh):
         self.clear()
         if not mesh or vertex_index >= len(mesh.vertices): return
-        
+
         v = mesh.vertices[vertex_index]
+        self.current_target = ('vertex', vertex_index)
         self.group_box.setTitle(f"Vertex {vertex_index}")
-        
+
         for i, axis in enumerate(['X', 'Y', 'Z']):
             spin = QDoubleSpinBox()
-            spin.setRange(-10000, 10000)
-            spin.setValue(v.position[i])
+            spin.setRange(-1e6, 1e6)
+            spin.setDecimals(6)
+            spin.setSingleStep(0.1)
+            # setValue before connect: no spurious edit signal on populate.
+            spin.setValue(float(v.position[i]))
             spin.valueChanged.connect(lambda val, a=axis: self.property_changed.emit(f"pos_{a.lower()}", val))
             self.form_layout.addRow(f"Position {axis}:", spin)
 
     def set_edge_properties(self, edge_index: int, mesh):
         self.clear()
         if not mesh or edge_index >= len(mesh.edges): return
-        
+
         e = mesh.edges[edge_index]
+        self.current_target = ('edge', edge_index)
         self.group_box.setTitle(f"Edge {edge_index}")
-        
+
         spin = QDoubleSpinBox()
         spin.setRange(0, 100)
         spin.setValue(e.crease_weight * 100)
@@ -115,21 +167,35 @@ class PropertiesPanel(QWidget):
 
     def set_face_properties(self, face_indices, mesh):
         self.clear()
-        if not mesh or not face_indices: return
-        
-        if isinstance(face_indices, int):
-            face_indices = [face_indices]
-            
+        if not mesh or face_indices is None: return
+
+        # `0` is a perfectly good face index; a plain `not face_indices` test
+        # used to drop it and leave the panel empty for the first face.
+        if isinstance(face_indices, (int, np.integer)):
+            face_indices = [int(face_indices)]
+        else:
+            face_indices = list(face_indices)
+        if not face_indices: return
+
         if len(face_indices) == 1:
             face_index = face_indices[0]
             if face_index >= len(mesh.faces): return
             f = mesh.faces[face_index]
+            self.current_target = ('face', face_index)
             self.group_box.setTitle(f"Face {face_index}")
-            
-            self.form_layout.addRow("Normal X:", QLabel(f"{f.normal[0]:.3f}"))
-            self.form_layout.addRow("Normal Y:", QLabel(f"{f.normal[1]:.3f}"))
-            self.form_layout.addRow("Normal Z:", QLabel(f"{f.normal[2]:.3f}"))
+
+            # Computed here rather than read straight off the face: nothing on
+            # the import/display path fills Face.normal in, and a stored value
+            # goes stale as soon as a vertex moves.
+            normal = face_normal(mesh, f)
+
+            # Face normals are derived from the vertex positions, so they are
+            # shown read-only rather than offering an edit that cannot be applied.
+            self.form_layout.addRow("Normal X:", QLabel(f"{normal[0]:.3f}"))
+            self.form_layout.addRow("Normal Y:", QLabel(f"{normal[1]:.3f}"))
+            self.form_layout.addRow("Normal Z:", QLabel(f"{normal[2]:.3f}"))
         else:
+            self.current_target = ('face', None)
             self.group_box.setTitle(f"Selected Faces ({len(face_indices)})")
 
     def set_feature_properties(self, feature):
@@ -272,6 +338,30 @@ class SelectionPanel(QWidget):
         
         self.layout.addWidget(ops_group)
         self.layout.addStretch()
+
+    # -- current state -----------------------------------------------------
+    # The panel is the single source of truth for the initial selection state;
+    # MainWindow pushes these into the viewport at startup so the first click
+    # already works instead of falling into the viewport's old 'none' default.
+
+    def current_selection_mode(self) -> str:
+        if self.rb_vertex.isChecked():
+            return 'vertex'
+        if self.rb_edge.isChecked():
+            return 'edge'
+        if self.rb_face.isChecked():
+            return 'face'
+        return 'none'
+
+    def current_selection_method(self) -> str:
+        return 'box' if self.rb_box.isChecked() else 'pick'
+
+    def current_selection_modifier(self) -> str:
+        if self.rb_add.isChecked():
+            return 'add'
+        if self.rb_remove.isChecked():
+            return 'remove'
+        return 'new'
 
     def set_selection_mode(self, mode: str):
         self.entity_group.blockSignals(True)

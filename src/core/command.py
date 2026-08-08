@@ -79,32 +79,57 @@ class MeshOperationCommand(Command):
         self.operation_func = operation_func
         self.args = args
         self.kwargs = kwargs
-        
+
         # State storage
         self.previous_mesh = None
         self.new_mesh = None
-        
+        self._has_run = False
+
+    @staticmethod
+    def _snapshot(mesh):
+        """Copy a mesh for the history.
+
+        HalfEdgeMesh is a fully cross-linked graph, so copy.deepcopy recurses
+        along the half-edge chain and dies well below 100 faces. The mesh
+        provides an iterative copy() instead.
+        """
+        return mesh.copy() if mesh is not None else None
+
+    def _restore(self, mesh, message: str) -> None:
+        """Put a stored state back into the document (None means empty document)."""
+        self.main_window.current_mesh = self._snapshot(mesh)
+        self._notify(message)
+
+    def _notify(self, message: str) -> None:
+        """Push the current state to the GUI, using only API the window really has."""
+        viewport = getattr(self.main_window, 'viewport', None)
+        if viewport is not None:
+            mesh = self.main_window.current_mesh
+            if mesh is None and hasattr(viewport, 'clear'):
+                viewport.clear()
+            elif hasattr(viewport, 'update_mesh'):
+                viewport.update_mesh(mesh)
+
+        log = getattr(self.main_window, 'log', None)
+        if callable(log):
+            log(message)
+
     def execute(self) -> None:
-        import copy
-        # Save previous state
-        if self.main_window.current_mesh:
-            self.previous_mesh = copy.deepcopy(self.main_window.current_mesh)
-            
-        # Execute the actual operation if we haven't already cached a new_mesh
-        if self.new_mesh is None:
-            self.operation_func(*self.args, **self.kwargs)
-            if self.main_window.current_mesh:
-                self.new_mesh = copy.deepcopy(self.main_window.current_mesh)
+        # Save previous state (None is a valid state: an empty document)
+        self.previous_mesh = self._snapshot(self.main_window.current_mesh)
+
+        if not self._has_run:
+            # Operations may either mutate the mesh in place or return a new one
+            result = self.operation_func(*self.args, **self.kwargs)
+            if result is not None:
+                self.main_window.current_mesh = result
+            self.new_mesh = self._snapshot(self.main_window.current_mesh)
+            self._has_run = True
+            self._notify(f"{self.name}: applied")
         else:
             # Re-applying (Redo)
-            self.main_window.current_mesh = copy.deepcopy(self.new_mesh)
-            self.main_window.viewport.update_mesh(self.main_window.current_mesh, keep_selection=False)
-            self.main_window._update_status()
+            self._restore(self.new_mesh, f"{self.name}: redone")
 
     def undo(self) -> None:
-        import copy
-        if self.previous_mesh:
-            self.main_window.current_mesh = copy.deepcopy(self.previous_mesh)
-            self.main_window.viewport.update_mesh(self.main_window.current_mesh, keep_selection=False)
-            self.main_window._update_status()
+        self._restore(self.previous_mesh, f"{self.name}: undone")
 

@@ -10,18 +10,27 @@ class ShrinkWrapper:
     on the reference mesh.
     """
     
-    def __init__(self, iterations: int = 5, 
-                 subdivision_levels: int = 2,
+    def __init__(self, iterations: int = 5,
+                 subdivision_levels: int = 0,
                  smooth_weight: float = 0.5,
                  projection_mode: str = 'ray_cast',
                  frozen_vertices: Optional[List[int]] = None):
         """
         Args:
             iterations: number of project-then-smooth cycles
-            subdivision_levels: subdivide the control cage this many times before projecting
+            subdivision_levels: linearly subdivide the control cage this many
+                times before projecting (0 = leave the cage as given). Linear
+                (non-smoothing) subdivision is used so the cage shape is
+                unchanged, only denser. Defaults to 0 because the projection
+                loop is the expensive part and callers that want a denser cage
+                usually subdivide it themselves.
             smooth_weight: Tangential Laplacian smoothing weight (0 = no smooth, 1 = full smooth)
             projection_mode: 'closest_point' or 'ray_cast' (project along normals)
             frozen_vertices: list of vertex indices to keep frozen during projection and smoothing
+
+        Note: with subdivision_levels > 0 the returned mesh has MORE vertices
+        than the input cage, so ``frozen_vertices`` indices still refer to the
+        original cage vertices (linear subdivision keeps them first in order).
         """
         self.iterations = iterations
         self.subdivision_levels = subdivision_levels
@@ -44,9 +53,15 @@ class ShrinkWrapper:
         """
         if len(cage_mesh.vertices) == 0 or len(reference_mesh.faces) == 0:
             return cage_mesh.copy()
-            
-        result_mesh = cage_mesh.copy()
-        
+
+        if self.subdivision_levels and self.subdivision_levels > 0:
+            # Linear (midpoint) subdivision: denser cage, identical shape, and
+            # existing vertex indices are preserved so frozen ids stay valid.
+            from src.subd.catmull_clark import subdivide
+            result_mesh = subdivide(cage_mesh, self.subdivision_levels, smooth=False)
+        else:
+            result_mesh = cage_mesh.copy()
+
         # Convert reference to trimesh for fast spatial queries
         ref_trimesh = reference_mesh.to_trimesh()
         
@@ -90,37 +105,55 @@ class ShrinkWrapper:
             return vertices
 
     def _ray_cast_projection(self, vertices: np.ndarray, normals: np.ndarray, reference_trimesh: trimesh.Trimesh) -> np.ndarray:
-        """Project vertices along their normal direction via ray casting."""
+        """Project vertices along their normal direction via ray casting.
+
+        Both the +normal and -normal rays are cast for every vertex, and the
+        hit closest to the vertex wins. Hits are grouped by ray id with a single
+        lexsort instead of one boolean mask per vertex (which was O(V * hits),
+        i.e. quadratic), and every ray-miss is resolved with ONE batched
+        ``closest_point`` call instead of one call per missed vertex.
+        """
         try:
             intersector = trimesh.ray.ray_triangle.RayMeshIntersector(reference_trimesh)
-            
+
+            n = len(vertices)
             origins = np.vstack((vertices, vertices))
             directions = np.vstack((normals, -normals))
-            
+
             locations, index_ray, index_tri = intersector.intersects_location(
                 ray_origins=origins,
                 ray_directions=directions
             )
-            
-            projected = []
-            for i, v in enumerate(vertices):
-                mask = (index_ray == i) | (index_ray == i + len(vertices))
-                valid_locations = locations[mask]
-                
-                if len(valid_locations) > 0:
-                    dists = np.linalg.norm(valid_locations - v, axis=1)
-                    closest_idx = np.argmin(dists)
-                    projected.append(valid_locations[closest_idx])
-                else:
-                    # Fallback to closest point
-                    closest_pt = self._project_to_surface(np.array([v]), reference_trimesh)
-                    projected.append(closest_pt[0])
-                    
-            return np.array(projected)
+
+            projected = np.array(vertices, dtype=np.float64, copy=True)
+            hit_ids = np.zeros(0, dtype=np.int64)
+
+            if len(index_ray):
+                # ray i and ray i+n both belong to vertex i
+                vid = np.asarray(index_ray, dtype=np.int64) % n
+                dist = np.linalg.norm(locations - vertices[vid], axis=1)
+                # primary key vertex id, then distance, then original order so
+                # ties resolve exactly like the previous argmin did
+                order = np.lexsort((np.arange(len(vid)), dist, vid))
+                vid_s = vid[order]
+                loc_s = locations[order]
+                first = np.empty(len(vid_s), dtype=bool)
+                first[0] = True
+                if len(vid_s) > 1:
+                    first[1:] = vid_s[1:] != vid_s[:-1]
+                hit_ids = vid_s[first]
+                projected[hit_ids] = loc_s[first]
+
+            missed = np.setdiff1d(np.arange(n, dtype=np.int64), hit_ids, assume_unique=False)
+            if len(missed):
+                projected[missed] = self._project_to_surface(vertices[missed], reference_trimesh)
+
+            return projected
         except Exception as e:
             print(f"Error in ray casting: {e}")
             return self._project_to_surface(vertices, reference_trimesh)
-            
+
+
     def _tangential_laplacian_smooth(self, mesh: HalfEdgeMesh, weight: float, boundary_fixed: bool = True, frozen_set: set = None):
         """Apply Tangential Laplacian smoothing."""
         frozen_set = frozen_set or set()

@@ -13,13 +13,18 @@ class TVertex:
     Represents a vertex in a T-Mesh control grid.
     Can be a regular vertex, a T-junction, or an extraordinary vertex.
     """
-    def __init__(self, id: int, x: float, y: float, z: float, w: float = 1.0):
+    def __init__(self, id: int, x: float, y: float, z: float, w: float = 1.0,
+                 is_boundary: bool = False):
         self.id = id
         self.x = x
         self.y = y
         self.z = z
         self.w = w
-        
+
+        # Boundary vertices of a regular grid are missing direction slots by
+        # construction, so they cannot be classified like interior vertices.
+        self.is_boundary = is_boundary
+
         # Connections to incident edges in up to 4 topological directions
         # For non-quad meshes, this might need to be a list of half-edges, 
         # but for standard T-Splines (which are essentially quad-based with T-junctions):
@@ -36,12 +41,22 @@ class TVertex:
         return sum(1 for e in self.edges.values() if e is not None)
     
     def is_t_junction(self) -> bool:
-        """A T-junction typically has valence 3 in a quad-based T-mesh."""
-        return self.valence == 3
-        
+        """An interior vertex with exactly 3 of its 4 directions used.
+
+        A boundary vertex with 3 edges is just a regular vertex on the border
+        of the grid, not a T-junction.
+        """
+        return not self.is_boundary and self.valence == 3
+
     def is_extraordinary(self) -> bool:
-        """An extraordinary vertex has valence != 4 (excluding T-junctions on boundaries)."""
-        # True extraordinary vertices are interior vertices with valence != 4
+        """A vertex whose valence deviates from the regular quad-grid case.
+
+        Regular is valence 4 in the interior, and 2 (corner) or 3 (border) on
+        the boundary. Interior T-junctions are a refinement feature, not an
+        extraordinary vertex.
+        """
+        if self.is_boundary:
+            return self.valence not in (2, 3)
         return self.valence != 4 and not self.is_t_junction()
 
 
@@ -88,12 +103,13 @@ class TMesh:
         self._next_e_id = 0
         self._next_f_id = 0
         
-    def add_vertex(self, x: float, y: float, z: float, w: float = 1.0) -> TVertex:
-        v = TVertex(self._next_v_id, x, y, z, w)
+    def add_vertex(self, x: float, y: float, z: float, w: float = 1.0,
+                   is_boundary: bool = False) -> TVertex:
+        v = TVertex(self._next_v_id, x, y, z, w, is_boundary)
         self.vertices[self._next_v_id] = v
         self._next_v_id += 1
         return v
-        
+
     def add_edge(self, v1_id: int, v2_id: int, dir_v1: str, dir_v2: str, knot_interval: float = 1.0) -> TEdge:
         """
         Add an edge between two vertices.
@@ -102,10 +118,19 @@ class TMesh:
         """
         if v1_id not in self.vertices or v2_id not in self.vertices:
             raise ValueError("Vertices must be added to the mesh first.")
-            
+
         v1 = self.vertices[v1_id]
         v2 = self.vertices[v2_id]
-        
+
+        for v, d in ((v1, dir_v1), (v2, dir_v2)):
+            if d not in v.edges:
+                raise ValueError(f"Unknown direction '{d}'. Expected one of {sorted(v.edges)}.")
+            if v.edges[d] is not None:
+                # Overwriting would orphan the edge already stored in that slot.
+                raise ValueError(
+                    f"Direction '{d}' of vertex {v.id} is already occupied by edge {v.edges[d].id}."
+                )
+
         e = TEdge(self._next_e_id, v1, v2, knot_interval)
         self.edges[self._next_e_id] = e
         self._next_e_id += 1
@@ -185,19 +210,25 @@ class TMesh:
         edge = self.edges[edge_id]
         v1 = edge.v1
         v2 = edge.v2
-        
+
+        # Find which direction edge was relative to v1 and v2
+        dir_v1 = next((d for d, e in v1.edges.items() if e == edge), None)
+        dir_v2 = next((d for d, e in v2.edges.items() if e == edge), None)
+        if dir_v1 is None or dir_v2 is None:
+            # Without both slots we would write a None key into vertex.edges.
+            raise ValueError(
+                f"Edge {edge_id} is not registered in the direction slots of its vertices."
+            )
+
         # Calculate new vertex position (linear interpolation for control net)
         nx = v1.x * (1 - alpha) + v2.x * alpha
         ny = v1.y * (1 - alpha) + v2.y * alpha
         nz = v1.z * (1 - alpha) + v2.z * alpha
         nw = v1.w * (1 - alpha) + v2.w * alpha
-        
-        new_v = self.add_vertex(nx, ny, nz, nw)
-        
-        # Find which direction edge was relative to v1 and v2
-        dir_v1 = next((d for d, e in v1.edges.items() if e == edge), None)
-        dir_v2 = next((d for d, e in v2.edges.items() if e == edge), None)
-        
+
+        # A vertex inserted between two boundary vertices stays on the boundary
+        new_v = self.add_vertex(nx, ny, nz, nw, v1.is_boundary and v2.is_boundary)
+
         # Update knot intervals
         old_interval = edge.knot_interval
         int1 = old_interval * alpha

@@ -49,15 +49,22 @@ class FeatureTree:
         # Feature evaluation function provided by the engine
         self.feature_evaluator: Optional[Callable[[Feature, Optional[HalfEdgeMesh]], HalfEdgeMesh]] = None
 
+    def _notify_added(self, feature: Feature) -> None:
+        for cb in self.on_feature_added:
+            cb(feature)
+
+    def _notify_removed(self, index: int) -> None:
+        for cb in self.on_feature_removed:
+            cb(index)
+
     def add_feature(self, feature: Feature) -> None:
         self.features.append(feature)
         idx = len(self.features) - 1
         self._undo_stack.append(('ADD', feature, idx))
         self._redo_stack.clear()
-        
-        for cb in self.on_feature_added:
-            cb(feature)
-            
+
+        self._notify_added(feature)
+
         self.rebuild(idx)
 
     def remove_feature(self, index: int) -> None:
@@ -65,10 +72,9 @@ class FeatureTree:
             feat = self.features.pop(index)
             self._undo_stack.append(('REMOVE', feat, index))
             self._redo_stack.clear()
-            
-            for cb in self.on_feature_removed:
-                cb(index)
-                
+
+            self._notify_removed(index)
+
             self.rebuild(max(0, index - 1))
 
     def move_feature(self, from_idx: int, to_idx: int) -> None:
@@ -92,20 +98,36 @@ class FeatureTree:
         if not self.feature_evaluator:
             return None
             
-        current_mesh = None
-        if from_index > 0:
-            for i in range(from_index - 1, -1, -1):
-                if self.features[i].enabled and self.features[i].mesh_snapshot:
-                    current_mesh = self.features[i].mesh_snapshot.copy()
-                    break
+        start = max(0, min(from_index, len(self.features)))
 
-        for i in range(max(0, from_index), len(self.features)):
+        # Walk back to the newest usable snapshot. An enabled feature without a
+        # snapshot (a freshly loaded tree, an invalidated one) has never been
+        # evaluated, so evaluation has to restart there instead of skipping it.
+        current_mesh = None
+        for i in range(start - 1, -1, -1):
             feat = self.features[i]
-            if feat.enabled:
-                current_mesh = self.feature_evaluator(feat, current_mesh)
-                feat.mesh_snapshot = current_mesh.copy() if current_mesh else None
-            else:
+            if not feat.enabled:
+                continue
+            if feat.mesh_snapshot is not None:
+                current_mesh = feat.mesh_snapshot.copy()
+                break
+            start = i
+
+        for i in range(start, len(self.features)):
+            feat = self.features[i]
+            if not feat.enabled:
                 feat.mesh_snapshot = None
+                continue
+            try:
+                current_mesh = self.feature_evaluator(feat, current_mesh)
+            except Exception:
+                # Snapshots from this feature onwards describe the pre-edit
+                # geometry; leaving them would let get_current_mesh() report
+                # stale geometry as current.
+                for stale in self.features[i:]:
+                    stale.mesh_snapshot = None
+                raise
+            feat.mesh_snapshot = current_mesh.copy() if current_mesh else None
 
         for cb in self.on_rebuild_complete:
             cb(self.get_current_mesh())
@@ -125,9 +147,11 @@ class FeatureTree:
         
         if action == 'ADD':
             self.features.pop()
+            self._notify_removed(idx)
             self.rebuild(idx)
         elif action == 'REMOVE':
             self.features.insert(idx, feat)
+            self._notify_added(feat)
             self.rebuild(idx)
         elif action == 'MOVE':
             to_idx, from_idx = idx
@@ -145,9 +169,11 @@ class FeatureTree:
         
         if action == 'ADD':
             self.features.append(feat)
+            self._notify_added(feat)
             self.rebuild(idx)
         elif action == 'REMOVE':
             self.features.pop(idx)
+            self._notify_removed(idx)
             self.rebuild(max(0, idx - 1))
         elif action == 'MOVE':
             to_idx, from_idx = idx

@@ -5,10 +5,34 @@ import trimesh
 from src.core.halfedge_mesh import HalfEdgeMesh
 
 
-def _compute_sdf(vertices: np.ndarray, faces: np.ndarray, 
-                 grid_resolution: int, padding: float = 0.1) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Compute signed distance field on a voxel grid.
-    
+def _oriented_distance(tmesh: 'trimesh.Trimesh', points: np.ndarray) -> np.ndarray:
+    """Signed distance to an OPEN, oriented surface.
+
+    ``trimesh.proximity.signed_distance`` needs a watertight mesh (it signs by
+    containment), so for a sheet the sign is meaningless. Sign by the normal of
+    the nearest triangle instead: positive on the +normal ("outward") side.
+    """
+    closest, dist, tri_id = trimesh.proximity.closest_point(tmesh, points)
+    normals = tmesh.face_normals[tri_id]
+    side = np.einsum('ij,ij->i', points - closest, normals)
+    sign = np.where(side < 0.0, -1.0, 1.0)
+    return dist * sign
+
+
+def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
+                 grid_resolution: int, padding: float = 0.1,
+                 open_surface: bool = False) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Compute a signed distance field on a voxel grid.
+
+    Sign convention: POSITIVE OUTSIDE / on the +normal side, negative inside.
+    Note ``trimesh.proximity.signed_distance`` uses the OPPOSITE convention
+    (positive inside); the sign is flipped here so the whole module can use one
+    convention and marching-cubes levels read as plain offsets.
+
+    Args:
+        open_surface: sign by the nearest triangle's normal instead of by
+            containment -- required for sheets, which have no inside.
+
     Returns:
         sdf_grid: 3D numpy array of signed distances
         grid_origin: (3,) origin of the grid
@@ -16,43 +40,56 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
     """
     if len(faces) == 0 or len(vertices) == 0:
         raise ValueError("Empty mesh provided.")
-        
+
     tmesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    
+
     bbox_min = vertices.min(axis=0)
     bbox_max = vertices.max(axis=0)
     extents = bbox_max - bbox_min
     max_extent = extents.max() if extents.max() > 0 else 1.0
-        
+
     pad_val = max_extent * padding
-    bbox_min -= pad_val
-    bbox_max += pad_val
-    
-    # Calculate voxel size to cover the maximum dimension
-    voxel_size = float((bbox_max.max() - bbox_min.min()) / grid_resolution)
-    
+    bbox_min = bbox_min - pad_val
+    bbox_max = bbox_max + pad_val
+
+    # Voxel size from the PADDED extent of the largest axis. The old
+    # (bbox_max.max() - bbox_min.min()) mixed coordinate axes: for a part
+    # sitting at x ~= 1150 it returned ~1170 instead of ~24 and the grid
+    # collapsed to 2x2x2.
+    padded_extents = bbox_max - bbox_min
+    voxel_size = float(padded_extents.max() / max(1, grid_resolution))
+    if not np.isfinite(voxel_size) or voxel_size <= 0:
+        voxel_size = 1.0
+
     # Create grid
-    nx = int(np.ceil((bbox_max[0] - bbox_min[0]) / voxel_size))
-    ny = int(np.ceil((bbox_max[1] - bbox_min[1]) / voxel_size))
-    nz = int(np.ceil((bbox_max[2] - bbox_min[2]) / voxel_size))
-    
+    nx = int(np.ceil(padded_extents[0] / voxel_size)) + 1
+    ny = int(np.ceil(padded_extents[1] / voxel_size)) + 1
+    nz = int(np.ceil(padded_extents[2] / voxel_size)) + 1
+
     # Ensure at least 2x2x2
     nx = max(nx, 2); ny = max(ny, 2); nz = max(nz, 2)
-    
+
     x = np.linspace(bbox_min[0], bbox_min[0] + (nx-1)*voxel_size, nx)
     y = np.linspace(bbox_min[1], bbox_min[1] + (ny-1)*voxel_size, ny)
     z = np.linspace(bbox_min[2], bbox_min[2] + (nz-1)*voxel_size, nz)
-    
+
     X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
     points = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
-    
+
     try:
-        from trimesh.proximity import signed_distance
-        # Trimesh signed distance: positive outside, negative inside
-        sd = signed_distance(tmesh, points)
+        if open_surface:
+            sd = _oriented_distance(tmesh, points)
+        else:
+            from trimesh.proximity import signed_distance
+            # trimesh: POSITIVE INSIDE -> negate for positive-outside.
+            sd = -np.asarray(signed_distance(tmesh, points))
         sdf_grid = sd.reshape((nx, ny, nz))
-    except Exception:
-        # Fallback to absolute distance using scipy KDTree
+    except Exception as e:
+        # Fallback to UNSIGNED distance using scipy KDTree. This breaks the
+        # sign convention above (everything reads as outside), so any offset
+        # extracted from it is one-sided -- say so instead of failing quietly.
+        print(f"Warning: signed distance unavailable ({e}); falling back to an "
+              f"UNSIGNED point distance field -- inward offsets will be wrong.")
         from scipy.spatial import cKDTree
         tree = cKDTree(vertices)
         distances, _ = tree.query(points)
@@ -120,6 +157,19 @@ def _smooth_mesh(mesh: HalfEdgeMesh, iterations: int) -> HalfEdgeMesh:
     return mesh
 
 
+def _padding_for(vertices: np.ndarray, offset: float) -> float:
+    """Bounding-box padding (as a fraction of the largest axis) that still
+    contains an offset of `offset` plus a couple of voxels of slack.
+
+    The old expression used ``verts.max() - verts.min()`` -- the spread across
+    ALL coordinates -- which for a part sitting at x ~= 1150 is ~1200 and made
+    the padding vanish.
+    """
+    extents = vertices.max(axis=0) - vertices.min(axis=0)
+    max_extent = float(extents.max()) if float(extents.max()) > 0 else 1.0
+    return float(max(0.1, 2.0 * abs(offset) / max_extent))
+
+
 def shell_solid(mesh: HalfEdgeMesh, thickness: float = 1.0,
                 direction: str = 'inward',
                 excluded_faces: Optional[List[int]] = None,
@@ -143,12 +193,16 @@ def shell_solid(mesh: HalfEdgeMesh, thickness: float = 1.0,
     Args:
         mesh: Input solid mesh
         thickness: Wall thickness
-        direction: 'inward', 'outward', or 'both'
+        direction: which way the offset surface moves --
+            'inward'  = shrink the body by `thickness`
+            'outward' = grow the body by `thickness`
+            'both'    = grow by `thickness / 2` (the outer face of a wall
+                        centred on the input surface)
         excluded_faces: Face indices to exclude (create openings)
         resolution: Voxel grid resolution (higher = more precise but slower)
         smooth_iterations: Post-processing smooth passes
-    
-    Returns: HalfEdgeMesh of the shelled solid
+
+    Returns: HalfEdgeMesh of the offset (shell) surface
     """
     if len(mesh.vertices) == 0:
         return mesh.copy()
@@ -167,19 +221,24 @@ def shell_solid(mesh: HalfEdgeMesh, thickness: float = 1.0,
         return thicken_surface(open_mesh, thickness, direction, resolution, smooth_iterations)
 
     tm = mesh.to_trimesh()
-    verts = tm.vertices
-    tri_faces = tm.faces
+    verts = np.asarray(tm.vertices, dtype=np.float64)
+    tri_faces = np.asarray(tm.faces)
 
-    padding = max(0.1, thickness * 2.0 / (verts.max() - verts.min() + 1e-6))
-    sdf_grid, grid_origin, voxel_size = _compute_sdf(verts, tri_faces, resolution, padding=padding)
-    
+    # Signed offset along the OUTWARD normal direction.
     if direction == 'inward':
-        level = -thickness
+        offset = -abs(thickness)
     elif direction == 'outward':
-        level = thickness
-    else: # both
-        level = thickness
-        
+        offset = abs(thickness)
+    else:  # both
+        offset = abs(thickness) / 2.0
+
+    padding = _padding_for(verts, offset)
+    sdf_grid, grid_origin, voxel_size = _compute_sdf(verts, tri_faces, resolution, padding=padding)
+
+    # _compute_sdf is positive OUTSIDE, so the surface offset outward by d is
+    # exactly the level set sdf == d (and d < 0 shrinks the body).
+    level = offset
+
     try:
         shell_verts, shell_faces = _marching_cubes(sdf_grid, level, grid_origin, voxel_size)
         if len(shell_verts) > 0:
@@ -187,10 +246,10 @@ def shell_solid(mesh: HalfEdgeMesh, thickness: float = 1.0,
             _smooth_mesh(result_mesh, smooth_iterations)
             return _fix_self_intersections(result_mesh)
         else:
-            return _offset_along_normals(mesh, level)
+            return _offset_along_normals(mesh, offset)
     except Exception as e:
         print(f"SDF shelling failed, falling back to normal offset: {e}")
-        return _offset_along_normals(mesh, thickness if direction != 'inward' else -thickness)
+        return _offset_along_normals(mesh, offset)
 
 
 def thicken_surface(mesh: HalfEdgeMesh, thickness: float = 1.0,
@@ -203,46 +262,68 @@ def thicken_surface(mesh: HalfEdgeMesh, thickness: float = 1.0,
     direction and closing the boundary.
     
     Algorithm:
-    1. If direction is 'both': offset by +thickness/2 and -thickness/2
-    2. Compute SDF from input surface
-    3. Extract isosurface at the desired thickness
-    4. Cap open boundaries
-    5. Smooth result
-    
+    1. Compute an oriented distance field from the input surface (positive on
+       the +normal / 'outward' side)
+    2. The wall is the slab {centre - thickness/2 <= sd <= centre + thickness/2},
+       where centre is 0 for 'both', +thickness/2 for 'outward' and
+       -thickness/2 for 'inward'. Its boundary is the level set
+       |sd - centre| == thickness/2, so ONE marching-cubes pass produces the
+       whole closed solid including the caps.
+    3. Smooth result
+
+    ``thickness`` is the TOTAL wall thickness in every mode. The previous
+    implementation extracted |sd| == thickness for the one-sided modes, which
+    both ignored `direction` (the result was symmetric) and produced a wall of
+    2 * thickness.
+
+    Accuracy: away from the open boundary the wall sits exactly where asked.
+    At the rim the one-sided slab has a sharp corner (and the nearest-triangle
+    sign flips discontinuously across the surface plane there), so marching
+    cubes rounds the cap over roughly half a voxel; raise `resolution` if that
+    matters.
+
     Args:
         mesh: Input surface mesh (may be open)
         thickness: Total wall thickness
-        direction: 'outward' (along normals), 'inward', or 'both' (symmetric)
+        direction: 'outward' (all material on the +normal side), 'inward'
+            (all material on the -normal side), or 'both' (symmetric)
         resolution: Voxel grid resolution
         smooth_iterations: Post-processing smooth passes
-    
+
     Returns: HalfEdgeMesh of the thickened solid
     """
     if len(mesh.vertices) == 0:
         return mesh.copy()
 
     tm = mesh.to_trimesh()
-    verts = tm.vertices
-    tri_faces = tm.faces
-    
-    # Compute absolute distance field since surface is open
-    padding = max(0.1, thickness * 2.0 / (verts.max() - verts.min() + 1e-6))
-    sdf_grid, grid_origin, voxel_size = _compute_sdf(verts, tri_faces, resolution, padding=padding)
-    
-    target_level = thickness / 2.0 if direction == 'both' else thickness
-    
+    verts = np.asarray(tm.vertices, dtype=np.float64)
+    tri_faces = np.asarray(tm.faces)
+
+    half = abs(thickness) / 2.0
+    if direction == 'outward':
+        centre = half
+    elif direction == 'inward':
+        centre = -half
+    else:  # both
+        centre = 0.0
+
+    # Room for the far side of the wall plus slack.
+    padding = _padding_for(verts, abs(centre) + half)
+    sdf_grid, grid_origin, voxel_size = _compute_sdf(
+        verts, tri_faces, resolution, padding=padding, open_surface=True
+    )
+
     try:
-        # Since the mesh might be open, signed distance could be unreliable.
-        # We take the absolute value of the SDF to create a thickened envelope (capsule-like).
-        abs_sdf = np.abs(sdf_grid)
-        thick_verts, thick_faces = _marching_cubes(abs_sdf, target_level, grid_origin, voxel_size)
-        
+        # |sd - centre| == half is exactly the boundary of the requested slab.
+        field = np.abs(sdf_grid - centre)
+        thick_verts, thick_faces = _marching_cubes(field, half, grid_origin, voxel_size)
+
         if len(thick_verts) > 0:
             result_mesh = HalfEdgeMesh.from_arrays(thick_verts, thick_faces.tolist())
             _smooth_mesh(result_mesh, smooth_iterations)
             return _fix_self_intersections(result_mesh)
         else:
-            return _offset_along_normals(mesh, target_level)
+            return _offset_along_normals(mesh, centre)
     except Exception as e:
         print(f"SDF thickening failed, falling back to normal offset: {e}")
-        return _offset_along_normals(mesh, target_level)
+        return _offset_along_normals(mesh, centre)

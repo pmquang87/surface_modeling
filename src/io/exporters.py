@@ -14,15 +14,15 @@ def export_stl(mesh: 'HalfEdgeMesh', filepath: str, binary: bool = True) -> None
     and then exports.
     """
     if len(mesh.faces) == 0:
-        logger.warning(f"Mesh is empty, cannot export STL to {filepath}")
-        return
-        
+        raise ValueError(f"Mesh is empty, cannot export STL to {filepath}")
+
     try:
         t_mesh = mesh.to_trimesh()
         t_mesh.export(filepath, file_type='stl' + ('' if binary else '_ascii'))
         logger.info(f"Exported STL to {filepath}")
     except Exception as e:
         logger.error(f"Failed to export STL: {e}")
+        raise
 
 def export_obj(mesh: 'HalfEdgeMesh', filepath: str) -> None:
     """Export HalfEdgeMesh as OBJ file.
@@ -43,6 +43,7 @@ def export_obj(mesh: 'HalfEdgeMesh', filepath: str) -> None:
         logger.info(f"Exported OBJ to {filepath}")
     except Exception as e:
         logger.error(f"Failed to export OBJ: {e}")
+        raise
 
 def export_step(brep_shape: Any, filepath: str) -> None:
     """Export an OCC shape as STEP file.
@@ -52,34 +53,31 @@ def export_step(brep_shape: Any, filepath: str) -> None:
         filepath: output path
     """
     if brep_shape is None:
-        logger.error("No B-Rep shape provided for STEP export.")
-        return
-        
+        raise ValueError("No B-Rep shape provided for STEP export.")
+
     try:
         from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
         from OCP.Interface import Interface_Static
-        
-        writer = STEPControl_Writer()
-        Interface_Static.SetCVal_s("write.step.schema", "AP214")
-        
-        status = writer.Transfer(brep_shape, STEPControl_AsIs)
-        if status == 1:
-            write_status = writer.Write(filepath)
-            from OCP.IFSelect import IFSelect_RetDone
-            if write_status == IFSelect_RetDone:
-                logger.info(f"Exported STEP to {filepath}")
-            else:
-                logger.error(f"Failed to write STEP file. Return status: {write_status}")
-        else:
-            logger.error("Failed to transfer shape for STEP export.")
-            
     except ImportError:
         try:
             import cadquery as cq
             # cadquery exporter
             cq.exporters.export(brep_shape, filepath, "STEP")
             logger.info(f"Exported STEP to {filepath} using CadQuery.")
+            return
         except ImportError:
-            logger.error("Neither OCP nor CadQuery are available. Cannot export STEP.")
-    except Exception as e:
-        logger.error(f"Failed to export STEP: {e}")
+            raise RuntimeError("Neither OCP nor CadQuery are available. Cannot export STEP.")
+
+    # schema must be set BEFORE the writer is constructed — the writer's
+    # model captures the protocol at creation time
+    Interface_Static.SetCVal_s("write.step.schema", "AP214IS")
+    writer = STEPControl_Writer()
+
+    status = writer.Transfer(brep_shape, STEPControl_AsIs)
+    if status != 1:
+        raise RuntimeError("Failed to transfer shape for STEP export.")
+    write_status = writer.Write(filepath)
+    from OCP.IFSelect import IFSelect_RetDone
+    if write_status != IFSelect_RetDone:
+        raise RuntimeError(f"Failed to write STEP file. Return status: {write_status}")
+    logger.info(f"Exported STEP to {filepath}")

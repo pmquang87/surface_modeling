@@ -10,6 +10,7 @@ import pyvista as pv
 pv.OFF_SCREEN = True
 
 from PySide6.QtWidgets import QApplication
+from src.core.feature_tree import Feature
 from src.gui.main_window import PowerSurfacingMainWindow
 from src.io.importers import import_stl
 from src.gui.dialogs import PrimitiveDialog, SubdivideDialog, QuadWrapDialog, ShrinkWrapDialog, ShellThickenDialog, ConvertNURBSDialog, ExportDialog
@@ -95,7 +96,7 @@ def run_tests():
 
     print("7. Feature tree panel...")
     try:
-        window.feature_tree.add_feature("BoxPrimitive", {"size": 1.0})
+        window.feature_tree.add_feature(Feature("BoxPrimitive", "primitive", {"size": 1.0}))
         print("PASS: Feature tree panel succeeded")
     except Exception as e:
         print(f"FAIL: Feature tree panel failed - {e}")
