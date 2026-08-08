@@ -21,23 +21,40 @@ def _oriented_distance(tmesh: 'trimesh.Trimesh', points: np.ndarray) -> np.ndarr
 
 def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
                  grid_resolution: int, padding: float = 0.1,
-                 open_surface: bool = False) -> Tuple[np.ndarray, np.ndarray, float]:
+                 open_surface: bool = False,
+                 exact_band: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, float]:
     """Compute a signed distance field on a voxel grid.
 
     Sign convention: POSITIVE OUTSIDE / on the +normal side, negative inside.
-    Note ``trimesh.proximity.signed_distance`` uses the OPPOSITE convention
-    (positive inside); the sign is flipped here so the whole module can use one
-    convention and marching-cubes levels read as plain offsets.
+
+    Scalability: ``trimesh.proximity.signed_distance`` on the full grid
+    broadcasts points x triangles (a real 63k-triangle part at resolution 192
+    attempted a 244 GiB allocation). Instead:
+      1. coarse unsigned distance for EVERY grid point from a KDTree over a
+         dense surface sampling (~voxel/2 spacing),
+      2. exact unsigned distance (chunked closest-point queries) only inside
+         ``exact_band`` -- the region whose values marching cubes will read,
+      3. sign from a voxel flood fill: cells the surface crosses are walls,
+         the component reachable from the padded corner is outside, enclosed
+         components are inside. Near-surface cells sign by the nearest
+         sample's normal. This stays correct at thin features where pure
+         normal-based signing is ambiguous.
 
     Args:
         open_surface: sign by the nearest triangle's normal instead of by
-            containment -- required for sheets, which have no inside.
+            enclosure -- required for sheets, which have no inside.
+        exact_band: absolute distance (same units as the mesh) within which
+            values are refined to exact surface distance. None -> 4 voxels
+            (enough to extract the level-0 surface).
 
     Returns:
         sdf_grid: 3D numpy array of signed distances
         grid_origin: (3,) origin of the grid
         voxel_size: float, size of each voxel
     """
+    from scipy import ndimage
+    from scipy.spatial import cKDTree
+
     if len(faces) == 0 or len(vertices) == 0:
         raise ValueError("Empty mesh provided.")
 
@@ -61,12 +78,9 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
     if not np.isfinite(voxel_size) or voxel_size <= 0:
         voxel_size = 1.0
 
-    # Create grid
     nx = int(np.ceil(padded_extents[0] / voxel_size)) + 1
     ny = int(np.ceil(padded_extents[1] / voxel_size)) + 1
     nz = int(np.ceil(padded_extents[2] / voxel_size)) + 1
-
-    # Ensure at least 2x2x2
     nx = max(nx, 2); ny = max(ny, 2); nz = max(nz, 2)
 
     x = np.linspace(bbox_min[0], bbox_min[0] + (nx-1)*voxel_size, nx)
@@ -76,25 +90,77 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
     X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
     points = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
 
-    try:
-        if open_surface:
-            sd = _oriented_distance(tmesh, points)
-        else:
-            from trimesh.proximity import signed_distance
-            # trimesh: POSITIVE INSIDE -> negate for positive-outside.
-            sd = -np.asarray(signed_distance(tmesh, points))
-        sdf_grid = sd.reshape((nx, ny, nz))
-    except Exception as e:
-        # Fallback to UNSIGNED distance using scipy KDTree. This breaks the
-        # sign convention above (everything reads as outside), so any offset
-        # extracted from it is one-sided -- say so instead of failing quietly.
-        print(f"Warning: signed distance unavailable ({e}); falling back to an "
-              f"UNSIGNED point distance field -- inward offsets will be wrong.")
-        from scipy.spatial import cKDTree
-        tree = cKDTree(vertices)
-        distances, _ = tree.query(points)
-        sdf_grid = distances.reshape((nx, ny, nz))
+    # 1. Coarse unsigned distance from a dense surface sampling.
+    target_spacing = voxel_size / 2.0
+    n_samples = int(np.clip(4.0 * tmesh.area / max(target_spacing ** 2, 1e-12),
+                            20_000, 3_000_000))
+    samples, sample_faces = trimesh.sample.sample_surface(tmesh, n_samples, seed=0)
+    tree = cKDTree(samples)
+    d_est, nearest_idx = tree.query(points, workers=-1)
+    sampling_err = 1.5 * target_spacing
 
+    # 2. Exact refinement inside the band marching cubes will actually read.
+    # Keep the exact closest points / triangles: signing near-surface cells
+    # with a nearest SAMPLE's normal fails at creases (a near-tie can pick a
+    # sample on the adjacent face, flipping the sign and bulging the level-0
+    # surface outward at box edges); the exact closest point has no such tie.
+    band = (4.0 * voxel_size) if exact_band is None else float(exact_band)
+    refine_mask = d_est < band + 2.0 * voxel_size + sampling_err
+    refine_pts = points[refine_mask]
+    exact_closest = np.empty((len(refine_pts), 3))
+    exact_tri = np.empty(len(refine_pts), dtype=np.int64)
+    if len(refine_pts):
+        exact = np.empty(len(refine_pts))
+        chunk = 200_000
+        for s in range(0, len(refine_pts), chunk):
+            closest, dist, tri = tmesh.nearest.on_surface(refine_pts[s:s + chunk])
+            exact[s:s + chunk] = dist
+            exact_closest[s:s + chunk] = closest
+            exact_tri[s:s + chunk] = tri
+        d_est[refine_mask] = exact
+
+    def _exact_normal_sign():
+        """Sign for the refined points from the exact nearest triangle."""
+        normals = tmesh.face_normals[exact_tri]
+        side = np.einsum('ij,ij->i', refine_pts - exact_closest, normals)
+        return np.where(side < 0.0, -1.0, 1.0)
+
+    if open_surface:
+        # Sheets have no enclosure: sign by the nearest facet's normal —
+        # exact within the refined band, sample-based far away (where the
+        # sign never reaches an extraction level anyway).
+        normals = tmesh.face_normals[sample_faces[nearest_idx]]
+        side = np.einsum('ij,ij->i', points - samples[nearest_idx], normals)
+        sign = np.where(side < 0.0, -1.0, 1.0)
+        if len(refine_pts):
+            sign[refine_mask] = _exact_normal_sign()
+        sdf_grid = (sign * d_est).reshape((nx, ny, nz))
+        grid_origin = np.array([x[0], y[0], z[0]])
+        return sdf_grid, grid_origin, voxel_size
+
+    # 3. Sign by voxel flood fill.
+    d_grid = d_est.reshape((nx, ny, nz))
+    wall = d_grid < (voxel_size * 0.87 + sampling_err)  # cells the surface crosses
+    labels, _ = ndimage.label(~wall)
+    outside_label = labels[0, 0, 0]  # padded corner is always outside
+    if outside_label == 0:
+        raise RuntimeError(
+            "SDF sign classification failed: the padded grid corner lies in a "
+            "surface-crossing cell; increase resolution or padding.")
+    sign_flat = np.where(labels == outside_label, 1.0, -1.0).ravel()
+
+    # Near-surface (wall) cells: enclosure says nothing — they ARE the wall.
+    # Sign them from the exact nearest triangle; every wall cell lies inside
+    # the refine band (wall threshold < refine threshold for any band >= 0).
+    if len(refine_pts):
+        wall_flat = wall.ravel()
+        exact_sign = _exact_normal_sign()
+        wall_in_refine = wall_flat[refine_mask]
+        refined_sign_full = sign_flat[refine_mask]
+        refined_sign_full[wall_in_refine] = exact_sign[wall_in_refine]
+        sign_flat[refine_mask] = refined_sign_full
+
+    sdf_grid = (sign_flat * d_est).reshape((nx, ny, nz))
     grid_origin = np.array([x[0], y[0], z[0]])
     return sdf_grid, grid_origin, voxel_size
 
@@ -205,24 +271,33 @@ def _extract_wall_band(vertices: np.ndarray, faces: np.ndarray,
     Args:
         open_surface: sign the distance field by the nearest triangle's normal
             (needed for sheets) instead of by containment (closed solids).
-        fallback_mesh: offset along its own normals and returned if marching
-            cubes is unavailable or fails.
+        fallback_mesh: kept for signature compatibility; extraction failure
+            RAISES instead of silently returning a normal offset (a plain
+            offset is not a wall, and callers could not tell the difference).
     """
     padding = _padding_for(vertices, abs(centre) + half)
     sdf_grid, grid_origin, voxel_size = _compute_sdf(
-        vertices, faces, resolution, padding=padding, open_surface=open_surface
+        vertices, faces, resolution, padding=padding, open_surface=open_surface,
+        exact_band=abs(centre) + half,
     )
 
     try:
         field = np.abs(sdf_grid - centre)
         wall_verts, wall_faces = _marching_cubes(field, half, grid_origin, voxel_size)
-        if len(wall_verts) > 0:
-            result_mesh = HalfEdgeMesh.from_arrays(wall_verts, wall_faces.tolist())
-            _smooth_mesh(result_mesh, smooth_iterations)
-            return _fix_self_intersections(result_mesh)
     except Exception as e:
-        print(f"SDF wall extraction failed, falling back to normal offset: {e}")
-    return _offset_along_normals(fallback_mesh, centre)
+        raise RuntimeError(
+            f"SDF wall extraction failed ({e}). The wall band "
+            f"[{centre - half:.3f}, {centre + half:.3f}] may be thinner than "
+            f"the voxel size {voxel_size:.3f} — raise `resolution`."
+        ) from e
+    if len(wall_verts) == 0:
+        raise RuntimeError(
+            f"SDF wall extraction produced no surface: the wall band "
+            f"[{centre - half:.3f}, {centre + half:.3f}] is not resolved at "
+            f"voxel size {voxel_size:.3f} — raise `resolution`.")
+    result_mesh = HalfEdgeMesh.from_arrays(wall_verts, wall_faces.tolist())
+    _smooth_mesh(result_mesh, smooth_iterations)
+    return _fix_self_intersections(result_mesh)
 
 
 def shell_solid(mesh: HalfEdgeMesh, thickness: float = 1.0,
