@@ -1,13 +1,15 @@
 import os
 import sys
 import io
+import html
 import datetime
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QSplitter, QMenuBar, QMenu, QToolBar, QStatusBar,
                                QFileDialog, QMessageBox, QApplication, QTextEdit,
                                QComboBox, QLabel, QPushButton)
 from PySide6.QtCore import Qt, QObject, Signal
-from PySide6.QtGui import QAction, QPalette, QColor, QKeySequence, QIcon, QTextCursor
+from PySide6.QtGui import (QAction, QPalette, QColor, QKeySequence, QIcon, QTextCursor,
+                           QTextBlockFormat, QTextCharFormat)
 
 from src.gui.viewport import MeshViewport
 from src.gui.panels import FeatureTreePanel, PropertiesPanel, SelectionPanel
@@ -170,7 +172,13 @@ class PowerSurfacingMainWindow(QMainWindow):
         self.selection_panel.selection_operation_requested.connect(self.viewport.run_selection_operation)
         self.selection_panel.tangent_selection_requested.connect(self.on_expand_selection)
         self.selection_panel.cb_through.toggled.connect(self.viewport.set_box_select_through)
-        
+
+        # The panel is drawn with Face / Pick / New already checked but emits
+        # nothing until the user clicks, so the viewport used to sit in its
+        # 'none' mode and swallow the first click. Push the panel's initial
+        # state across once, at startup.
+        self._sync_selection_panel_to_viewport()
+
         self.properties_panel.property_changed.connect(self.on_property_changed)
         
         # Connect FeatureTreePanel signals
@@ -221,10 +229,27 @@ class PowerSurfacingMainWindow(QMainWindow):
     def _append_log(self, text, error=False):
         """Append a message to the in-GUI log panel."""
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f'[{timestamp}] {str(text).rstrip()}'
+
+        cursor = self.log_panel.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        if not self.log_panel.document().isEmpty():
+            # Reset formats so the red error colour does not bleed into the
+            # following lines.
+            cursor.insertBlock(QTextBlockFormat(), QTextCharFormat())
+
         if error:
-            self.log_panel.append(f'<span style="color:#cc0000;">[{timestamp}] {text}</span>')
+            # The message is rendered as rich text to keep the red styling, so
+            # it MUST be escaped — '<' or '&' in a traceback would otherwise be
+            # swallowed or interpreted as markup.
+            safe = html.escape(line, quote=False)
+            cursor.insertHtml(
+                f'<span style="color:#cc0000; white-space:pre-wrap;">{safe}</span>'
+            )
         else:
-            self.log_panel.append(f'[{timestamp}] {text}')
+            # Plain insert: never interpreted as markup, whitespace preserved.
+            cursor.insertText(line)
+
         self.log_panel.moveCursor(QTextCursor.End)
 
     def log(self, message):
@@ -429,6 +454,14 @@ class PowerSurfacingMainWindow(QMainWindow):
         elif index == 6: self.viewport.plotter.view_yz()
         elif index == 7: self.viewport.plotter.view_yz(negative=True)
 
+    def _sync_selection_panel_to_viewport(self):
+        """Make the viewport agree with what the selection panel already shows."""
+        panel = self.selection_panel
+        self.viewport.set_selection_modifier(panel.current_selection_modifier())
+        self.viewport.set_selection_method(panel.current_selection_method())
+        self.viewport.set_box_select_through(panel.cb_through.isChecked())
+        self.viewport.set_selection_mode(panel.current_selection_mode())
+
     def on_selection_changed(self, indices):
         if not self.current_mesh: return
         if self.viewport.selection_mode == 'vertex' and len(indices) == 1:
@@ -439,11 +472,47 @@ class PowerSurfacingMainWindow(QMainWindow):
             self.properties_panel.set_face_properties(indices, self.current_mesh)
             
     def on_property_changed(self, prop_name, value):
-        self.log(f"Property changed: {prop_name} -> {value}")
-        if self.current_mesh:
-            self.viewport.update_mesh(self.current_mesh)
+        """Write an edited property back onto the mesh element it belongs to."""
+        mesh = self.current_mesh
+        if mesh is None:
+            return
 
-            
+        target = getattr(self.properties_panel, 'current_target', None)
+        if not target:
+            return
+        kind, index = target
+
+        axis_map = {'pos_x': 0, 'pos_y': 1, 'pos_z': 2}
+
+        if kind == 'vertex' and prop_name in axis_map:
+            if index is None or not (0 <= index < len(mesh.vertices)):
+                return
+            axis = axis_map[prop_name]
+            vertex = mesh.vertices[index]
+            new_value = float(value)
+            if abs(float(vertex.position[axis]) - new_value) < 1e-12:
+                return  # nothing actually changed (panel repopulation)
+            vertex.position[axis] = new_value
+            mesh.compute_face_normals()
+            self.viewport.refresh_geometry()
+            self.log(f"Vertex {index} {prop_name[-1].upper()} -> {new_value:.6g}")
+
+        elif kind == 'edge' and prop_name == 'crease_weight':
+            if index is None or not (0 <= index < len(mesh.edges)):
+                return
+            edge = mesh.edges[index]
+            new_value = float(value)
+            if abs(float(edge.crease_weight) - new_value) < 1e-12:
+                return
+            edge.crease_weight = new_value
+            self.log(f"Edge {index} crease weight -> {new_value:.4g}")
+
+        else:
+            # Everything else in the panel is read-only (mesh counts, face
+            # normals); nothing to write back.
+            self.log(f"Property '{prop_name}' is read-only — not applied.")
+
+
     def on_expand_selection(self, angle):
         if not self.current_mesh: return
         current_faces = self.viewport.get_selected_faces()
@@ -603,6 +672,28 @@ class PowerSurfacingMainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", str(e))
             
+    @staticmethod
+    def _primitive_factories():
+        """Map the dialog's primitive names to size-driven factory callables.
+
+        Each callable takes the single `size` value from PrimitiveDialog and
+        translates it into the natural kwargs of src.subd.primitives, so the
+        created primitive spans roughly `size` in its largest dimension.
+        """
+        if primitives is None:
+            return {}
+        return {
+            'box': lambda s: primitives.create_box(width=s, height=s, depth=s),
+            'cylinder': lambda s: primitives.create_cylinder(radius=s / 2.0, height=s),
+            # outer diameter = 2 * (major + minor); keep the default 1 : 0.3 ratio
+            'torus': lambda s: primitives.create_torus(
+                major_radius=s / 2.6, minor_radius=(s / 2.6) * 0.3
+            ),
+            'cone': lambda s: primitives.create_cone(radius=s / 2.0, height=s),
+            'plane': lambda s: primitives.create_plane(width=s, height=s),
+            'sphere': lambda s: primitives.create_sphere(radius=s / 2.0),
+        }
+
     def on_create_primitive(self):
         dlg = PrimitiveDialog(self)
         if dlg.exec_():
@@ -610,15 +701,15 @@ class PowerSurfacingMainWindow(QMainWindow):
             if primitives and HalfEdgeMesh:
                 try:
                     ptype = params['type']
-                    create_fn = {
-                        'box': primitives.create_box,
-                        'cylinder': primitives.create_cylinder,
-                        'torus': primitives.create_torus,
-                        'cone': primitives.create_cone,
-                        'plane': primitives.create_plane,
-                        'sphere': primitives.create_sphere,
-                    }.get(ptype, primitives.create_box)
-                    self.current_mesh = create_fn(size=params['size'])
+                    size = float(params['size'])
+                    # The dialog offers a single "Size" value; map it onto each
+                    # primitive's own parameters so the result is roughly
+                    # `size` across its largest dimension. None of the
+                    # primitive factories accepts a `size` keyword.
+                    create_fn = self._primitive_factories().get(
+                        ptype, self._primitive_factories()['box']
+                    )
+                    self.current_mesh = create_fn(size)
                     self.current_shape = None
                     self.viewport.set_mesh(self.current_mesh)
                     self.properties_panel.set_mesh_info(self.current_mesh)
@@ -688,14 +779,31 @@ class PowerSurfacingMainWindow(QMainWindow):
         if dlg.exec_():
             if SubDToNURBSConverter:
                 try:
-                    continuity_map = {'G0 (Position)': 0, 'G1 (Tangent)': 1, 'G2 (Curvature)': 2, 'G3 (Torsion)': 3}
-                    continuity = continuity_map.get(dlg.continuity.currentText(), 1)
+                    # SubDToNURBSConverter expects the continuity as a 'G0'..'G3'
+                    # string, not an int.
+                    continuity_map = {
+                        'G0 (Position)': 'G0',
+                        'G1 (Tangent)': 'G1',
+                        'G2 (Curvature)': 'G2',
+                        'G3 (Torsion)': 'G3',
+                    }
+                    continuity = continuity_map.get(dlg.continuity.currentText(), 'G2')
                     tolerance = dlg.tolerance.value()
                     simplify = dlg.simplify.isChecked()
-                    self.log(f"Converting to NURBS (continuity=G{continuity}, tol={tolerance}, simplify={simplify})...")
+                    reference = getattr(self.viewport, 'reference_mesh', None)
+                    ref_note = (
+                        f"fitting to reference mesh ({len(reference.vertices):,} verts)"
+                        if reference else "no reference mesh loaded"
+                    )
+                    self.log(
+                        f"Converting to NURBS (continuity={continuity}, tol={tolerance}, "
+                        f"simplify={simplify}, {ref_note})..."
+                    )
                     QApplication.processEvents()
                     converter = SubDToNURBSConverter(continuity=continuity, tolerance=tolerance)
-                    result = converter.convert(self.current_mesh, simplify=simplify)
+                    result = converter.convert(
+                        self.current_mesh, simplify=simplify, reference_mesh=reference
+                    )
                     patch_count = len(result.get('patches', []))
                     self.log(f"NURBS conversion complete — {patch_count} patches generated")
                     if patch_count == 0:
@@ -747,39 +855,69 @@ class PowerSurfacingMainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "Error", "Quad Wrap backend not available.")
 
+    def _collect_frozen_vertices(self, face_ids):
+        """Vertex indices of the given faces of the current mesh.
+
+        Uses the half-edge API (`Face.half_edge`, `get_face_vertices`) — there is
+        no `Face.halfedge` attribute.
+        """
+        vert_set = set()
+        if not self.current_mesh or not face_ids:
+            return []
+        n_faces = len(self.current_mesh.faces)
+        for f_id in face_ids:
+            if not (0 <= f_id < n_faces):
+                continue
+            face = self.current_mesh.faces[f_id]
+            if face is None or face.half_edge is None:
+                continue
+            for v in self.current_mesh.get_face_vertices(face):
+                if v is not None:
+                    vert_set.add(v.index)
+        return sorted(vert_set)
+
     def on_shrink_wrap(self):
         if not self.current_mesh:
             QMessageBox.information(self, "Shrink Wrap", "No mesh loaded.")
             return
+
+        reference = getattr(self.viewport, 'reference_mesh', None)
+        if reference is None or len(reference.faces) == 0:
+            QMessageBox.information(
+                self, "Shrink Wrap",
+                "Shrink Wrap projects the current mesh onto a reference surface, "
+                "but no reference mesh is loaded.\n\n"
+                "Use 'Reverse Engineering > Load Reference Mesh...' to load the "
+                "scanned/target surface first."
+            )
+            self.status_bar.showMessage("Shrink Wrap needs a reference mesh.")
+            return
+
         dlg = ShrinkWrapDialog(self)
         if dlg.exec_():
             if ShrinkWrapper:
                 try:
                     iterations = dlg.iterations.value()
-                    
+
                     frozen_verts = None
                     if dlg.lock_faces.isChecked():
                         selected_faces = self.viewport.get_selected_faces()
                         if selected_faces:
-                            vert_set = set()
-                            for f_id in selected_faces:
-                                if f_id < len(self.current_mesh.faces):
-                                    face = self.current_mesh.faces[f_id]
-                                    if face and face.halfedge:
-                                        he = face.halfedge
-                                        start = he
-                                        while True:
-                                            if he.vertex:
-                                                vert_set.add(he.vertex.index)
-                                            he = he.next
-                                            if he == start or not he:
-                                                break
-                            frozen_verts = list(vert_set)
-                            
-                    self.log(f"Running Shrink Wrap ({iterations} iterations)...")
+                            frozen_verts = self._collect_frozen_vertices(selected_faces)
+                            self.log(
+                                f"Locking {len(frozen_verts)} vertices from "
+                                f"{len(selected_faces)} selected faces."
+                            )
+                        else:
+                            self.log("'Lock Selected Faces' is on but no faces are selected.")
+
+                    self.log(
+                        f"Running Shrink Wrap ({iterations} iterations) onto reference "
+                        f"mesh ({len(reference.vertices):,} verts, {len(reference.faces):,} faces)..."
+                    )
                     QApplication.processEvents()
                     shrinker = ShrinkWrapper(iterations=iterations)
-                    result = shrinker.wrap(self.current_mesh, self.current_mesh, frozen_vertices=frozen_verts)
+                    result = shrinker.wrap(self.current_mesh, reference, frozen_vertices=frozen_verts)
                     v = len(result.vertices)
                     f = len(result.faces)
                     self.current_mesh = result

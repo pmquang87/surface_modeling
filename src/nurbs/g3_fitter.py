@@ -17,19 +17,38 @@ except ImportError:
         return decorator
 
 @njit(fastmath=True, nogil=True)
-def _numba_compute_edge_control_points(p_start, p_end, d1, d2):
+def _numba_compute_edge_control_points(p_start, p_end, d1_start, d1_end, d2):
     edge_pts = np.zeros((6, 3))
     edge_pts[0] = p_start
     edge_pts[5] = p_end
-    
-    # 1st derivative (G1)
-    edge_pts[1] = edge_pts[0] + d1 / 5.0
-    edge_pts[4] = edge_pts[5] - d1 / 5.0
-    
+
+    # 1st derivative (G1) — independent end tangents
+    edge_pts[1] = edge_pts[0] + d1_start / 5.0
+    edge_pts[4] = edge_pts[5] - d1_end / 5.0
+
     # 2nd derivative (G2)
     edge_pts[2] = 2 * edge_pts[1] - edge_pts[0] + d2 / 20.0
     edge_pts[3] = 2 * edge_pts[4] - edge_pts[5] + d2 / 20.0
     return edge_pts
+
+
+def _tangent_in_plane(chord, normal):
+    """Project chord onto the tangent plane of `normal`, keeping its length.
+
+    Both patches sharing an edge derive the same tangent from the same vertex
+    normal and the same (up to sign) chord, so their boundary curves stay
+    exactly identical and sewing still closes."""
+    n = np.asarray(normal, dtype=np.float64)
+    nl = np.linalg.norm(n)
+    if nl < 1e-12:
+        return chord
+    n = n / nl
+    t = chord - np.dot(chord, n) * n
+    tl = np.linalg.norm(t)
+    cl = np.linalg.norm(chord)
+    if tl < 1e-12 or cl < 1e-12:
+        return chord
+    return t * (cl / tl)
 
 @njit(fastmath=True, nogil=True)
 def _numba_compute_interior_control_points(ctrl_pts):
@@ -51,46 +70,77 @@ def _numba_compute_interior_control_points(ctrl_pts):
     return ctrl_pts
 
 def _generate_single_patch(quad_data):
+    """Build a 6x6 control grid for one quad.
+
+    `corners` are the quad's vertices in CYCLIC winding order (c0->c1->c2->c3
+    around the face), matching HalfEdgeMesh.get_face_vertices and the dense
+    sample grid p(u,v) = (1-u)(1-v)c0 + u(1-v)c1 + uv c2 + (1-u)v c3.
+    Grid axes: index i follows u (edge c0->c1 at v=0), index j follows v
+    (edge c0->c3 at u=0).
+    """
     corners = np.array(quad_data['corners'])
     derivatives = quad_data.get('derivatives')
-    
+    corner_normals = quad_data.get('corner_normals')
+    c0, c1, c2, c3 = corners
+
     if derivatives is None:
-        du = corners[2] - corners[0]
-        dv = corners[1] - corners[0]
-        derivatives = {
-            'u0': {'d1': du, 'd2': np.zeros(3)},
-            'u1': {'d1': corners[3] - corners[1], 'd2': np.zeros(3)},
-            'v0': {'d1': dv, 'd2': np.zeros(3)},
-            'v1': {'d1': corners[3] - corners[2], 'd2': np.zeros(3)}
-        }
-        
+        z = np.zeros(3)
+        if corner_normals is not None:
+            n0, n1, n2, n3 = corner_normals
+            # Bend each boundary curve into the surface tangent planes of its
+            # endpoints instead of running it along the straight chord.
+            derivatives = {
+                'u0': {'d1_start': _tangent_in_plane(c1 - c0, n0), 'd1_end': _tangent_in_plane(c1 - c0, n1), 'd2': z},
+                'u1': {'d1_start': _tangent_in_plane(c2 - c3, n3), 'd1_end': _tangent_in_plane(c2 - c3, n2), 'd2': z},
+                'v0': {'d1_start': _tangent_in_plane(c3 - c0, n0), 'd1_end': _tangent_in_plane(c3 - c0, n3), 'd2': z},
+                'v1': {'d1_start': _tangent_in_plane(c2 - c1, n1), 'd1_end': _tangent_in_plane(c2 - c1, n2), 'd2': z},
+            }
+        else:
+            derivatives = {
+                'u0': {'d1': c1 - c0, 'd2': z},   # edge v=0: c0 -> c1
+                'u1': {'d1': c2 - c3, 'd2': z},   # edge v=1: c3 -> c2
+                'v0': {'d1': c3 - c0, 'd2': z},   # edge u=0: c0 -> c3
+                'v1': {'d1': c2 - c1, 'd2': z}    # edge u=1: c1 -> c2
+            }
+
+    def _edge(p_start, p_end, d):
+        d1s = d.get('d1_start', d.get('d1'))
+        d1e = d.get('d1_end', d.get('d1'))
+        return _numba_compute_edge_control_points(p_start, p_end, d1s, d1e, d['d2'])
+
     ctrl_pts = np.zeros((6, 6, 3))
-    
-    # Corners
-    ctrl_pts[0, 0] = corners[0]
-    ctrl_pts[0, 5] = corners[1]
-    ctrl_pts[5, 0] = corners[2]
-    ctrl_pts[5, 5] = corners[3]
-    
-    # Edges
-    ctrl_pts[:, 0] = _numba_compute_edge_control_points(corners[0], corners[2], derivatives['u0']['d1'], derivatives['u0']['d2'])
-    ctrl_pts[:, 5] = _numba_compute_edge_control_points(corners[1], corners[3], derivatives['u1']['d1'], derivatives['u1']['d2'])
-    ctrl_pts[0, :] = _numba_compute_edge_control_points(corners[0], corners[1], derivatives['v0']['d1'], derivatives['v0']['d2'])
-    ctrl_pts[5, :] = _numba_compute_edge_control_points(corners[2], corners[3], derivatives['v1']['d1'], derivatives['v1']['d2'])
-    
+
+    # Corners (cyclic winding mapped onto the tensor grid)
+    ctrl_pts[0, 0] = c0
+    ctrl_pts[5, 0] = c1
+    ctrl_pts[5, 5] = c2
+    ctrl_pts[0, 5] = c3
+
+    # Edges — each boundary curve runs along an actual quad edge, so two
+    # patches sharing an edge produce identical (reversed) control rows and
+    # sewing can join them exactly.
+    ctrl_pts[:, 0] = _edge(c0, c1, derivatives['u0'])
+    ctrl_pts[:, 5] = _edge(c3, c2, derivatives['u1'])
+    ctrl_pts[0, :] = _edge(c0, c3, derivatives['v0'])
+    ctrl_pts[5, :] = _edge(c1, c2, derivatives['v1'])
+
     # Interior
     ctrl_pts = _numba_compute_interior_control_points(ctrl_pts)
     return ctrl_pts
 
 
 class G3Fitter:
-    def __init__(self):
+    def __init__(self, continuity_weight: float = 1000.0):
         """
         Initialize the G3 Fitter for Degree 5 B-spline patches.
         A degree 5 Bezier/B-spline patch requires a 6x6 grid of control points.
+
+        continuity_weight: weight of the cross-boundary smoothness equations
+        relative to the surface data equations (weight 1). 0 disables them.
         """
         self.degree = 5
         self.num_ctrl_pts = 6
+        self.continuity_weight = continuity_weight
 
     def generate_patch(self, corners, derivatives=None):
         """
@@ -110,7 +160,7 @@ class G3Fitter:
         import math
         
         # Pre-compile Numba functions on the first run
-        _numba_compute_edge_control_points(np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3))
+        _numba_compute_edge_control_points(np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3))
         _numba_compute_interior_control_points(np.zeros((6, 6, 3)))
         
         patches = [_generate_single_patch(quad) for quad in quad_mesh]
@@ -170,7 +220,7 @@ class G3Fitter:
                         eq_idx += 1
                         
         # 2. G3 Continuity Constraints
-        weight_g3 = 1000.0
+        weight_g3 = self.continuity_weight
         
         def get_inward(patch_idx, edge_id, idx):
             if edge_id == 0:
@@ -183,43 +233,49 @@ class G3Fitter:
                 return [(idx, 5), (idx, 4), (idx, 3), (idx, 2)]
                 
         processed_pairs = set()
-        
+
         for k, quad in enumerate(quad_mesh):
+            if weight_g3 <= 0:
+                break  # continuity equations disabled
             neighbors = quad.get('neighbors', [-1, -1, -1, -1])
-            for edge_k in range(4):
-                n_k = neighbors[edge_k]
+            for n_k in neighbors:
                 if n_k == -1 or n_k >= num_patches:
                     continue
-                    
+
                 pair = tuple(sorted((k, n_k)))
                 if pair in processed_pairs:
                     continue
-                
-                matched = False
-                for edge_n in range(4):
-                    E_k_0 = get_inward(k, edge_k, 0)[0]
-                    E_k_5 = get_inward(k, edge_k, 5)[0]
-                    
-                    E_n_0 = get_inward(n_k, edge_n, 0)[0]
-                    E_n_5 = get_inward(n_k, edge_n, 5)[0]
-                    
-                    pt_k_0 = patches[k][E_k_0]
-                    pt_k_5 = patches[k][E_k_5]
-                    
-                    pt_n_0 = patches[n_k][E_n_0]
-                    pt_n_5 = patches[n_k][E_n_5]
-                    
-                    d_align = np.linalg.norm(pt_k_0 - pt_n_0) + np.linalg.norm(pt_k_5 - pt_n_5)
-                    d_rev = np.linalg.norm(pt_k_0 - pt_n_5) + np.linalg.norm(pt_k_5 - pt_n_0)
-                    
-                    if d_align < 1e-4:
-                        reversed_dir = False
-                        matched = True
-                    elif d_rev < 1e-4:
-                        reversed_dir = True
-                        matched = True
-                        
-                    if matched:
+
+                # The position of a neighbor in the `neighbors` list says
+                # nothing about which tensor-grid edge (row 0/5, col 0/5) the
+                # shared boundary is — find both edge ids geometrically. Match
+                # on the FULL 6-point boundary curve (shared curves are exactly
+                # identical by construction): endpoint-only matching pairs the
+                # wrong edges when corner positions coincide (duplicate cage
+                # vertices), and one wrong constraint sends the least-squares
+                # interior of both patches tens of millimetres off the part.
+                def boundary_row(patch_idx, edge_id):
+                    return np.array([patches[patch_idx][get_inward(patch_idx, edge_id, i)[0]]
+                                     for i in range(6)])
+
+                candidates = []
+                for ek in range(4):
+                    row_k = boundary_row(k, ek)
+                    for en in range(4):
+                        row_n = boundary_row(n_k, en)
+                        if np.abs(row_k - row_n).max() < 1e-7:
+                            candidates.append((ek, en, False))
+                        elif np.abs(row_k - row_n[::-1]).max() < 1e-7:
+                            candidates.append((ek, en, True))
+
+                if len(candidates) != 1:
+                    # no shared curve, or ambiguous (degenerate geometry) —
+                    # skipping only loses a soft smoothness equation
+                    continue
+                edge_k, edge_n, reversed_dir = candidates[0]
+                matched = True
+
+                if matched:
                         processed_pairs.add(pair)
                         for idx_k in range(1, 5):
                             idx_n = 5 - idx_k if reversed_dir else idx_k
@@ -249,21 +305,47 @@ class G3Fitter:
                                 data.append(coeff * weight_g3)
                                 
                             eq_idx += 1
-                        break
-                        
+
         if len(data) > 0:
+            initial_interiors = [p[1:5, 1:5].copy() for p in patches]
+
             A = sp.csr_matrix((data, (rows, cols)), shape=(eq_idx, num_vars))
-            
+
             x = spla.lsqr(A, np.array(bx))[0]
             y = spla.lsqr(A, np.array(by))[0]
             z = spla.lsqr(A, np.array(bz))[0]
-            
+
+            # Only overwrite variables that appeared in at least one equation;
+            # lsqr returns the least-norm value 0 for untouched variables,
+            # which would collapse unconstrained patches to the origin.
+            used = np.zeros(num_vars, dtype=bool)
+            used[np.asarray(cols, dtype=np.int64)] = True
+
             for k in range(num_patches):
                 for i in range(1, 5):
                     for j in range(1, 5):
                         var_idx = k * 16 + (i-1) * 4 + (j-1)
-                        patches[k][i, j, 0] = x[var_idx]
-                        patches[k][i, j, 1] = y[var_idx]
-                        patches[k][i, j, 2] = z[var_idx]
-                        
+                        if used[var_idx]:
+                            patches[k][i, j, 0] = x[var_idx]
+                            patches[k][i, j, 1] = y[var_idx]
+                            patches[k][i, j, 2] = z[var_idx]
+
+            # Sanity clamp: the solve refines the Coons interior; if it
+            # diverged (conflicting equations at degenerate geometry), the
+            # runaway control points inflate the shape's bounding box and
+            # corrupt the surface. Fall back to the initialization there.
+            n_reset = 0
+            for k, p in enumerate(patches):
+                corners = np.array([p[0, 0], p[5, 0], p[5, 5], p[0, 5]])
+                center = corners.mean(axis=0)
+                diag = np.linalg.norm(corners.max(axis=0) - corners.min(axis=0))
+                limit = max(2.0 * diag, diag + 1.0)
+                interior = p[1:5, 1:5].reshape(-1, 3)
+                if np.linalg.norm(interior - center, axis=1).max() > limit:
+                    p[1:5, 1:5] = initial_interiors[k]
+                    n_reset += 1
+            if n_reset:
+                print(f"G3Fitter: reset {n_reset} diverged patch interior(s) "
+                      f"to their Coons initialization")
+
         return patches

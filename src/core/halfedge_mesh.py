@@ -56,37 +56,53 @@ class HalfEdgeMesh:
         self.vertices.append(v)
         return v
 
-    def add_face(self, vertex_indices: List[int]) -> Face:
+    def add_face(self, vertex_indices: List[int]) -> Optional[Face]:
+        # A repeated consecutive index would build a half-edge from a vertex to
+        # itself: it becomes its own twin and never gets an Edge record.
+        indices = []
+        for v_idx in vertex_indices:
+            if not indices or indices[-1] != v_idx:
+                indices.append(v_idx)
+        while len(indices) > 1 and indices[0] == indices[-1]:
+            indices.pop()
+
+        if len(indices) < 3:
+            print(f"Warning: skipping degenerate face {list(vertex_indices)} "
+                  f"(only {len(indices)} distinct consecutive vertices)")
+            return None
+
         face = Face(len(self.faces))
         self.faces.append(face)
-        
-        n = len(vertex_indices)
+
+        n = len(indices)
         face_hes = []
         for i in range(n):
             he = HalfEdge(len(self.half_edges))
             self.half_edges.append(he)
             face_hes.append(he)
-            
+
         for i in range(n):
-            v1_idx = vertex_indices[i]
-            v2_idx = vertex_indices[(i+1)%n]
-            
+            v1_idx = indices[i]
+            v2_idx = indices[(i+1)%n]
+
             he = face_hes[i]
             he.vertex = self.vertices[v2_idx]
             he.face = face
             he.next = face_hes[(i+1)%n]
             he.prev = face_hes[(i-1)%n]
-            
+
             if self.vertices[v1_idx].half_edge is None:
                 self.vertices[v1_idx].half_edge = he
-                
+
             if face.half_edge is None:
                 face.half_edge = he
-                
-            self._he_dict[(v1_idx, v2_idx)] = he
-            
+
+            # Look the reverse edge up BEFORE registering this one, and only
+            # pair with a candidate that is still free. On non-manifold input a
+            # directed edge can repeat; re-pairing there would leave the earlier
+            # twin dangling (a.twin = b while b.twin = c).
             twin = self._he_dict.get((v2_idx, v1_idx))
-            if twin is not None:
+            if twin is not None and twin.twin is None:
                 he.twin = twin
                 twin.twin = he
                 he.edge = twin.edge
@@ -95,7 +111,12 @@ class HalfEdgeMesh:
                 edge.half_edge = he
                 self.edges.append(edge)
                 he.edge = edge
-                
+
+            # The first half-edge registered for a directed edge stays the
+            # canonical one, so an existing pairing can never be overwritten.
+            if (v1_idx, v2_idx) not in self._he_dict:
+                self._he_dict[(v1_idx, v2_idx)] = he
+
         return face
 
     def get_face_vertices(self, face: Face) -> List[Vertex]:
@@ -115,44 +136,56 @@ class HalfEdgeMesh:
                 break
         return vertices
 
-    def get_vertex_faces(self, vertex: Vertex) -> List[Face]:
+    def get_vertex_fan(self, vertex: Vertex) -> List['HalfEdge']:
+        """
+        Outgoing half-edges around a vertex, in ring order.
+
+        The twin.next rotation only covers one side of an open fan. When the
+        stored vertex.half_edge sits in the middle of a boundary fan, that walk
+        silently drops every face on the other side, so at a boundary we keep
+        collecting in the opposite (prev.twin) direction as well.
+        """
         if vertex.half_edge is None:
             return []
-        faces = []
+
+        forward = []
         visited = set()
+        hit_boundary = False
         curr = vertex.half_edge
         while True:
             if curr is None or curr.index in visited:
                 break
             visited.add(curr.index)
-            
-            if curr.face is not None:
-                faces.append(curr.face)
+            forward.append(curr)
             if curr.twin is None:
+                hit_boundary = True
                 break
             curr = curr.twin.next
             if curr == vertex.half_edge:
                 break
-        return faces
+
+        if not hit_boundary:
+            return forward
+
+        backward = []
+        curr = vertex.half_edge
+        while True:
+            if curr is None or curr.prev is None:
+                break
+            curr = curr.prev.twin
+            if curr is None or curr.index in visited:
+                break
+            visited.add(curr.index)
+            backward.append(curr)
+
+        backward.reverse()
+        return backward + forward
+
+    def get_vertex_faces(self, vertex: Vertex) -> List[Face]:
+        return [he.face for he in self.get_vertex_fan(vertex) if he.face is not None]
 
     def get_vertex_neighbors(self, vertex: Vertex) -> List[Vertex]:
-        if vertex.half_edge is None:
-            return []
-        neighbors = []
-        visited = set()
-        curr = vertex.half_edge
-        while True:
-            if curr is None or curr.index in visited:
-                break
-            visited.add(curr.index)
-            
-            neighbors.append(curr.vertex)
-            if curr.twin is None:
-                break
-            curr = curr.twin.next
-            if curr == vertex.half_edge:
-                break
-        return neighbors
+        return [he.vertex for he in self.get_vertex_fan(vertex) if he.vertex is not None]
 
     def get_edge_faces(self, edge: Edge) -> Tuple[Optional[Face], Optional[Face]]:
         if edge.half_edge is None:
@@ -205,11 +238,17 @@ class HalfEdgeMesh:
     def get_edge_loop(self, start_edge: Edge) -> List[Edge]:
         # Simple loop traversal across quad topologies
         loop = [start_edge]
+        if start_edge.half_edge is None:
+            return loop
+        # Every edge is collected at most once: on a closed ring the forward
+        # walk already comes back to start_edge, and the backward walk would
+        # otherwise re-collect the whole ring in scrambled order.
+        collected = {start_edge.index}
         # Implementation depends on specific Sub-D logic, basic traversal for quads
         for direction in [0, 1]:
-            curr = start_edge.half_edge if direction == 0 else (start_edge.half_edge.twin if start_edge.half_edge.twin else None)
+            curr = start_edge.half_edge if direction == 0 else start_edge.half_edge.twin
             if curr is None: continue
-            
+
             visited_loop = set()
             while curr is not None:
                 if curr.index in visited_loop:
@@ -227,13 +266,17 @@ class HalfEdgeMesh:
                     temp = temp.next
                 if len(face_edges) == 3: # Quad face (3 remaining edges)
                     opp_edge = face_edges[1]
-                    if opp_edge == start_edge: break
+                    if opp_edge is None or opp_edge.index in collected:
+                        break
+                    collected.add(opp_edge.index)
                     if direction == 0:
                         loop.append(opp_edge)
                     else:
                         loop.insert(0, opp_edge)
-                        
+
                     # cross to next face
+                    if opp_edge.half_edge is None:
+                        break
                     next_he = opp_edge.half_edge if opp_edge.half_edge.face != curr.face else opp_edge.half_edge.twin
                     curr = next_he
                 else:
@@ -260,9 +303,10 @@ class HalfEdgeMesh:
         if not self.faces:
             return []
             
-        if np.allclose(self.faces[0].normal, np.zeros(3)):
-            self.compute_face_normals()
-            
+        # Always recompute: cached normals go stale after any vertex move, and
+        # a non-zero faces[0].normal is no evidence that the rest is current.
+        self.compute_face_normals()
+
         selected = set(start_face_ids)
         queue = list(start_face_ids)
         max_angle_rad = np.radians(max_angle_degrees)
@@ -339,22 +383,40 @@ class HalfEdgeMesh:
 
     def to_pyvista(self) -> Any:
         import pyvista as pv
-        verts = np.array([v.position for v in self.vertices], dtype=np.float64)
+        if self.vertices:
+            verts = np.array([v.position for v in self.vertices], dtype=np.float64)
+        else:
+            verts = np.zeros((0, 3), dtype=np.float64)
         pv_faces = []
         for f in self.faces:
             fv = [v.index for v in self.get_face_vertices(f)]
+            if len(fv) < 3:
+                continue
             pv_faces.append(len(fv))
             pv_faces.extend(fv)
-        return pv.PolyData(verts, np.array(pv_faces))
+        if not pv_faces:
+            # Empty or point-only mesh: an empty face array is float64 and
+            # pyvista rejects it, so hand it the points on their own.
+            return pv.PolyData(verts)
+        return pv.PolyData(verts, np.array(pv_faces, dtype=np.int64))
 
     def compute_face_normals(self):
         for f in self.faces:
             verts = [v.position for v in self.get_face_vertices(f)]
             if len(verts) >= 3:
-                v0 = verts[0]
-                v1 = verts[1]
-                v2 = verts[-1]
-                n = np.cross(v1 - v0, v2 - v0)
+                # Newell's method over every edge of the polygon. A single
+                # corner triangle (verts[0], verts[1], verts[-1]) inverts the
+                # normal whenever that corner is reflex, and ignores warping on
+                # non-planar quads.
+                P = np.asarray(verts, dtype=np.float64)
+                Q = np.roll(P, -1, axis=0)
+                d = P - Q
+                s = P + Q
+                n = np.array([
+                    np.dot(d[:, 1], s[:, 2]),
+                    np.dot(d[:, 2], s[:, 0]),
+                    np.dot(d[:, 0], s[:, 1]),
+                ], dtype=np.float64)
                 norm = np.linalg.norm(n)
                 f.normal = n / norm if norm > 1e-8 else np.zeros(3)
 

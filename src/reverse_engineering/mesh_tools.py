@@ -1,20 +1,232 @@
+import warnings
 import numpy as np
 import trimesh
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from src.core.halfedge_mesh import HalfEdgeMesh
 
-def fill_holes(mesh: HalfEdgeMesh, max_hole_edges: int = 20) -> HalfEdgeMesh:
-    """Fill holes in the mesh with new faces.
-    
-    Detect boundary loops, triangulate each hole using ear-clipping,
-    then convert to quads where possible.
+
+def _warn_if_not_triangles(mesh: HalfEdgeMesh, func_name: str) -> None:
+    """Warn that a quad/ngon cage will come back triangulated.
+
+    Every helper here round-trips through ``HalfEdgeMesh.to_trimesh()``, which
+    fans any face with more than three corners into triangles. That is a silent
+    loss of the quad cage, so say so.
     """
+    n_ngon = sum(1 for f in mesh.faces if len(mesh.get_face_vertices(f)) != 3)
+    if n_ngon:
+        warnings.warn(
+            f"{func_name}: input has {n_ngon} non-triangle face(s); the result "
+            f"is triangulated (the quad/ngon cage is NOT preserved).",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
+def _boundary_loops(faces: List[List[int]]) -> List[List[int]]:
+    """Return the boundary loops of a triangle soup, wound for hole filling.
+
+    A directed edge (a, b) that has no opposing (b, a) sits on a boundary. New
+    faces closing that hole must contain (b, a), so each loop is returned in the
+    reverse of the traversal direction implied by the existing faces: feeding it
+    straight to a triangulator yields faces consistent with the surrounding
+    winding.
+    """
+    directed = set()
+    for f in faces:
+        n = len(f)
+        for i in range(n):
+            directed.add((f[i], f[(i + 1) % n]))
+
+    outgoing: Dict[int, List[int]] = {}
+    for a, b in directed:
+        if (b, a) not in directed:
+            outgoing.setdefault(a, []).append(b)
+
+    loops = []
+    for start in list(outgoing.keys()):
+        while outgoing.get(start):
+            loop = [start]
+            at = {start: 0}          # vertex -> position in `loop`, O(1) lookup
+            cur = start
+            while True:
+                nxt_list = outgoing.get(cur)
+                if not nxt_list:
+                    loop = None
+                    break
+                nxt = nxt_list.pop()
+                if not nxt_list:
+                    outgoing.pop(cur, None)
+                if nxt == start:
+                    break
+                if nxt in at:
+                    # self-touching boundary: cut the sub-loop off and keep it
+                    k = at[nxt]
+                    loops.append(list(reversed(loop[k:])))
+                    for v in loop[k:]:
+                        at.pop(v, None)
+                    loop = loop[:k]
+                at[nxt] = len(loop)
+                loop.append(nxt)
+                cur = nxt
+            if loop and len(loop) >= 3:
+                loops.append(list(reversed(loop)))
+    return [lp for lp in loops if len(lp) >= 3]
+
+
+def _polygon_frame(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Newell normal plus an orthonormal in-plane basis (e1, e2).
+
+    Projected on (e1, e2) the polygon is counter-clockwise, so an ear clipper
+    can assume CCW input and the triangles it emits keep the polygon's winding.
+    """
+    q = np.roll(points, -1, axis=0)
+    normal = np.cross(points, q).sum(axis=0)
+    nl = np.linalg.norm(normal)
+    if nl < 1e-14:
+        # Fully degenerate (collinear) loop: fall back to any frame.
+        normal = np.array([0.0, 0.0, 1.0])
+    else:
+        normal = normal / nl
+    ref = np.array([1.0, 0.0, 0.0])
+    if abs(np.dot(ref, normal)) > 0.9:
+        ref = np.array([0.0, 1.0, 0.0])
+    e1 = ref - normal * np.dot(ref, normal)
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(normal, e1)
+    return normal, e1, e2
+
+
+def _ear_clip(poly2d: np.ndarray,
+              forbidden: Optional[set] = None) -> Optional[List[Tuple[int, int, int]]]:
+    """Ear-clip a simple CCW polygon. Returns local index triples, or None.
+
+    ``forbidden`` holds local index pairs (i, j), i < j, whose diagonal must not
+    be created -- used for chords that already exist as edges of the surrounding
+    mesh, since re-creating one would give that edge a third face.
+    """
+    n = len(poly2d)
+    if n < 3:
+        return []
+    forbidden = forbidden or set()
+    scale = float(np.ptp(poly2d, axis=0).max())
+    if scale <= 0:
+        return None
+    eps = 1e-10 * scale * scale
+
+    def in_tri(p, a, b, c):
+        d1 = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+        d2 = (c[0] - b[0]) * (p[1] - b[1]) - (c[1] - b[1]) * (p[0] - b[0])
+        d3 = (a[0] - c[0]) * (p[1] - c[1]) - (a[1] - c[1]) * (p[0] - c[0])
+        return d1 >= -eps and d2 >= -eps and d3 >= -eps
+
+    idx = list(range(n))
+    tris: List[Tuple[int, int, int]] = []
+    guard = 0
+    while len(idx) > 3:
+        guard += 1
+        if guard > n * n + 16:
+            return None
+        found = False
+        for k in range(len(idx)):
+            i0 = idx[k - 1]
+            i1 = idx[k]
+            i2 = idx[(k + 1) % len(idx)]
+            a, b, c = poly2d[i0], poly2d[i1], poly2d[i2]
+            cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+            if cross <= eps:
+                continue  # reflex or degenerate corner
+            if (min(i0, i2), max(i0, i2)) in forbidden:
+                continue  # the diagonal already exists in the surrounding mesh
+            if any(in_tri(poly2d[m], a, b, c) for m in idx if m not in (i0, i1, i2)):
+                continue
+            tris.append((i0, i1, i2))
+            idx.pop(k)
+            found = True
+            break
+        if not found:
+            return None
+    tris.append((idx[0], idx[1], idx[2]))
+    return tris
+
+
+def fill_holes(mesh: HalfEdgeMesh, max_hole_edges: int = 20) -> HalfEdgeMesh:
+    """Fill boundary holes with new triangles.
+
+    Boundary loops are detected from the (triangulated) face set and each loop
+    up to ``max_hole_edges`` edges long is closed by ear-clipping it in its
+    best-fit plane; loops the ear clipper cannot handle (self-intersecting when
+    projected) fall back to a fan from a new centroid vertex.
+
+    Loops LONGER than ``max_hole_edges`` are deliberately left open and reported
+    via a warning -- unlike ``trimesh.repair.fill_holes``, which silently closes
+    only 3- and 4-edge holes and whose boolean result the old implementation
+    threw away.
+
+    Note: the mesh round-trips through ``to_trimesh()``, so a quad cage comes
+    back triangulated (a warning says so).
+    """
+    _warn_if_not_triangles(mesh, "fill_holes")
     t_mesh = mesh.to_trimesh()
+    if len(t_mesh.faces) == 0:
+        return mesh.copy()
+
     try:
-        from trimesh.repair import fill_holes as trimesh_fill_holes
-        trimesh_fill_holes(t_mesh)
-        result = HalfEdgeMesh.from_trimesh(t_mesh)
-        return result
+        verts = [np.asarray(p, dtype=np.float64) for p in np.asarray(t_mesh.vertices)]
+        faces = [[int(i) for i in f] for f in np.asarray(t_mesh.faces)]
+
+        # Chords already present in the mesh: an ear whose diagonal duplicates
+        # one would put a third face on that edge.
+        existing = set()
+        for f in faces:
+            m = len(f)
+            for i in range(m):
+                a, b = f[i], f[(i + 1) % m]
+                existing.add((a, b) if a < b else (b, a))
+
+        loops = _boundary_loops(faces)
+        skipped = []
+        for loop in loops:
+            if len(loop) > max_hole_edges:
+                skipped.append(len(loop))
+                continue
+            pts = np.array([verts[i] for i in loop], dtype=np.float64)
+            _, e1, e2 = _polygon_frame(pts)
+            poly2d = np.column_stack([pts @ e1, pts @ e2])
+            n_loop = len(loop)
+            forbidden = set()
+            for i in range(n_loop):
+                for j in range(i + 2, n_loop):
+                    if i == 0 and j == n_loop - 1:
+                        continue  # the closing edge of the loop itself
+                    a, b = loop[i], loop[j]
+                    if ((a, b) if a < b else (b, a)) in existing:
+                        forbidden.add((i, j))
+            tris = _ear_clip(poly2d, forbidden=forbidden)
+            if tris is None:
+                center = len(verts)
+                verts.append(pts.mean(axis=0))
+                n = len(loop)
+                for i in range(n):
+                    faces.append([loop[i], loop[(i + 1) % n], center])
+            else:
+                for a, b, c in tris:
+                    tri = [loop[a], loop[b], loop[c]]
+                    faces.append(tri)
+                    # keep `existing` current so a later loop sharing these
+                    # vertices cannot duplicate one of the new chords
+                    for i in range(3):
+                        p, q = tri[i], tri[(i + 1) % 3]
+                        existing.add((p, q) if p < q else (q, p))
+
+        if skipped:
+            warnings.warn(
+                f"fill_holes: {len(skipped)} hole(s) left open, boundary loops of "
+                f"{sorted(skipped)} edges exceed max_hole_edges={max_hole_edges}.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        return HalfEdgeMesh.from_arrays(np.array(verts, dtype=np.float64), faces)
     except Exception as e:
         print(f"Error filling holes: {e}")
         return mesh.copy()
@@ -62,120 +274,211 @@ def offset_mesh(mesh: HalfEdgeMesh, distance: float = 0.1) -> HalfEdgeMesh:
         
     return result
 
-def decimate_mesh(mesh: HalfEdgeMesh, target_faces: int = None, 
+def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
+                          frozen_set: set, target_faces: int):
+    """Edge-collapse decimation that never moves or removes a frozen vertex.
+
+    Only true mesh edges between two currently-adjacent, unfrozen vertices are
+    collapsed, and the vertex/vertex and vertex/face adjacency is updated after
+    every collapse. The previous implementation kept a union-find alias table
+    built from the ORIGINAL edge list, so once a vertex had been merged its
+    stale edges were reinterpreted as edges between the merge representatives --
+    which are usually not adjacent at all, and on a sphere end up antipodal.
+
+    Collapses are additionally guarded by:
+      * the link condition (the common neighbourhood of the two endpoints must
+        be exactly the vertices opposite the shared faces) which is what keeps
+        the result manifold and fold-free, and
+      * a floor of three incident faces on every frozen vertex, so a frozen
+        vertex can never be stranded without a face and dropped later as
+        unreferenced.
+    """
+    import heapq
+
+    n_v = len(verts)
+    vertex_faces = [set() for _ in range(n_v)]
+    adj = [set() for _ in range(n_v)]
+    for fi, f in enumerate(faces):
+        a, b, c = int(f[0]), int(f[1]), int(f[2])
+        for v in (a, b, c):
+            vertex_faces[v].add(fi)
+        adj[a].update((b, c))
+        adj[b].update((a, c))
+        adj[c].update((a, b))
+    for v in range(n_v):
+        adj[v].discard(v)
+
+    alive = np.ones(n_v, dtype=bool)
+    face_active = np.ones(len(faces), dtype=bool)
+    current_faces = int(len(faces))
+
+    def edge_key(a, b):
+        return (a, b) if a < b else (b, a)
+
+    heap = []
+    seen = set()
+    for v in range(n_v):
+        if v in frozen_set:
+            continue
+        for w in adj[v]:
+            if w in frozen_set:
+                continue
+            k = edge_key(v, w)
+            if k in seen:
+                continue
+            seen.add(k)
+            heapq.heappush(heap, (float(np.linalg.norm(verts[k[0]] - verts[k[1]])), k[0], k[1]))
+
+    while heap and current_faces > target_faces:
+        _, v1, v2 = heapq.heappop(heap)
+        # lazy validation: both endpoints must still exist and still be adjacent
+        if not (alive[v1] and alive[v2]) or v2 not in adj[v1]:
+            continue
+
+        shared = vertex_faces[v1] & vertex_faces[v2]
+        shared = {fi for fi in shared if face_active[fi]}
+        if not shared or len(shared) > 2:
+            continue
+
+        # link condition: neighbours common to both endpoints must be exactly
+        # the apex vertices of the shared faces, otherwise the collapse folds
+        # the surface onto itself.
+        apex = set()
+        for fi in shared:
+            apex.update(int(x) for x in faces[fi])
+        apex -= {v1, v2}
+        if (adj[v1] & adj[v2]) != apex:
+            continue
+
+        # frozen vertices must keep at least three live faces
+        bad = False
+        for fi in shared:
+            for x in faces[fi]:
+                x = int(x)
+                if x in frozen_set:
+                    live = sum(1 for g in vertex_faces[x] if face_active[g])
+                    if live - 1 < 3:
+                        bad = True
+                        break
+            if bad:
+                break
+        if bad:
+            continue
+
+        # perform the collapse: v2 -> v1
+        for fi in shared:
+            face_active[fi] = False
+            current_faces -= 1
+        for fi in list(vertex_faces[v2]):
+            if face_active[fi]:
+                vertex_faces[v1].add(fi)
+                faces[fi] = [v1 if int(x) == v2 else int(x) for x in faces[fi]]
+        vertex_faces[v2] = set()
+        vertex_faces[v1] = {fi for fi in vertex_faces[v1] if face_active[fi]}
+
+        for w in adj[v2]:
+            adj[w].discard(v2)
+            if w != v1:
+                adj[w].add(v1)
+                adj[v1].add(w)
+        adj[v2] = set()
+        adj[v1].discard(v1)
+        alive[v2] = False
+
+        if v1 not in frozen_set:
+            for w in adj[v1]:
+                if w in frozen_set:
+                    continue
+                heapq.heappush(
+                    heap,
+                    (float(np.linalg.norm(verts[v1] - verts[w])), min(v1, w), max(v1, w)),
+                )
+
+    new_faces = []
+    for fi, active in enumerate(face_active):
+        if not active:
+            continue
+        a, b, c = (int(x) for x in faces[fi])
+        if a != b and b != c and c != a:
+            new_faces.append([a, b, c])
+    return new_faces
+
+
+def decimate_mesh(mesh: HalfEdgeMesh, target_faces: int = None,
                   ratio: float = 0.5, frozen_vertices: Optional[List[int]] = None) -> HalfEdgeMesh:
     """Reduce face count using edge collapse decimation.
-    
-    Uses trimesh's simplify_quadric_decimation if available.
+
+    Uses trimesh's simplify_quadric_decimation, or -- when ``frozen_vertices``
+    is given -- a local edge-collapse pass that never touches those vertices.
+
+    Note: the mesh round-trips through ``to_trimesh()``, so a quad/ngon cage
+    comes back triangulated (a warning says so).
     """
+    _warn_if_not_triangles(mesh, "decimate_mesh")
     t_mesh = mesh.to_trimesh()
-    
+
     if target_faces is None:
         target_faces = int(len(mesh.faces) * ratio)
-        
+
     if frozen_vertices:
-        # Custom edge collapse decimation that preserves frozen vertices
-        verts = np.array(t_mesh.vertices)
-        faces = np.array(t_mesh.faces)
-        frozen_set = set(frozen_vertices)
-        
-        # Build adjacency
-        vertex_faces = {i: set() for i in range(len(verts))}
-        for i, f in enumerate(faces):
-            for v in f:
-                vertex_faces[v].add(i)
-                
-        # Find all edges
-        edges = set()
-        for f in faces:
-            edges.add(tuple(sorted((f[0], f[1]))))
-            edges.add(tuple(sorted((f[1], f[2]))))
-            edges.add(tuple(sorted((f[2], f[0]))))
-            
-        # We only collapse edges where NEITHER vertex is frozen.
-        valid_edges = []
-        for v1, v2 in edges:
-            if v1 in frozen_set or v2 in frozen_set:
-                continue
-            dist = np.linalg.norm(verts[v1] - verts[v2])
-            valid_edges.append((dist, v1, v2))
-            
-        valid_edges.sort(key=lambda x: x[0])
-        
-        alias = {i: i for i in range(len(verts))}
-        def get_alias(v):
-            curr = v
-            while alias[curr] != curr:
-                curr = alias[curr]
-            curr2 = v
-            while alias[curr2] != curr:
-                nxt = alias[curr2]
-                alias[curr2] = curr
-                curr2 = nxt
-            return curr
+        verts = np.array(t_mesh.vertices, dtype=np.float64)
+        faces = np.array(t_mesh.faces, dtype=np.int64).tolist()
+        frozen_set = {int(i) for i in frozen_vertices}
 
-        current_faces = len(faces)
-        face_active = [True] * len(faces)
-        
-        for dist, v1, v2 in valid_edges:
-            if current_faces <= target_faces:
-                break
-                
-            a1 = get_alias(v1)
-            a2 = get_alias(v2)
-            
-            if a1 == a2:
-                continue
-                
-            faces_a1 = vertex_faces[a1]
-            faces_a2 = vertex_faces[a2]
-            
-            common_faces = faces_a1.intersection(faces_a2)
-            
-            for f_idx in common_faces:
-                if face_active[f_idx]:
-                    face_active[f_idx] = False
-                    current_faces -= 1
-                    
-            alias[a2] = a1
-            
-            for f_idx in faces_a2:
-                if face_active[f_idx]:
-                    faces_a1.add(f_idx)
-            
-            vertex_faces[a2] = set()
+        new_faces = _decimate_with_frozen(verts, faces, frozen_set, int(target_faces))
 
-        new_faces = []
-        for i, active in enumerate(face_active):
-            if active:
-                f = faces[i]
-                v0 = get_alias(f[0])
-                v1 = get_alias(f[1])
-                v2 = get_alias(f[2])
-                if v0 != v1 and v1 != v2 and v2 != v0:
-                    new_faces.append([v0, v1, v2])
-                    
         try:
             import trimesh
-            new_t_mesh = trimesh.Trimesh(vertices=verts, faces=new_faces, process=True)
+            # process=False: merging vertices here would silently relocate or
+            # fuse the very vertices the caller asked us to freeze.
+            new_t_mesh = trimesh.Trimesh(vertices=verts, faces=new_faces, process=False)
+            new_t_mesh.update_faces(new_t_mesh.nondegenerate_faces())
+            new_t_mesh.remove_unreferenced_vertices()
             return HalfEdgeMesh.from_trimesh(new_t_mesh)
         except Exception as e:
             print(f"Error generating trimesh during decimation: {e}")
             return mesh.copy()
 
     try:
-        # Requires open3d or pyembree depending on trimesh installation
-        decimated = t_mesh.simplify_quadric_decimation(target_faces)
+        # trimesh >= 5 renamed the args to (percent, face_count, aggression);
+        # passing the count positionally lands in `percent` and raises.
+        decimated = t_mesh.simplify_quadric_decimation(face_count=target_faces)
         return HalfEdgeMesh.from_trimesh(decimated)
-    except Exception:
-        # Fallback if decimation fails (e.g. missing dependencies)
+    except TypeError:
+        try:
+            # older trimesh: face_count was the first positional argument
+            decimated = t_mesh.simplify_quadric_decimation(target_faces)
+            return HalfEdgeMesh.from_trimesh(decimated)
+        except Exception as e:
+            print(f"Warning: decimation failed ({e}); returning original mesh")
+            return mesh.copy()
+    except Exception as e:
+        print(f"Warning: decimation failed ({e}); returning original mesh")
         return mesh.copy()
 
 def remove_duplicate_vertices(mesh: HalfEdgeMesh, tolerance: float = 1e-6) -> HalfEdgeMesh:
-    """Merge vertices that are within tolerance distance of each other."""
+    """Merge vertices that are within tolerance distance of each other.
+
+    trimesh >= 5 quantizes to a power-of-ten grid (``digits_vertex`` decimal
+    places) rather than to an arbitrary tolerance, so the tolerance can only be
+    honoured approximately. The digit count is rounded UP (``ceil``), making the
+    effective grid step 10**-digits <= tolerance: e.g. tolerance 5e-5 gives
+    digits 5 (grid 1e-5), never digits 4 (grid 1e-4) which would merge vertices
+    up to twice as far apart as requested. Erring towards a finer grid keeps
+    the operation conservative -- it may leave a near-duplicate behind, but it
+    will not fuse geometry the caller wanted kept apart.
+
+    Note: the mesh round-trips through ``to_trimesh()``, so a quad/ngon cage
+    comes back triangulated (a warning says so).
+    """
+    _warn_if_not_triangles(mesh, "remove_duplicate_vertices")
     try:
         t_mesh = mesh.to_trimesh()
-        t_mesh.merge_vertices(merge_tex=False, merge_norm=False, digits_or_tol=tolerance)
+        digits = max(0, int(np.ceil(-np.log10(max(tolerance, 1e-12)))))
+        try:
+            t_mesh.merge_vertices(merge_tex=False, merge_norm=False, digits_vertex=digits)
+        except TypeError:
+            t_mesh.merge_vertices(merge_tex=False, merge_norm=False, digits_or_tol=tolerance)
         return HalfEdgeMesh.from_trimesh(t_mesh)
     except Exception as e:
         print(f"Error merging vertices: {e}")
@@ -183,18 +486,20 @@ def remove_duplicate_vertices(mesh: HalfEdgeMesh, tolerance: float = 1e-6) -> Ha
 
 def compute_mesh_quality(mesh: HalfEdgeMesh) -> dict:
     """Compute mesh quality metrics.
-    
+
     Returns dict with:
         'face_count', 'vertex_count', 'edge_count',
-        'min_angle', 'max_angle', 'avg_angle',
+        'min_angle', 'max_angle', 'avg_angle'  (corner angles in DEGREES,
+            measured on the triangulated mesh -- a quad cage is fanned into
+            triangles by ``to_trimesh()`` first),
         'min_area', 'max_area',
         'watertight': bool,
         'manifold': bool,
         'boundary_edges': int,
-        'non_manifold_edges': int
+        'non_manifold_edges': int  (undirected edges shared by >2 faces)
     """
     t_mesh = mesh.to_trimesh()
-    
+
     stats = {
         'face_count': len(mesh.faces),
         'vertex_count': len(mesh.vertices),
@@ -202,15 +507,36 @@ def compute_mesh_quality(mesh: HalfEdgeMesh) -> dict:
         'watertight': t_mesh.is_watertight,
         'manifold': t_mesh.is_winding_consistent,
     }
-    
-    if len(mesh.faces) > 0:
+
+    if len(mesh.faces) > 0 and len(t_mesh.faces) > 0:
         areas = t_mesh.area_faces
         stats['min_area'] = float(np.min(areas))
         stats['max_area'] = float(np.max(areas))
-        
+
+        # Corner angles come from trimesh (radians) -> report degrees.
+        angles = np.degrees(np.asarray(t_mesh.face_angles).ravel())
+        angles = angles[np.isfinite(angles)]
+        if len(angles):
+            stats['min_angle'] = float(np.min(angles))
+            stats['max_angle'] = float(np.max(angles))
+            stats['avg_angle'] = float(np.mean(angles))
+
     # Boundary edges
     boundary_edges = sum(1 for e in mesh.edges if mesh.is_boundary_edge(e))
     stats['boundary_edges'] = boundary_edges
-    stats['non_manifold_edges'] = 0 # HalfEdge structure enforces manifold by design
-    
+
+    # Non-manifold edges: count undirected edges with face incidence > 2.
+    # The half-edge structure does NOT enforce manifoldness -- add_face happily
+    # accepts a third face on an existing edge, it just leaves the extra
+    # half-edge untwinned -- so this has to be measured on the face set.
+    incidence: Dict[tuple, int] = {}
+    for f in mesh.faces:
+        fv = [v.index for v in mesh.get_face_vertices(f)]
+        n = len(fv)
+        for i in range(n):
+            a, b = fv[i], fv[(i + 1) % n]
+            key = (a, b) if a < b else (b, a)
+            incidence[key] = incidence.get(key, 0) + 1
+    stats['non_manifold_edges'] = int(sum(1 for c in incidence.values() if c > 2))
+
     return stats

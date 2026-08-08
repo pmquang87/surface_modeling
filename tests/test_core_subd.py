@@ -25,6 +25,10 @@ def test(name, condition, details=""):
         print(f"FAIL: {name} - {details}")
         results['fail'] += 1
 
+
+# script-style helper, not a pytest case
+test.__test__ = False
+
 def run_halfedge_mesh_tests():
     print("\n--- HalfEdgeMesh Tests ---")
     try:

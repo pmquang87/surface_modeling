@@ -1,19 +1,45 @@
 import numpy as np
 from src.core.halfedge_mesh import HalfEdgeMesh, Vertex, HalfEdge, Edge, Face
 
-def subdivide(mesh: HalfEdgeMesh, levels: int = 1) -> HalfEdgeMesh:
+def subdivide(mesh: HalfEdgeMesh, levels: int = 1, smooth: bool = True) -> HalfEdgeMesh:
     """
     Subdivide a mesh using the Catmull-Clark algorithm.
+
+    smooth=False performs linear (midpoint) subdivision: same topology split,
+    but existing vertices stay in place and new points sit on face centroids /
+    edge midpoints, so the shape is preserved exactly.
     """
     if levels <= 0:
         return mesh.copy()
-    
+
     current_mesh = mesh
     for _ in range(levels):
-        current_mesh = _subdivide_once(current_mesh)
+        current_mesh = _subdivide_once(current_mesh, smooth=smooth)
     return current_mesh
 
-def _subdivide_once(mesh: HalfEdgeMesh) -> HalfEdgeMesh:
+def _build_incident_edge_map(mesh: HalfEdgeMesh) -> dict[int, list[Edge]]:
+    """
+    Map every vertex index to the edges touching it, in ascending edge order.
+
+    Built in a single sweep over the edge list so that callers never have to
+    rescan all edges per vertex.
+    """
+    incident: dict[int, list[Edge]] = {v.index: [] for v in mesh.vertices}
+    for e in mesh.edges:
+        he = e.half_edge
+        if he is None or he.prev is None or he.vertex is None or he.prev.vertex is None:
+            continue
+        tgt = he.vertex.index
+        src = he.prev.vertex.index
+        if tgt in incident:
+            incident[tgt].append(e)
+        # A self-loop must not be counted twice for the same vertex.
+        if src != tgt and src in incident:
+            incident[src].append(e)
+    return incident
+
+
+def _subdivide_once(mesh: HalfEdgeMesh, smooth: bool = True) -> HalfEdgeMesh:
     # 1. Face points
     face_points = {}
     for f in mesh.faces:
@@ -35,8 +61,8 @@ def _subdivide_once(mesh: HalfEdgeMesh) -> HalfEdgeMesh:
         edge_midpoints[e.index] = midpoint
         
         f1, f2 = mesh.get_edge_faces(e)
-        if f2 is None:
-            # Boundary edge
+        if not smooth or f2 is None:
+            # Linear subdivision or boundary edge
             ep = midpoint
         else:
             fp1 = face_points[f1.index]
@@ -49,16 +75,22 @@ def _subdivide_once(mesh: HalfEdgeMesh) -> HalfEdgeMesh:
         edge_points[e.index] = ep
         
     # 3. Vertex points
+    # One pass over the edges builds every vertex's incident-edge list. Asking
+    # each vertex to rescan all edges instead is O(V*E), which on a real mesh
+    # (100k+ edges) dominates everything else in the algorithm.
+    incident_edges = _build_incident_edge_map(mesh)
+
     vertex_points = {}
     for v in mesh.vertices:
         P = v.position
+        if not smooth:
+            # Linear subdivision: existing vertices do not move
+            vertex_points[v.index] = P
+            continue
         faces = mesh.get_vertex_faces(v)
-        
-        inc_edges = []
-        for e in mesh.edges:
-            if e.half_edge.vertex == v or e.half_edge.prev.vertex == v:
-                inc_edges.append(e)
-                
+
+        inc_edges = incident_edges[v.index]
+
         is_boundary = mesh.is_boundary_vertex(v)
         n = len(inc_edges)
         
@@ -156,65 +188,103 @@ def _subdivide_once(mesh: HalfEdgeMesh) -> HalfEdgeMesh:
 
 def evaluate_limit_surface(mesh: HalfEdgeMesh) -> tuple[np.ndarray, np.ndarray]:
     """
-    Evaluate the exact limit surface positions and normals for a Catmull-Clark mesh.
+    Project every cage vertex onto the Catmull-Clark limit surface.
+
+    Positions are exact. For an interior vertex of valence n the limit point is
+
+        limit = ((n - 3) * P + 4 * Rbar + 4 * Fbar) / (n + 5)
+
+    with P the vertex, Rbar the mean of the incident edge midpoints and Fbar the
+    mean of the incident face centroids. That is the eigenvector of the local
+    subdivision matrix for eigenvalue 1, derived from the very rules applied in
+    `_subdivide_once`; on a regular (valence 4, all-quad) neighbourhood it
+    reproduces the exact bicubic B-spline limit (16*P + 4*sum(neighbours) +
+    sum(diagonals)) / 36. The weights sum to n + 5, so the map is affine
+    invariant.
+
+    Boundary vertices are left where they are: the boundary limit rule depends on
+    the crease/boundary curve rather than the interior mask, and this module does
+    not model open boundaries.
+
+    Normals are an APPROXIMATION, not the analytic limit normal. They are the
+    angle-independent area-weighted normals of the polygon mesh formed by the
+    limit positions, which converges to the true limit normal as the cage is
+    refined but is not equal to it on a coarse cage. Use the limit tangent masks
+    if you need exact normals at extraordinary vertices.
+
+    The input mesh is not modified.
     """
     limit_positions = np.zeros((len(mesh.vertices), 3))
-    limit_normals = np.zeros((len(mesh.vertices), 3))
-    
-    mesh.compute_vertex_normals()
-    
+
     face_points = {}
     for f in mesh.faces:
         verts = mesh.get_face_vertices(f)
         if verts:
             face_points[f.index] = np.mean([v.position for v in verts], axis=0)
-        
+
     edge_midpoints = {}
     for e in mesh.edges:
-        v_tgt = e.half_edge.vertex.position
-        v_src = e.half_edge.prev.vertex.position
-        edge_midpoints[e.index] = (v_src + v_tgt) / 2.0
-        
-    for v in mesh.vertices:
-        if mesh.is_boundary_vertex(v):
-            limit_positions[v.index] = v.position
-            limit_normals[v.index] = v.normal
+        he = e.half_edge
+        if he is None or he.prev is None or he.vertex is None or he.prev.vertex is None:
             continue
-            
-        faces = mesh.get_vertex_faces(v)
-        inc_edges = []
-        if v.half_edge:
-            curr = v.half_edge
-            visited = set()
-            while True:
-                if curr is None or curr.index in visited:
-                    break
-                visited.add(curr.index)
-                if curr.edge:
-                    inc_edges.append(curr.edge)
-                if curr.twin is None:
-                    break
-                curr = curr.twin.next
-                if curr == v.half_edge:
-                    break
-                
-        n = len(inc_edges)
-        P = v.position
-        
-        if n > 0:
-            sum_R = np.sum([edge_midpoints[e.index] for e in inc_edges], axis=0)
-            sum_F = np.sum([face_points[f.index] for f in faces], axis=0) if faces else np.zeros(3)
-            limit_pos = ((n - 2) / n) * P + (1 / (n * n)) * sum_R + (1 / (n * n)) * sum_F
-        else:
-            limit_pos = P
-            
-        limit_positions[v.index] = limit_pos
-        limit_normals[v.index] = v.normal
-        
-    regular, irregular = identify_regular_regions(mesh)
-    # Regular regions evaluate to exactly bicubic B-spline patches.
+        edge_midpoints[e.index] = (he.prev.vertex.position + he.vertex.position) / 2.0
 
+    for v in mesh.vertices:
+        P = v.position
+        if mesh.is_boundary_vertex(v):
+            limit_positions[v.index] = P
+            continue
+
+        fan = mesh.get_vertex_fan(v)
+        inc_edges = [he.edge for he in fan
+                     if he.edge is not None and he.edge.index in edge_midpoints]
+        faces = [he.face for he in fan
+                 if he.face is not None and he.face.index in face_points]
+
+        n = len(inc_edges)
+        if n == 0 or not faces:
+            limit_positions[v.index] = P
+            continue
+
+        R_bar = np.mean([edge_midpoints[e.index] for e in inc_edges], axis=0)
+        F_bar = np.mean([face_points[f.index] for f in faces], axis=0)
+        limit_positions[v.index] = ((n - 3) * P + 4.0 * R_bar + 4.0 * F_bar) / (n + 5.0)
+
+    limit_normals = _normals_from_positions(mesh, limit_positions)
     return limit_positions, limit_normals
+
+
+def _normals_from_positions(mesh: HalfEdgeMesh, positions: np.ndarray) -> np.ndarray:
+    """
+    Area-weighted vertex normals of `mesh`'s topology evaluated at `positions`.
+
+    Computed without touching the mesh's own cached normals, so calling it does
+    not disturb whatever the caller had stored there.
+    """
+    normals = np.zeros((len(mesh.vertices), 3))
+
+    for f in mesh.faces:
+        fv = [v.index for v in mesh.get_face_vertices(f)]
+        if len(fv) < 3:
+            continue
+        # Newell's method: robust for non-planar and non-convex polygons, and
+        # its magnitude is twice the projected area, giving the area weighting.
+        Pp = positions[fv]
+        Q = np.roll(Pp, -1, axis=0)
+        d = Pp - Q
+        s = Pp + Q
+        fn = np.array([
+            np.dot(d[:, 1], s[:, 2]),
+            np.dot(d[:, 2], s[:, 0]),
+            np.dot(d[:, 0], s[:, 1]),
+        ])
+        for idx in fv:
+            normals[idx] += fn
+
+    lengths = np.linalg.norm(normals, axis=1)
+    good = lengths > 1e-12
+    normals[good] /= lengths[good][:, None]
+    return normals
 
 def identify_regular_regions(mesh: HalfEdgeMesh) -> tuple[list[Vertex], list[Vertex]]:
     """

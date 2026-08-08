@@ -51,20 +51,36 @@ class SubDToNURBSConverter:
                 
         return grid
 
-    def generate_patches(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3) -> List[Any]:
-        try:
-            from src.subd.catmull_clark import evaluate_limit_surface
-            limit_positions, limit_normals = evaluate_limit_surface(mesh)
-        except Exception:
+    def generate_patches(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3,
+                         reference_mesh: Optional[HalfEdgeMesh] = None) -> List[Any]:
+        ref_tm = None
+        if reference_mesh is not None and len(reference_mesh.faces) > 0:
+            ref_tm = reference_mesh.to_trimesh()
+
+        if ref_tm is None:
+            try:
+                from src.subd.catmull_clark import evaluate_limit_surface
+                limit_positions, limit_normals = evaluate_limit_surface(mesh)
+            except Exception:
+                limit_positions = np.array([v.position for v in mesh.vertices])
+        else:
+            # Reverse engineering: the cage vertices already lie ON the target
+            # surface (shrink wrap projects them there). Catmull-Clark limit
+            # positions would pull low-valence vertices millimetres off it.
             limit_positions = np.array([v.position for v in mesh.vertices])
-            limit_normals = []
+            mesh.compute_vertex_normals()
 
         from src.nurbs.g3_fitter import G3Fitter
-        fitter = G3Fitter()
-        
+        # Map the requested continuity level onto the fitter's soft-constraint
+        # weight; data equations have weight 1, so values far above ~50 make
+        # the solver satisfy smoothness identities while ignoring the surface.
+        continuity_weights = {'G0': 0.0, 'G1': 5.0, 'G2': 20.0, 'G3': 50.0}
+        fitter = G3Fitter(continuity_weight=continuity_weights.get(self.continuity, 20.0))
+
         quad_faces = [f for f in mesh.faces if len(mesh.get_face_vertices(f)) == 4]
         face_to_idx = {f.index: idx for idx, f in enumerate(quad_faces)}
-        
+
+        grid_size = 6
         quad_mesh_data = []
         for face in quad_faces:
             vertices = mesh.get_face_vertices(face)
@@ -74,7 +90,7 @@ class SubDToNURBSConverter:
                     corners.append(limit_positions[v.index])
                 else:
                     corners.append(v.position)
-            
+
             neighbors = []
             he = face.half_edge
             curr = he
@@ -84,14 +100,44 @@ class SubDToNURBSConverter:
                 else:
                     neighbors.append(-1)
                 curr = curr.next
-                
-            dense_points = self._evaluate_dense_grid(mesh, face, limit_positions, grid_size=6)
+
+            if ref_tm is None:
+                dense_points = self._evaluate_dense_grid(mesh, face, limit_positions, grid_size=grid_size)
+                corner_normals = None
+            else:
+                dense_points = None  # filled below by batched projection
+                # per-vertex normals give both patches at a shared edge the
+                # same tangent-plane boundary curve (sewable, but curved)
+                corner_normals = [v.normal.copy() for v in vertices]
             quad_mesh_data.append({
                 'corners': corners,
                 'dense_points': dense_points,
+                'corner_normals': corner_normals,
                 'neighbors': neighbors
             })
-                
+
+        if ref_tm is not None and quad_mesh_data:
+            # Sample each quad bilinearly and project the samples onto the
+            # reference surface in ONE batched query, so the fitter fits the
+            # actual scanned geometry instead of a synthetic bump heuristic.
+            import trimesh as _trimesh
+            u = np.linspace(0.0, 1.0, grid_size)
+            uu, vv = np.meshgrid(u, u, indexing='ij')
+            w0 = ((1 - uu) * (1 - vv))[..., None]
+            w1 = (uu * (1 - vv))[..., None]
+            w2 = (uu * vv)[..., None]
+            w3 = ((1 - uu) * vv)[..., None]
+            grids = []
+            for qd in quad_mesh_data:
+                c0, c1, c2, c3 = qd['corners']
+                g = w0 * c0 + w1 * c1 + w2 * c2 + w3 * c3
+                grids.append(g.reshape(-1, 3))
+            all_pts = np.vstack(grids)
+            projected, _, _ = _trimesh.proximity.closest_point(ref_tm, all_pts)
+            projected = np.asarray(projected).reshape(len(quad_mesh_data), grid_size, grid_size, 3)
+            for qd, g in zip(quad_mesh_data, projected):
+                qd['dense_points'] = g
+
         patches = fitter.fit_surface(quad_mesh_data)
         return patches
         
@@ -126,19 +172,84 @@ class SubDToNURBSConverter:
         if faces_added > 0:
             sewing.Perform()
             shape = sewing.SewedShape()
+            shape = self._promote_closed_shells(shape)
             if simplify:
                 try:
                     from src.nurbs.simplifier import NURBSSimplifier
-                    simplifier = NURBSSimplifier(linear_tolerance=self.tolerance, angular_tolerance=self.tolerance)
+                    # angular tolerance is in radians, not mm — keep the
+                    # simplifier's intended ~0.1 rad merge threshold
+                    simplifier = NURBSSimplifier(linear_tolerance=self.tolerance, angular_tolerance=0.1)
                     shape = simplifier.simplify(shape)
                 except Exception as e:
                     print(f"Simplification failed: {e}")
             return shape
         return None
 
-    def convert(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3, simplify: bool = False) -> Dict[str, Any]:
-        """Convert Sub-D mesh to a sewed TopoDS_Shape using cadquery-ocp."""
-        patches = self.generate_patches(mesh, subdivision_levels)
+    @staticmethod
+    def _promote_closed_shells(shape: Any) -> Any:
+        """Turn closed shells into solids so CAD importers see solid bodies."""
+        try:
+            from OCP.TopExp import TopExp_Explorer, TopExp
+            from OCP.TopAbs import TopAbs_SHELL, TopAbs_FACE
+            from OCP.TopoDS import TopoDS, TopoDS_Compound
+            from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
+            from OCP.ShapeFix import ShapeFix_Solid
+            from OCP.BRep import BRep_Builder
+            from OCP.TopTools import TopTools_IndexedMapOfShape
+
+            children = []
+            faces_in_shells = TopTools_IndexedMapOfShape()
+            exp = TopExp_Explorer(shape, TopAbs_SHELL)
+            while exp.More():
+                shell = TopoDS.Shell_s(exp.Current())
+                TopExp.MapShapes_s(shell, TopAbs_FACE, faces_in_shells)
+                child = shell
+                if shell.Closed():
+                    mk = BRepBuilderAPI_MakeSolid(shell)
+                    if mk.IsDone():
+                        fixer = ShapeFix_Solid(mk.Solid())
+                        fixer.Perform()
+                        child = fixer.Solid()
+                children.append(child)
+                exp.Next()
+
+            # keep faces that sewing could not attach to any shell —
+            # dropping them would silently delete surface area
+            exp = TopExp_Explorer(shape, TopAbs_FACE)
+            loose = 0
+            while exp.More():
+                face = exp.Current()
+                if not faces_in_shells.Contains(face):
+                    children.append(face)
+                    loose += 1
+                exp.Next()
+            if loose:
+                print(f"NURBS conversion: {loose} face(s) could not be sewn into "
+                      f"a shell and are kept as free faces")
+
+            if not children:
+                return shape
+            if len(children) == 1:
+                return children[0]
+            comp = TopoDS_Compound()
+            builder = BRep_Builder()
+            builder.MakeCompound(comp)
+            for c in children:
+                builder.Add(comp, c)
+            return comp
+        except Exception as e:
+            print(f"Shell-to-solid promotion failed: {e}")
+            return shape
+
+    def convert(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3, simplify: bool = False,
+                reference_mesh: Optional[HalfEdgeMesh] = None) -> Dict[str, Any]:
+        """Convert Sub-D mesh to a sewed TopoDS_Shape using cadquery-ocp.
+
+        reference_mesh: optional dense mesh (e.g. the original STL) — when
+        given, patches are fitted to that surface instead of a synthetic
+        approximation of the Catmull-Clark limit surface.
+        """
+        patches = self.generate_patches(mesh, subdivision_levels, reference_mesh=reference_mesh)
         shape = self.build_shape(patches, simplify=simplify)
         return {
             'shape': shape,

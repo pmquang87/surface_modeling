@@ -49,10 +49,14 @@ def create_cylinder(radius: float = 0.5, height: float = 1.0, segments: int = 8,
         v3 = v2 + segments
         v4 = v1 + segments
         mesh.add_face([v1, v4, v3, v2])
-        
-    mesh.add_face(list(range(segments))[::-1])
-    mesh.add_face(list(range(segments, 2 * segments)))
-    
+
+    # The walls traverse the bottom ring backwards (i+1 -> i) and the top ring
+    # forwards, so each cap has to run the opposite way round to twin with them.
+    # Winding the caps like the walls leaves every cap half-edge without a twin
+    # and the winding globally inconsistent.
+    mesh.add_face(list(range(segments)))
+    mesh.add_face(list(range(segments, 2 * segments))[::-1])
+
     if subdivisions > 0:
         mesh = subdivide(mesh, subdivisions)
     return mesh
@@ -102,13 +106,16 @@ def create_cone(radius: float = 0.5, height: float = 1.0, segments: int = 8, sub
     tip_idx = segments
     mesh.add_vertex([0, h, 0])
     
+    # Outward winding: [v2, v1, tip] puts the side normals away from the axis,
+    # and the base then has to run forwards to twin with them. The reverse of
+    # both (the old code) is a consistent but inside-out solid: negative volume.
     for i in range(segments):
         v1 = i
         v2 = (i + 1) % segments
-        mesh.add_face([v1, v2, tip_idx])
-        
-    mesh.add_face(list(range(segments))[::-1])
-    
+        mesh.add_face([v2, v1, tip_idx])
+
+    mesh.add_face(list(range(segments)))
+
     if subdivisions > 0:
         mesh = subdivide(mesh, subdivisions)
     return mesh
@@ -157,12 +164,14 @@ def create_sphere(radius: float = 0.5, segments: int = 8, rings: int = 6, subdiv
             
     mesh.add_vertex([0, radius, 0])
     
+    # Every ring below was wound the other way round, giving a consistent but
+    # inside-out sphere (negative volume), unlike create_box/create_torus.
     for j in range(segments):
         v1 = 0
         v2 = 1 + j
         v3 = 1 + (j + 1) % segments
-        mesh.add_face([v1, v3, v2])
-        
+        mesh.add_face([v1, v2, v3])
+
     for i in range(rings - 2):
         row1 = 1 + i * segments
         row2 = 1 + (i + 1) * segments
@@ -171,16 +180,16 @@ def create_sphere(radius: float = 0.5, segments: int = 8, rings: int = 6, subdiv
             v2 = row1 + (j + 1) % segments
             v3 = row2 + (j + 1) % segments
             v4 = row2 + j
-            mesh.add_face([v1, v2, v3, v4])
-            
+            mesh.add_face([v4, v3, v2, v1])
+
     n_pole = 1 + (rings - 1) * segments
     row = 1 + (rings - 2) * segments
     for j in range(segments):
         v1 = row + j
         v2 = n_pole
         v3 = row + (j + 1) % segments
-        mesh.add_face([v1, v3, v2])
-        
+        mesh.add_face([v1, v2, v3])
+
     if subdivisions > 0:
         mesh = subdivide(mesh, subdivisions)
     return mesh

@@ -155,31 +155,33 @@ class TestG3Fitter:
     def test_generate_patch(self):
         fitter = G3Fitter()
         
+        # corners in cyclic winding order around the quad (the convention
+        # used by HalfEdgeMesh.get_face_vertices / SubDToNURBSConverter)
         corners = np.array([
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [1.0, 1.0, 0.0]
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0]
         ])
-        
+
         patch = fitter.generate_patch(corners)
-        
+
         assert patch.shape == (6, 6, 3)
-        
-        # Check corners G0 positional matching
+
+        # Check corners G0 positional matching (cyclic -> tensor grid)
         assert np.allclose(patch[0, 0], corners[0])
-        assert np.allclose(patch[0, 5], corners[1])
-        assert np.allclose(patch[5, 0], corners[2])
-        assert np.allclose(patch[5, 5], corners[3])
+        assert np.allclose(patch[5, 0], corners[1])
+        assert np.allclose(patch[5, 5], corners[2])
+        assert np.allclose(patch[0, 5], corners[3])
 
     def test_fit_surface(self):
         fitter = G3Fitter()
         quad_mesh = [
             {'corners': np.array([
-                [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]
+                [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]
             ])},
             {'corners': np.array([
-                [1, 0, 0], [2, 0, 0], [1, 1, 0], [2, 1, 0]
+                [1, 0, 0], [2, 0, 0], [2, 1, 0], [1, 1, 0]
             ])}
         ]
         
