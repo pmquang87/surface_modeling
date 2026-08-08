@@ -187,6 +187,58 @@ class TestDecimationRepair:
         assert repaired.is_watertight
 
 
+class TestRemoveSliverEdges:
+    def _mesh_with_short_edge(self):
+        import trimesh
+        base = trimesh.creation.icosphere(subdivisions=2)
+        verts = np.asarray(base.vertices).copy()
+        # shrink an ACTUAL mesh edge to 2% of its length
+        a, b = base.edges_unique[0]
+        verts[b] = verts[a] + 0.02 * (verts[b] - verts[a])
+        return trimesh.Trimesh(vertices=verts, faces=base.faces, process=False)
+
+    def test_collapse_short_edges(self):
+        from src.reverse_engineering.mesh_tools import collapse_short_edges
+        dirty = self._mesh_with_short_edge()
+        out = collapse_short_edges(dirty, rel_threshold=0.15)
+        assert len(out.faces) < len(dirty.faces), "collapse did not happen"
+        edges = np.sort(out.faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+        edges = np.unique(edges, axis=0)
+        lens = np.linalg.norm(out.vertices[edges[:, 0]] - out.vertices[edges[:, 1]], axis=1)
+        assert lens.min() >= 0.15 * np.median(lens)
+        assert out.is_watertight
+
+    def test_flip_needle_triangles(self):
+        import trimesh
+        from src.reverse_engineering.mesh_tools import flip_needle_triangles
+
+        def worst_height(m):
+            pts = m.vertices[m.faces]
+            e = np.roll(pts, -1, axis=1) - pts
+            areas = 0.5 * np.linalg.norm(np.cross(e[:, 0], -e[:, 2]), axis=1)
+            longest = np.linalg.norm(e, axis=2).max(axis=1)
+            return (2.0 * areas / longest).min()
+
+        base = trimesh.creation.icosphere(subdivisions=2)
+        verts = np.asarray(base.vertices).copy()
+        # squash an ACTUAL face: its apex moves almost onto the opposite
+        # edge's midpoint -> needle triangle with long edges, tiny height
+        p, q, r = base.faces[0]
+        verts[r] = 0.998 * (verts[p] + verts[q]) / 2.0 + 0.002 * verts[r]
+        dirty = trimesh.Trimesh(vertices=verts, faces=base.faces, process=False)
+
+        out = flip_needle_triangles(dirty, rel_height=0.05)
+        assert worst_height(out) > worst_height(dirty)
+        assert out.is_watertight
+
+    def test_remove_sliver_edges_halfedge_roundtrip(self):
+        from src.reverse_engineering.mesh_tools import remove_sliver_edges
+        dirty = HalfEdgeMesh.from_trimesh(self._mesh_with_short_edge())
+        out = remove_sliver_edges(dirty)
+        assert len(out.faces) < len(dirty.faces)
+        assert sum(1 for e in out.edges if out.is_boundary_edge(e)) == 0
+
+
 class TestForceConvexFallback:
     def test_irreparably_concave_quad_gets_forced_convex(self):
         """A quad that was concave BEFORE relaxation cannot be fixed by the

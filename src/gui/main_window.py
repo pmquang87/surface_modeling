@@ -53,7 +53,8 @@ except Exception as e:
 try:
     from src.reverse_engineering.quad_wrap import QuadWrapper
     from src.reverse_engineering.shrink_wrap import ShrinkWrapper
-    from src.reverse_engineering.mesh_tools import smooth_mesh, decimate_mesh, fill_holes
+    from src.reverse_engineering.mesh_tools import (
+        smooth_mesh, decimate_mesh, fill_holes, remove_sliver_edges)
 except Exception as e:
     print(f"[WARNING] Could not import RE modules: {e}")
     traceback.print_exc()
@@ -62,6 +63,7 @@ except Exception as e:
     smooth_mesh = None
     decimate_mesh = None
     fill_holes = None
+    remove_sliver_edges = None
 
 try:
     from src.operations.shell_thicken import shell_solid, thicken_surface
@@ -390,6 +392,8 @@ class PowerSurfacingMainWindow(QMainWindow):
         menu_rev.addSeparator()
         menu_rev.addAction("Quad Wrap...", self.on_quad_wrap)
         menu_rev.addAction("Shrink Wrap...", self.on_shrink_wrap)
+        menu_rev.addSeparator()
+        menu_rev.addAction("Remove Sliver Edges", self.on_remove_sliver_edges)
         
         menu_view = menubar.addMenu("&View")
         menu_view.addAction(self.act_view_solid)
@@ -875,6 +879,35 @@ class PowerSurfacingMainWindow(QMainWindow):
                 if v is not None:
                     vert_set.add(v.index)
         return sorted(vert_set)
+
+    def on_remove_sliver_edges(self):
+        if not self.current_mesh:
+            QMessageBox.information(self, "Remove Sliver Edges", "No mesh loaded.")
+            return
+        if not remove_sliver_edges:
+            QMessageBox.warning(self, "Error", "Mesh tools backend not available.")
+            return
+        try:
+            v_before = len(self.current_mesh.vertices)
+            f_before = len(self.current_mesh.faces)
+            self.log(f"Removing sliver edges... ({v_before} verts, {f_before} faces)")
+            QApplication.processEvents()
+            result = remove_sliver_edges(self.current_mesh)
+            v = len(result.vertices)
+            f = len(result.faces)
+            if v == v_before and f == f_before:
+                self.log("No sliver edges found — mesh unchanged.")
+                self.status_bar.showMessage("No sliver edges found.")
+                return
+            self.current_mesh = result
+            self.viewport.set_mesh(self.current_mesh)
+            self.properties_panel.set_mesh_info(self.current_mesh)
+            self.log(f"Sliver removal complete — {v} vertices, {f} faces "
+                     f"(was {v_before}/{f_before})")
+            self.status_bar.showMessage(f"Sliver removal: {v} verts, {f} faces")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Sliver removal failed: {e}")
+            self.log(f"ERROR: Sliver removal failed: {e}")
 
     def on_shrink_wrap(self):
         if not self.current_mesh:

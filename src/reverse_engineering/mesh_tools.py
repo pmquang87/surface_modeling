@@ -456,6 +456,155 @@ def decimate_mesh(mesh: HalfEdgeMesh, target_faces: int = None,
         print(f"Warning: decimation failed ({e}); returning original mesh")
         return mesh.copy()
 
+def collapse_short_edges(t_mesh: 'trimesh.Trimesh',
+                         rel_threshold: float = 0.15) -> 'trimesh.Trimesh':
+    """Collapse triangle-mesh edges much shorter than the median edge length.
+
+    Each short edge's endpoints merge at their midpoint (disjoint pairs per
+    round, up to 4 rounds). Degenerate and duplicate faces are dropped after
+    every round.
+    """
+    for _ in range(4):
+        verts = np.asarray(t_mesh.vertices).copy()
+        faces = np.asarray(t_mesh.faces)
+        if len(faces) == 0:
+            break
+        edges = np.sort(faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+        edges = np.unique(edges, axis=0)
+        lens = np.linalg.norm(verts[edges[:, 0]] - verts[edges[:, 1]], axis=1)
+        threshold = rel_threshold * np.median(lens)
+        short = edges[lens < threshold]
+        if len(short) == 0:
+            break
+        used = set()
+        remap = np.arange(len(verts))
+        n_collapsed = 0
+        for a, b in short:
+            if a in used or b in used:
+                continue
+            used.update((int(a), int(b)))
+            verts[a] = (verts[a] + verts[b]) / 2.0
+            remap[b] = a
+            n_collapsed += 1
+        if n_collapsed == 0:
+            break
+        new_faces = remap[faces]
+        keep = ((new_faces[:, 0] != new_faces[:, 1]) &
+                (new_faces[:, 1] != new_faces[:, 2]) &
+                (new_faces[:, 2] != new_faces[:, 0]))
+        print(f"Sliver removal: collapsed {n_collapsed} short edge(s) "
+              f"(< {threshold:.3f})")
+        t_mesh = trimesh.Trimesh(vertices=verts, faces=new_faces[keep],
+                                 process=False)
+        t_mesh.merge_vertices()
+        t_mesh.update_faces(t_mesh.nondegenerate_faces())
+        t_mesh.update_faces(t_mesh.unique_faces())
+        t_mesh.remove_unreferenced_vertices()
+    return t_mesh
+
+
+def flip_needle_triangles(t_mesh: 'trimesh.Trimesh',
+                          rel_height: float = 0.05) -> 'trimesh.Trimesh':
+    """Remove needle/cap triangles by flipping their longest edge.
+
+    A needle's edges can all be long while its height is near zero. Flipping
+    the longest edge against the neighbouring triangle removes the needle
+    without moving any vertex; a flip only happens when it strictly improves
+    the worse of the two triangles.
+    """
+    for _ in range(5):
+        verts = np.asarray(t_mesh.vertices)
+        faces = np.asarray(t_mesh.faces).copy()
+        if len(faces) == 0:
+            break
+        tri_pts = verts[faces]
+        edge_vecs = np.roll(tri_pts, -1, axis=1) - tri_pts
+        edge_lens = np.linalg.norm(edge_vecs, axis=2)
+        areas = 0.5 * np.linalg.norm(
+            np.cross(edge_vecs[:, 0], -edge_vecs[:, 2]), axis=1)
+        longest = edge_lens.max(axis=1)
+        heights = np.divide(2.0 * areas, longest,
+                            out=np.zeros_like(areas), where=longest > 1e-12)
+        median_edge = np.median(edge_lens)
+        h_min = rel_height * median_edge
+        sliver_ids = np.where(heights < h_min)[0]
+        if len(sliver_ids) == 0:
+            break
+
+        edge_face = {}
+        for fi, f in enumerate(faces):
+            for k in range(3):
+                edge_face[(f[k], f[(k + 1) % 3])] = fi
+
+        def height_of(tri):
+            p = verts[tri]
+            e = np.roll(p, -1, axis=0) - p
+            area = 0.5 * np.linalg.norm(np.cross(e[0], -e[2]))
+            longest_e = np.linalg.norm(e, axis=1).max()
+            return 2.0 * area / longest_e if longest_e > 1e-12 else 0.0
+
+        flipped = set()
+        n_flips = 0
+        for fi in sliver_ids:
+            if fi in flipped:
+                continue
+            f = faces[fi]
+            k = int(np.argmax(edge_lens[fi]))
+            a, b = f[k], f[(k + 1) % 3]
+            c = f[(k + 2) % 3]
+            nb = edge_face.get((b, a))
+            if nb is None or nb in flipped or nb == fi:
+                continue
+            g = faces[nb]
+            d = [v for v in g if v != a and v != b]
+            if len(d) != 1:
+                continue
+            d = d[0]
+            # flip AB -> CD: (A,B,C),(B,A,D) => (A,D,C),(D,B,C)
+            new1 = np.array([a, d, c])
+            new2 = np.array([d, b, c])
+            if min(height_of(new1), height_of(new2)) <= heights[fi]:
+                continue
+            faces[fi] = new1
+            faces[nb] = new2
+            flipped.update((fi, nb))
+            n_flips += 1
+        if n_flips == 0:
+            break
+        print(f"Sliver removal: flipped {n_flips} needle triangle(s) "
+              f"(height < {h_min:.3f})")
+        t_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        t_mesh.merge_vertices()
+        t_mesh.update_faces(t_mesh.nondegenerate_faces())
+        t_mesh.update_faces(t_mesh.unique_faces())
+        t_mesh.remove_unreferenced_vertices()
+    return t_mesh
+
+
+def remove_sliver_edges(mesh: HalfEdgeMesh,
+                        rel_threshold: float = 0.15,
+                        rel_height: float = 0.05) -> HalfEdgeMesh:
+    """Remove sliver geometry: collapse very short edges and flip needle
+    triangles.
+
+    Sliver elements survive smoothing and projection, and their faces are
+    silently dropped by strict CAD importers (SolidWorks rejects any solid
+    face with a sub-tolerance edge — the body then arrives as an unknittable
+    surface and the part looks empty). Thresholds are relative to the median
+    edge length.
+
+    Note: the mesh round-trips through ``to_trimesh()``, so a quad cage comes
+    back triangulated (a warning says so).
+    """
+    _warn_if_not_triangles(mesh, "remove_sliver_edges")
+    t_mesh = mesh.to_trimesh()
+    if len(t_mesh.faces) == 0:
+        return mesh.copy()
+    t_mesh = collapse_short_edges(t_mesh, rel_threshold=rel_threshold)
+    t_mesh = flip_needle_triangles(t_mesh, rel_height=rel_height)
+    return HalfEdgeMesh.from_trimesh(t_mesh)
+
+
 def remove_duplicate_vertices(mesh: HalfEdgeMesh, tolerance: float = 1e-6) -> HalfEdgeMesh:
     """Merge vertices that are within tolerance distance of each other.
 
