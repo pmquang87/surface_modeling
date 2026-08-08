@@ -332,14 +332,17 @@ class G3Fitter:
 
             # Sanity clamp: the solve refines the Coons interior; if it
             # diverged (conflicting equations at degenerate geometry), the
-            # runaway control points inflate the shape's bounding box and
-            # corrupt the surface. Fall back to the initialization there.
+            # runaway control points corrupt the surface. Legitimate curvature
+            # bulges stay near 1x the quad diagonal; SolidWorks refuses faces
+            # whose interiors span ~1.3x+ (import silently drops them and the
+            # shell can no longer knit into a solid), so clamp tightly and
+            # fall back to the Coons initialization.
             n_reset = 0
             for k, p in enumerate(patches):
                 corners = np.array([p[0, 0], p[5, 0], p[5, 5], p[0, 5]])
                 center = corners.mean(axis=0)
                 diag = np.linalg.norm(corners.max(axis=0) - corners.min(axis=0))
-                limit = max(2.0 * diag, diag + 1.0)
+                limit = max(1.25 * diag, diag + 0.5)
                 interior = p[1:5, 1:5].reshape(-1, 3)
                 if np.linalg.norm(interior - center, axis=1).max() > limit:
                     p[1:5, 1:5] = initial_interiors[k]

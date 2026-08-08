@@ -116,12 +116,80 @@ class QuadWrapper:
         pre_relax = np.array([v.position.copy() for v in he_mesh.vertices])
         he_mesh = self._relax_mesh(he_mesh, reference_mesh)
 
+        # Sliver quads (a sub-tolerance edge, near-collinear corners) survive
+        # every projection step and SolidWorks' solid validator silently drops
+        # the resulting face — stretch such edges to a sane length first.
+        self._repair_short_cage_edges(he_mesh, reference_mesh)
+
         # Smoothing + projection can fold quads concave; the renderer treats
         # concave quads as holes, so untangle them (the pre-relax cage from
         # _extract_pure_quads is convex-clean and serves as the safe state).
         self._repair_concave_quads(he_mesh, reference_mesh, pre_relax)
 
         return he_mesh
+
+    @staticmethod
+    def _repair_short_cage_edges(mesh: HalfEdgeMesh, reference: HalfEdgeMesh,
+                                 rel_threshold: float = 0.15) -> None:
+        """Stretch cage edges far shorter than the median to a usable length.
+
+        The endpoints move apart along the edge direction (a tangential shift
+        of a fraction of the local quad size), then are re-projected onto the
+        reference surface. Purely local, no topology change.
+        """
+        lens = []
+        for e in mesh.edges:
+            a = e.half_edge.prev.vertex.position
+            b = e.half_edge.vertex.position
+            lens.append(np.linalg.norm(b - a))
+        if not lens:
+            return
+        min_len = rel_threshold * float(np.median(lens))
+
+        ref_tm = reference.to_trimesh()
+        for _ in range(3):
+            moved = {}
+            touched = set()
+            pairs = []
+            for e, L in zip(mesh.edges, lens):
+                if L >= min_len:
+                    continue
+                va = e.half_edge.prev.vertex
+                vb = e.half_edge.vertex
+                if va.index in touched or vb.index in touched:
+                    continue
+                touched.update((va.index, vb.index))
+                mid = (va.position + vb.position) / 2.0
+                if L > 1e-12:
+                    d = (vb.position - va.position) / L
+                else:
+                    d = np.array([1.0, 0.0, 0.0])
+                moved[va.index] = mid - d * (min_len / 2.0)
+                moved[vb.index] = mid + d * (min_len / 2.0)
+                pairs.append((va.index, vb.index))
+            if not moved:
+                return
+            print(f"Quad wrap: stretched {len(pairs)} sliver edge(s) to "
+                  f">= {min_len:.3f}")
+            ids = sorted(moved)
+            projected, _, _ = trimesh.proximity.closest_point(
+                ref_tm, np.array([moved[i] for i in ids]))
+            proj_map = {i: np.asarray(p, dtype=np.float64)
+                        for i, p in zip(ids, projected)}
+            for ia, ib in pairs:
+                # keep the on-surface positions only if projection did not
+                # re-collapse the edge (thin features pull both ends together)
+                if np.linalg.norm(proj_map[ib] - proj_map[ia]) >= 0.8 * min_len:
+                    mesh.vertices[ia].position = proj_map[ia]
+                    mesh.vertices[ib].position = proj_map[ib]
+                else:
+                    mesh.vertices[ia].position = np.asarray(moved[ia], dtype=np.float64)
+                    mesh.vertices[ib].position = np.asarray(moved[ib], dtype=np.float64)
+            lens = []
+            for e in mesh.edges:
+                a = e.half_edge.prev.vertex.position
+                b = e.half_edge.vertex.position
+                lens.append(np.linalg.norm(b - a))
         
     def _compute_curvatures(self, mesh: trimesh.Trimesh) -> Tuple[np.ndarray, np.ndarray]:
         """Compute approximate principal curvature directions at vertices.
@@ -264,6 +332,135 @@ class QuadWrapper:
             mesh.merge_vertices()
             mesh.remove_unreferenced_vertices()
 
+        mesh = self._collapse_sliver_edges(mesh)
+        mesh = self._flip_sliver_triangles(mesh)
+
+        return mesh
+
+    @staticmethod
+    def _flip_sliver_triangles(mesh: trimesh.Trimesh,
+                               rel_height: float = 0.05) -> trimesh.Trimesh:
+        """Remove needle/cap triangles by flipping their longest edge.
+
+        A sliver's edges can all be long while its height is near zero; the
+        quad-split step then puts the face centroid ~height/3 from an edge
+        midpoint, creating a degenerate quad whose face SolidWorks silently
+        drops. Flipping the sliver's longest edge against its neighbour
+        removes the sliver without moving any vertex.
+        """
+        for _ in range(5):
+            verts = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces).copy()
+            tri_pts = verts[faces]
+            edge_vecs = np.roll(tri_pts, -1, axis=1) - tri_pts
+            edge_lens = np.linalg.norm(edge_vecs, axis=2)
+            areas = 0.5 * np.linalg.norm(
+                np.cross(edge_vecs[:, 0], -edge_vecs[:, 2]), axis=1)
+            longest = edge_lens.max(axis=1)
+            heights = np.divide(2.0 * areas, longest,
+                                out=np.zeros_like(areas), where=longest > 1e-12)
+            median_edge = np.median(edge_lens)
+            h_min = rel_height * median_edge
+            sliver_ids = np.where(heights < h_min)[0]
+            if len(sliver_ids) == 0:
+                break
+
+            # directed edge -> face map
+            edge_face = {}
+            for fi, f in enumerate(faces):
+                for k in range(3):
+                    edge_face[(f[k], f[(k + 1) % 3])] = fi
+
+            flipped = set()
+            n_flips = 0
+            for fi in sliver_ids:
+                if fi in flipped:
+                    continue
+                f = faces[fi]
+                k = int(np.argmax(edge_lens[fi]))
+                a, b = f[k], f[(k + 1) % 3]
+                c = f[(k + 2) % 3]
+                nb = edge_face.get((b, a))
+                if nb is None or nb in flipped or nb == fi:
+                    continue
+                g = faces[nb]
+                d = [v for v in g if v != a and v != b]
+                if len(d) != 1:
+                    continue
+                d = d[0]
+                # flip AB -> CD: (A,B,C),(B,A,D) => (A,D,C),(D,B,C)
+                new1 = np.array([a, d, c])
+                new2 = np.array([d, b, c])
+                # only flip if it actually removes the sliver
+                def h(tri):
+                    p = verts[tri]
+                    e = np.roll(p, -1, axis=0) - p
+                    ar = 0.5 * np.linalg.norm(np.cross(e[0], -e[2]))
+                    L = np.linalg.norm(e, axis=1).max()
+                    return 2.0 * ar / L if L > 1e-12 else 0.0
+                if min(h(new1), h(new2)) <= heights[fi]:
+                    continue
+                faces[fi] = new1
+                faces[nb] = new2
+                flipped.update((fi, nb))
+                n_flips += 1
+            if n_flips == 0:
+                break
+            print(f"Quad wrap: flipped {n_flips} sliver triangle(s) "
+                  f"(height < {h_min:.3f})")
+            mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+            mesh.merge_vertices()
+            mesh.update_faces(mesh.nondegenerate_faces())
+            mesh.update_faces(mesh.unique_faces())
+            mesh.remove_unreferenced_vertices()
+        return mesh
+
+    @staticmethod
+    def _collapse_sliver_edges(mesh: trimesh.Trimesh,
+                               rel_threshold: float = 0.15) -> trimesh.Trimesh:
+        """Collapse edges much shorter than the median edge length.
+
+        Midpoint subdivision halves every decimated edge, so a tiny triangle
+        here becomes a cluster of sub-millimetre quad edges in the cage — and
+        SolidWorks' solid validator silently drops any face with such an
+        edge, leaving a hole that stops the whole body from knitting.
+        """
+        for _ in range(4):
+            verts = np.asarray(mesh.vertices).copy()
+            faces = np.asarray(mesh.faces)
+            edges = np.sort(faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+            edges = np.unique(edges, axis=0)
+            lens = np.linalg.norm(verts[edges[:, 0]] - verts[edges[:, 1]], axis=1)
+            threshold = rel_threshold * np.median(lens)
+            short = edges[lens < threshold]
+            if len(short) == 0:
+                break
+            # merge each short edge's endpoints at their midpoint; process
+            # disjoint pairs only, then rebuild and re-check
+            used = set()
+            remap = np.arange(len(verts))
+            n_collapsed = 0
+            for a, b in short:
+                if a in used or b in used:
+                    continue
+                used.update((int(a), int(b)))
+                verts[a] = (verts[a] + verts[b]) / 2.0
+                remap[b] = a
+                n_collapsed += 1
+            if n_collapsed == 0:
+                break
+            new_faces = remap[faces]
+            keep = ((new_faces[:, 0] != new_faces[:, 1]) &
+                    (new_faces[:, 1] != new_faces[:, 2]) &
+                    (new_faces[:, 2] != new_faces[:, 0]))
+            print(f"Quad wrap: collapsed {n_collapsed} sliver edge(s) "
+                  f"(< {threshold:.3f}) in the decimated mesh")
+            mesh = trimesh.Trimesh(vertices=verts, faces=new_faces[keep],
+                                   process=False)
+            mesh.merge_vertices()
+            mesh.update_faces(mesh.nondegenerate_faces())
+            mesh.update_faces(mesh.unique_faces())
+            mesh.remove_unreferenced_vertices()
         return mesh
         
     def _extract_pure_quads(self, V: np.ndarray, F: np.ndarray, field: np.ndarray) -> Tuple[np.ndarray, List[List[int]]]:
@@ -458,7 +655,39 @@ class QuadWrapper:
                 targets, _, _ = trimesh.proximity.closest_point(ref_tm, targets)
             for vi, p in zip(vert_ids, targets):
                 mesh.vertices[vi].position = np.asarray(p, dtype=np.float64)
+
+        # Last resort: a quad that was already folded BEFORE relaxation cannot
+        # be fixed by reverting. One folded patch is enough for SolidWorks to
+        # reject the whole imported body, so force-convexify what is left by
+        # parallelogram completion (bounded local error of one quad size).
+        for _ in range(4):
+            bad = self._concave_quad_ids(mesh)
+            if not bad:
+                return
+            for fi in bad:
+                self._force_convex_quad(mesh, fi)
         left = len(self._concave_quad_ids(mesh))
         if left:
             print(f"Quad wrap: {left} concave quad(s) could not be untangled")
+
+    @staticmethod
+    def _force_convex_quad(mesh: HalfEdgeMesh, face_id: int) -> None:
+        """Reposition one corner so the quad becomes planar and convex.
+
+        For each corner r, parallelogram completion from the other three
+        (p[r] = p[r+1] - p[r+2] + p[r+3]) yields a convex planar quad; pick
+        the candidate that moves its vertex the least.
+        """
+        verts = mesh.get_face_vertices(mesh.faces[face_id])
+        if len(verts) != 4:
+            return
+        pos = [v.position.copy() for v in verts]
+        best = None
+        for r in range(4):
+            target = pos[(r + 1) % 4] - pos[(r + 2) % 4] + pos[(r + 3) % 4]
+            dist = np.linalg.norm(target - pos[r])
+            if best is None or dist < best[0]:
+                best = (dist, r, target)
+        _, r, target = best
+        verts[r].position = np.asarray(target, dtype=np.float64)
 

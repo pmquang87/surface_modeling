@@ -187,6 +187,23 @@ class TestDecimationRepair:
         assert repaired.is_watertight
 
 
+class TestForceConvexFallback:
+    def test_irreparably_concave_quad_gets_forced_convex(self):
+        """A quad that was concave BEFORE relaxation cannot be fixed by the
+        revert strategy; the parallelogram fallback must still fix it
+        (SolidWorks rejects a whole body over one folded patch)."""
+        verts = np.array([
+            [0, 0, 0], [2, 0, 0], [0.4, 0.4, 0], [0, 2, 0],  # reflex at idx 2
+        ], dtype=float)
+        mesh = HalfEdgeMesh.from_arrays(verts, [[0, 1, 2, 3]])
+        wrapper = QuadWrapper()
+        assert wrapper._concave_quad_ids(mesh) == [0]
+
+        fallback = np.array([v.position.copy() for v in mesh.vertices])
+        wrapper._repair_concave_quads(mesh, mesh, fallback)
+        assert wrapper._concave_quad_ids(mesh) == []
+
+
 class TestExpectedBodyCount:
     def test_debris_above_size_threshold_still_dropped(self):
         """A decimation fragment can be big enough to pass the size filter;
