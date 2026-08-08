@@ -191,20 +191,36 @@ class QuadWrapper:
                   f"undecimated mesh of {len(mesh.faces)} faces")
             decimated = mesh
 
-        decimated = self._repair_decimated(decimated)
-            
+        # Ground truth for how many bodies the cage may have: components of
+        # the INPUT mesh that are big enough to matter. Decimation fragments
+        # can exceed a pure size threshold (a 12-face scrap became a 24 mm^3
+        # phantom solid in the exported STEP), so the input body count is the
+        # reliable signal.
+        try:
+            input_components = mesh.split(only_watertight=False)
+            body_floor = max(16, int(0.0005 * len(mesh.faces)))
+            expected_bodies = max(1, sum(1 for c in input_components
+                                         if len(c.faces) >= body_floor))
+        except Exception:
+            expected_bodies = None
+
+        decimated = self._repair_decimated(decimated, expected_bodies=expected_bodies)
+
         return np.array(decimated.vertices), np.array(decimated.faces), np.zeros((len(decimated.vertices), 3))
 
-    def _repair_decimated(self, mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    def _repair_decimated(self, mesh: trimesh.Trimesh,
+                          expected_bodies: Optional[int] = None) -> trimesh.Trimesh:
         """Clean up quadric-decimation artifacts.
 
         fast_simplification routinely emits duplicated vertices, degenerate
         slivers, tiny debris components and a few non-manifold edges even for
         perfectly watertight input. Any of these corrupts the half-edge cage
         and later splits the sewn B-Rep into multiple shells.
-        """
-        from collections import Counter
 
+        expected_bodies: number of real bodies in the ORIGINAL mesh — at most
+        this many (largest) components survive, so decimation debris can never
+        become an extra solid in the exported B-Rep.
+        """
         mesh = mesh.copy()
         mesh.merge_vertices()
         mesh.update_faces(mesh.nondegenerate_faces())
@@ -217,11 +233,14 @@ class QuadWrapper:
         if len(components) > 1:
             min_faces = max(8, int(0.01 * len(mesh.faces)))
             keep = [c for c in components if len(c.faces) >= min_faces]
+            if expected_bodies is not None and len(keep) > expected_bodies:
+                keep = sorted(keep, key=lambda c: len(c.faces),
+                              reverse=True)[:expected_bodies]
             if keep and len(keep) < len(components):
                 dropped = len(components) - len(keep)
                 print(f"Quad wrap: dropped {dropped} debris component(s) "
-                      f"(< {min_faces} faces) after decimation")
-                mesh = trimesh.util.concatenate(keep)
+                      f"after decimation (kept {len(keep)})")
+                mesh = keep[0] if len(keep) == 1 else trimesh.util.concatenate(keep)
 
         # Remove extra faces on non-manifold edges (incidence > 2), keeping
         # the two largest faces, then close any holes this opened.

@@ -187,6 +187,31 @@ class TestDecimationRepair:
         assert repaired.is_watertight
 
 
+class TestExpectedBodyCount:
+    def test_debris_above_size_threshold_still_dropped(self):
+        """A decimation fragment can be big enough to pass the size filter;
+        the input body count must cap the surviving components regardless."""
+        import trimesh
+        main = trimesh.creation.icosphere(subdivisions=2)  # 320 faces
+        blob = trimesh.creation.icosphere(subdivisions=1)  # 80 faces > 1% size
+        blob.apply_translation([10, 0, 0])
+        dirty = trimesh.util.concatenate([main, blob])
+
+        repaired = QuadWrapper(target_face_count=100)._repair_decimated(
+            dirty, expected_bodies=1)
+        comps = repaired.split(only_watertight=False)
+        assert len(comps) == 1
+        assert len(comps[0].faces) == 320  # the largest body survived
+
+    def test_wrap_single_body_input_yields_single_component_cage(self):
+        import trimesh
+        dense = trimesh.creation.icosphere(subdivisions=4)
+        cage = QuadWrapper(target_face_count=300).wrap(
+            HalfEdgeMesh.from_trimesh(dense))
+        comps = cage.to_trimesh().split(only_watertight=False)
+        assert len(comps) == 1
+
+
 class TestLinearSubdivide:
     def test_subdivide_smooth_kwarg_accepted(self):
         from src.subd.primitives import create_box
