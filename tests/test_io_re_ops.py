@@ -180,16 +180,23 @@ def test_importer_obj_ngon_and_negative_coordinates():
 def test_importer_step():
     """The fixture STEP has an EMPTY data section.
 
-    There is no geometry to import, so pin the documented degenerate result
-    rather than accepting any object at all.
+    There is no geometry to import, so the import FAILS -- loudly. It used to
+    return an all-empty result dict, which is indistinguishable from a
+    successful import of an empty file and left every caller to notice by hand.
     """
-    res = import_step(STEP_FILE)
-    assert isinstance(res, dict)
-    assert set(res) >= {'shape', 'mesh', 'vertices', 'faces'}
-    assert res['shape'] is None, "an empty DATA section cannot yield a shape"
-    assert res['mesh'] is None
-    assert list(res['faces']) == []
-    assert len(np.asarray(res['vertices'])) == 0
+    with pytest.raises(ValueError) as excinfo:
+        import_step(STEP_FILE)
+    msg = str(excinfo.value)
+    assert STEP_FILE in msg, f"the error must name the file: {msg}"
+    assert 'status' in msg.lower() or 'null' in msg.lower(), (
+        f"the error must carry the OCP status/reason: {msg}")
+
+
+def test_importer_step_missing_file_still_raises_filenotfound():
+    """A path that does not exist is a different failure from an unreadable
+    file, and must stay distinguishable."""
+    with pytest.raises(FileNotFoundError):
+        import_step(os.path.join(tempfile.gettempdir(), 'no_such_file_12345.stp'))
 
 
 def test_importer_step_real_geometry():
@@ -420,17 +427,57 @@ def test_re_shrink_wrap_pulls_the_cage_onto_the_reference():
 # --------------------------------------------------------------------------
 
 def test_operations_shell():
+    """shell_solid returns the WALL, not a resized copy of the body.
+
+    Default direction='inward': the outer surface stays where the input surface
+    was and the inner one is offset in by `thickness`, so a 1x1x1 box keeps its
+    1x1x1 bounding box and encloses 1 - 0.8^3 of material. The old
+    implementation returned the offset isosurface alone -- a SOLID 0.8 box of
+    volume 0.512 -- which is what every assertion below rules out.
+    """
     box = create_box(width=1, height=1, depth=1)
     shelled = shell_solid(box, thickness=0.1)
     assert shelled is not None
     tm = shelled.to_trimesh()
-    # shell_solid returns the OFFSET SURFACE and defaults to direction='inward',
-    # so a 1x1x1 box comes back as a closed 0.8 box, marching-cubes tessellated.
     assert len(shelled.faces) > len(box.faces), "no isosurface was extracted"
     assert tm.is_watertight
-    assert np.allclose(tm.extents, [0.8, 0.8, 0.8], atol=0.02), (
-        f"body was not offset inward: extents {tm.extents}")
-    assert tm.volume == pytest.approx(0.8 ** 3, rel=0.02)
+    assert np.allclose(tm.extents, [1.0, 1.0, 1.0], atol=0.02), (
+        f"the outer wall must coincide with the input surface: extents {tm.extents}"
+    )
+    assert tm.volume == pytest.approx(1.0 - 0.8 ** 3, rel=0.05), (
+        f"expected a hollow wall of {1.0 - 0.8 ** 3:.3f}, got {tm.volume:.3f} "
+        f"(0.512 would mean a solid 0.8 box was returned)")
+
+    # Two closed surfaces -- outer and inner -- is what makes it hollow.
+    bodies = tm.split(only_watertight=False)
+    assert len(bodies) == 2, f"a hollow shell has 2 surfaces, got {len(bodies)}"
+    inner, outer = sorted(bodies, key=lambda b: b.extents.max())
+    assert np.allclose(outer.extents, [1.0, 1.0, 1.0], atol=0.02)
+    assert np.allclose(inner.extents, [0.8, 0.8, 0.8], atol=0.03)
+
+
+def test_operations_shell_outward_and_both():
+    """The other two directions place the same wall on the other side.
+
+    'outward' grows a wall outside the input surface, 'both' straddles it. The
+    ideal volumes below are the naive box-difference values; the SDF offset
+    rounds convex edges with radius `thickness`, so 'outward'/'both' land a few
+    percent under -- hence rel=0.06 rather than a tight bound.
+    """
+    for direction, bbox, ideal in (
+            ('outward', 1.2, 1.2 ** 3 - 1.0),
+            ('both', 1.1, 1.1 ** 3 - 0.9 ** 3),
+    ):
+        box = create_box(width=1, height=1, depth=1)
+        out = shell_solid(box, thickness=0.1, direction=direction)
+        tm = out.to_trimesh()
+        assert tm.is_watertight, direction
+        assert len(tm.split(only_watertight=False)) == 2, (
+            f"{direction}: result is not hollow")
+        assert np.allclose(tm.extents, [bbox] * 3, atol=0.02), (
+            f"{direction}: extents {tm.extents}, expected {bbox}")
+        assert tm.volume == pytest.approx(ideal, rel=0.06), (
+            f"{direction}: volume {tm.volume:.3f}, expected ~{ideal:.3f}")
 
 
 def test_operations_thicken():
@@ -449,15 +496,16 @@ def test_operations_thicken():
 
 
 def test_operations_zero_thickness():
-    """A zero shell is a zero offset: the body comes back at its original size
-    rather than raising or collapsing."""
+    """A wall of zero thickness is not a shell -- it must be rejected.
+
+    It used to be accepted as "offset by 0": a multi-second SDF+marching-cubes
+    round trip that handed the input body straight back.
+    """
     box = create_box(width=1, height=1, depth=1)
-    shelled = shell_solid(box, thickness=0.0)
-    tm = shelled.to_trimesh()
-    assert len(shelled.faces) > 0
-    assert tm.is_watertight
-    assert np.allclose(tm.extents, [1.0, 1.0, 1.0], atol=0.02)
-    assert tm.volume == pytest.approx(1.0, rel=0.02)
+    with pytest.raises(ValueError, match="thickness"):
+        shell_solid(box, thickness=0.0)
+    with pytest.raises(ValueError, match="thickness"):
+        shell_solid(box, thickness=-0.1)
 
 
 def test_operations_empty():

@@ -436,7 +436,13 @@ def decimate_mesh(mesh: HalfEdgeMesh, target_faces: int = None,
             new_t_mesh.remove_unreferenced_vertices()
             return HalfEdgeMesh.from_trimesh(new_t_mesh)
         except Exception as e:
-            print(f"Error generating trimesh during decimation: {e}")
+            warnings.warn(
+                f"decimate_mesh: rebuilding the trimesh after the frozen-vertex "
+                f"pass failed ({e}); returning an UNDECIMATED copy of the input "
+                f"-- the face count was NOT reduced.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return mesh.copy()
 
     try:
@@ -450,10 +456,21 @@ def decimate_mesh(mesh: HalfEdgeMesh, target_faces: int = None,
             decimated = t_mesh.simplify_quadric_decimation(target_faces)
             return HalfEdgeMesh.from_trimesh(decimated)
         except Exception as e:
-            print(f"Warning: decimation failed ({e}); returning original mesh")
+            warnings.warn(
+                f"decimate_mesh: quadric decimation failed ({e}); returning an "
+                f"UNDECIMATED copy of the input -- the face count was NOT "
+                f"reduced.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return mesh.copy()
     except Exception as e:
-        print(f"Warning: decimation failed ({e}); returning original mesh")
+        warnings.warn(
+            f"decimate_mesh: quadric decimation failed ({e}); returning an "
+            f"UNDECIMATED copy of the input -- the face count was NOT reduced.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return mesh.copy()
 
 def collapse_short_edges(t_mesh: 'trimesh.Trimesh',

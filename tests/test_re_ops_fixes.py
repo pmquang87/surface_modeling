@@ -17,6 +17,11 @@ J shrink_wrap subdivision_levels stored but never applied
 K shell_thicken voxel size mixed coordinate axes
 L shell_thicken assumed signed_distance is positive OUTSIDE (it is not)
 M shell_thicken thicken_surface ignored direction and doubled the wall
+N shell_thicken shell_solid returned the offset SOLID, never a hollow wall,
+             and accepted thickness <= 0 as a slow no-op
+O mesh_tools decimate_mesh printed and returned an undecimated copy, so the
+             caller could not tell degradation from success
+P quad_wrap  wrap() swallowed every failure and returned the input mesh
 """
 import os
 import sys
@@ -725,19 +730,60 @@ class TestSdfSign:
         assert len(tm.faces) > 0
         return tm.vertices.max(axis=0) - tm.vertices.min(axis=0)
 
-    def test_inward_shrinks_the_body(self):
+    @staticmethod
+    def _wall_extents(result):
+        """(outer, inner) bounding-box extents of a hollow shell.
+
+        A true shell has TWO closed surfaces; splitting them apart is what
+        tells a wall from a plain resized body, which has only one.
+        """
+        tm = result.to_trimesh()
+        bodies = tm.split(only_watertight=False)
+        assert len(bodies) == 2, (
+            f"expected a hollow wall (2 surfaces), got {len(bodies)} -- "
+            f"only the offset isosurface was returned")
+        inner, outer = sorted(bodies, key=lambda b: b.extents.max())
+        return outer.extents, inner.extents
+
+    def test_inward_hollows_the_body_keeping_the_outer_surface(self):
         box = trimesh.creation.box(extents=(20.0, 20.0, 20.0))
         mesh = HalfEdgeMesh.from_arrays(np.array(box.vertices), box.faces.tolist())
         out = shell_solid(mesh, thickness=2.0, direction='inward',
                           resolution=48, smooth_iterations=0)
-        assert self._extents_of(out) == pytest.approx([16.0] * 3, abs=0.6)
+        # The whole point of the fix: the result is the WALL, so the overall
+        # bounding box is the INPUT's, not the shrunken offset's.
+        assert self._extents_of(out) == pytest.approx([20.0] * 3, abs=0.6)
+        outer, inner = self._wall_extents(out)
+        assert outer == pytest.approx([20.0] * 3, abs=0.6)
+        assert inner == pytest.approx([16.0] * 3, abs=0.6)
+        assert out.to_trimesh().volume == pytest.approx(20.0 ** 3 - 16.0 ** 3,
+                                                        rel=0.05)
 
-    def test_outward_grows_the_body(self):
+    def test_outward_hollows_outside_keeping_the_inner_surface(self):
         box = trimesh.creation.box(extents=(20.0, 20.0, 20.0))
         mesh = HalfEdgeMesh.from_arrays(np.array(box.vertices), box.faces.tolist())
         out = shell_solid(mesh, thickness=2.0, direction='outward',
                           resolution=48, smooth_iterations=0)
         assert self._extents_of(out) == pytest.approx([24.0] * 3, abs=0.6)
+        outer, inner = self._wall_extents(out)
+        assert outer == pytest.approx([24.0] * 3, abs=0.6)
+        assert inner == pytest.approx([20.0] * 3, abs=0.6)
+
+    def test_both_straddles_the_input_surface(self):
+        box = trimesh.creation.box(extents=(20.0, 20.0, 20.0))
+        mesh = HalfEdgeMesh.from_arrays(np.array(box.vertices), box.faces.tolist())
+        out = shell_solid(mesh, thickness=2.0, direction='both',
+                          resolution=48, smooth_iterations=0)
+        outer, inner = self._wall_extents(out)
+        assert outer == pytest.approx([22.0] * 3, abs=0.6)
+        assert inner == pytest.approx([18.0] * 3, abs=0.6)
+
+    def test_thickness_must_be_positive(self):
+        box = trimesh.creation.box(extents=(20.0, 20.0, 20.0))
+        mesh = HalfEdgeMesh.from_arrays(np.array(box.vertices), box.faces.tolist())
+        for bad in (0.0, -1.0, float('nan')):
+            with pytest.raises(ValueError, match="thickness"):
+                shell_solid(mesh, thickness=bad, resolution=8)
 
     def test_far_from_origin_body_still_shells_correctly(self):
         box = trimesh.creation.box(extents=(20.0, 20.0, 20.0))
@@ -746,7 +792,9 @@ class TestSdfSign:
         out = shell_solid(mesh, thickness=2.0, direction='inward',
                           resolution=48, smooth_iterations=0)
         tm = out.to_trimesh()
-        assert self._extents_of(out) == pytest.approx([16.0] * 3, abs=0.8)
+        assert self._extents_of(out) == pytest.approx([20.0] * 3, abs=0.8)
+        outer, inner = self._wall_extents(out)
+        assert inner == pytest.approx([16.0] * 3, abs=0.8)
         centre = (tm.vertices.max(axis=0) + tm.vertices.min(axis=0)) / 2
         assert centre == pytest.approx([1150.0, 17.0, 78.0], abs=0.8)
 
@@ -841,6 +889,112 @@ class TestThickenSurface:
                               resolution=self.RES, smooth_iterations=0)
         lo, hi = self._z_span(out, footprint=4.0, offset=(1150.0, 0.0))
         assert hi - lo == pytest.approx(self.T, abs=0.05)
+
+
+# --------------------------------------------------------------------------
+# O. mesh_tools: decimate_mesh SIGNALS its fallbacks
+# --------------------------------------------------------------------------
+
+class TestDecimateMeshWarnsOnFallback:
+    @staticmethod
+    def _sphere_mesh():
+        sphere = trimesh.creation.icosphere(subdivisions=2)
+        return HalfEdgeMesh.from_arrays(np.array(sphere.vertices),
+                                        sphere.faces.tolist())
+
+    def test_quadric_failure_warns_and_degrades_gracefully(self, monkeypatch):
+        """Returning the copy is fine -- returning it SILENTLY is not."""
+        mesh = self._sphere_mesh()
+
+        def boom(self, *args, **kwargs):
+            raise RuntimeError("simulated fast_simplification crash")
+
+        monkeypatch.setattr(trimesh.Trimesh, "simplify_quadric_decimation",
+                            boom, raising=True)
+
+        with pytest.warns(RuntimeWarning, match="decimation failed"):
+            out = decimate_mesh(mesh, target_faces=20)
+
+        # graceful degradation: the input still comes back, undecimated
+        assert len(out.faces) == len(mesh.faces)
+
+    def test_frozen_path_rebuild_failure_warns(self, monkeypatch):
+        mesh = self._sphere_mesh()
+        real_trimesh = trimesh.Trimesh
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated Trimesh construction crash")
+
+        # only the reconstruction inside the frozen branch must fail; the
+        # to_trimesh() call that precedes it has to keep working
+        calls = {"n": 0}
+
+        def maybe_boom(*args, **kwargs):
+            calls["n"] += 1
+            if kwargs.get("process") is False and calls["n"] > 1:
+                boom()
+            return real_trimesh(*args, **kwargs)
+
+        monkeypatch.setattr(trimesh, "Trimesh", maybe_boom)
+        with pytest.warns(RuntimeWarning, match="frozen-vertex"):
+            out = decimate_mesh(mesh, target_faces=20, frozen_vertices=[0, 1, 2])
+        assert len(out.faces) == len(mesh.faces)
+
+    def test_successful_decimation_warns_about_nothing(self):
+        mesh = self._sphere_mesh()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            out = decimate_mesh(mesh, target_faces=40)
+        assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        assert len(out.faces) < len(mesh.faces)
+
+
+# --------------------------------------------------------------------------
+# P. quad_wrap: wrap() reports total failure instead of returning the input
+# --------------------------------------------------------------------------
+
+class TestQuadWrapStrict:
+    @staticmethod
+    def _mesh():
+        sphere = trimesh.creation.icosphere(subdivisions=2)
+        return HalfEdgeMesh.from_arrays(np.array(sphere.vertices),
+                                        sphere.faces.tolist())
+
+    @staticmethod
+    def _break_pipeline(monkeypatch):
+        def boom(self, *args, **kwargs):
+            raise RuntimeError("simulated quadrangulation crash")
+        monkeypatch.setattr(QuadWrapper, "_miq_parametrization", boom)
+
+    def test_strict_is_the_default_and_raises(self, monkeypatch):
+        self._break_pipeline(monkeypatch)
+        with pytest.raises(RuntimeError, match="quad wrap failed"):
+            QuadWrapper(target_face_count=40).wrap(self._mesh())
+
+    def test_the_original_cause_is_chained(self, monkeypatch):
+        self._break_pipeline(monkeypatch)
+        with pytest.raises(RuntimeError) as excinfo:
+            QuadWrapper(target_face_count=40).wrap(self._mesh())
+        assert "simulated quadrangulation crash" in str(excinfo.value.__cause__)
+
+    def test_non_strict_warns_and_returns_a_copy(self, monkeypatch):
+        self._break_pipeline(monkeypatch)
+        mesh = self._mesh()
+        with pytest.warns(RuntimeWarning, match="quad wrap failed"):
+            out = QuadWrapper(target_face_count=40).wrap(mesh, strict=False)
+        assert out is not mesh
+        assert len(out.faces) == len(mesh.faces), (
+            "non-strict mode still degrades to the untouched input")
+
+    def test_a_healthy_wrap_neither_warns_nor_raises(self):
+        mesh = self._mesh()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            out = QuadWrapper(target_face_count=40).wrap(mesh)
+        assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        assert out is not mesh
+        assert len(out.faces) > 0
+        assert all(len(out.get_face_vertices(f)) == 4 for f in out.faces)
 
 
 if __name__ == '__main__':

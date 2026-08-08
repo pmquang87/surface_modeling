@@ -2,8 +2,12 @@ import numpy as np
 from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime
 
+# '__weakref__' is listed in every element's __slots__ on purpose: without it a
+# slotted class cannot be the target of a weakref, so leak audits (does this
+# mesh's storage actually die?) have no way to observe an element without
+# keeping it alive. It costs one pointer per element.
 class Vertex:
-    __slots__ = ['position', 'normal', 'half_edge', 'index', 'selected']
+    __slots__ = ['position', 'normal', 'half_edge', 'index', 'selected', '__weakref__']
     def __init__(self, position: np.ndarray, index: int):
         self.position: np.ndarray = np.array(position, dtype=np.float64)
         self.normal: np.ndarray = np.zeros(3, dtype=np.float64)
@@ -12,7 +16,7 @@ class Vertex:
         self.selected: bool = False
 
 class Face:
-    __slots__ = ['half_edge', 'normal', 'index', 'material_id', 'selected']
+    __slots__ = ['half_edge', 'normal', 'index', 'material_id', 'selected', '__weakref__']
     def __init__(self, index: int):
         self.half_edge: Optional['HalfEdge'] = None
         self.normal: np.ndarray = np.zeros(3, dtype=np.float64)
@@ -21,7 +25,7 @@ class Face:
         self.selected: bool = False
 
 class Edge:
-    __slots__ = ['half_edge', 'crease_weight', 'index', 'selected']
+    __slots__ = ['half_edge', 'crease_weight', 'index', 'selected', '__weakref__']
     def __init__(self, index: int):
         self.half_edge: Optional['HalfEdge'] = None
         self.crease_weight: float = 0.0
@@ -29,7 +33,7 @@ class Edge:
         self.selected: bool = False
 
 class HalfEdge:
-    __slots__ = ['vertex', 'face', 'next', 'prev', 'twin', 'edge', 'index']
+    __slots__ = ['vertex', 'face', 'next', 'prev', 'twin', 'edge', 'index', '__weakref__']
     def __init__(self, index: int):
         self.vertex: Optional[Vertex] = None
         self.face: Optional[Face] = None

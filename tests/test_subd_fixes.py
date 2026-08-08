@@ -874,21 +874,58 @@ def test_mirror_mesh_keeps_geometry_when_nothing_is_on_the_plane():
 
 
 def test_mirror_mesh_is_not_quadratic():
-    """Finding 9: the merge rebuilt an (N,3) array for every single vertex."""
+    """Finding 9: the merge rebuilt an (N,3) array for every single vertex.
+
+    Also pins the symmetric-input contract (see the dedicated test below): a
+    subdivided box is symmetric about x = 0, so mirroring it is an identity.
+    """
     mesh = subdivide(create_box(), 4)
     assert len(mesh.vertices) > 1000
     t0 = time.perf_counter()
     out = mirror_mesh(mesh, axis='x')
     dt = time.perf_counter() - t0
-    # `>= len(mesh.faces)` accepts a mirror that produced nothing as long as it
-    # was fast. No face of a subdivided box lies wholly in x = 0, so every face
-    # must have been reflected; the box is symmetric about x = 0, so every
-    # mirrored vertex merges back onto an existing one.
-    assert len(out.faces) == 2 * len(mesh.faces), \
-        f"mirroring gave {len(out.faces)} faces, expected {2 * len(mesh.faces)}"
+    # No face of a subdivided box lies wholly in x = 0, so every face IS
+    # reflected; the box is symmetric about x = 0, so every mirrored vertex
+    # merges back onto an existing one and every reflection lands on a face
+    # that is already there.
+    assert len(out.faces) == len(mesh.faces), \
+        f"mirroring gave {len(out.faces)} faces, expected {len(mesh.faces)}"
     assert len(out.vertices) == len(mesh.vertices), \
         f"merge failed: {len(out.vertices)} vertices, expected {len(mesh.vertices)}"
     assert dt < 5.0, f"mirroring {len(mesh.vertices)} vertices took {dt:.1f}s"
+
+
+def test_mirror_mesh_of_an_already_symmetric_body_is_an_identity():
+    """A mesh already symmetric about the plane must not gain a second shell.
+
+    Every mirrored vertex merged onto an existing one, but the reversed copy of
+    every face was appended anyway: 1536 -> 3072 faces on the SAME vertices,
+    i.e. a zero-thickness double shell with two faces on every triangle. That
+    is not watertight-with-volume, it is a degenerate solid.
+    """
+    mesh = subdivide(create_box(), 2)
+    before_faces, before_verts = len(mesh.faces), len(mesh.vertices)
+    before_volume = mesh.to_trimesh().volume
+
+    out = mirror_mesh(mesh, axis='x')
+
+    assert len(out.faces) == before_faces, \
+        f"double shell: {len(out.faces)} faces from {before_faces}"
+    assert len(out.vertices) == before_verts, \
+        f"{len(out.vertices)} vertices from {before_verts}"
+
+    # No face may appear twice -- that is the actual defect, and equal counts
+    # alone would also pass for an implementation that dropped real faces.
+    keys = [frozenset(v.index for v in out.get_face_vertices(f)) for f in out.faces]
+    assert len(set(keys)) == len(keys), "a face vertex-set is repeated"
+    assert set(keys) == {frozenset(v.index for v in mesh.get_face_vertices(f))
+                         for f in mesh.faces}, "the face set changed"
+
+    tm = out.to_trimesh()
+    assert tm.is_watertight, "the mirrored symmetric body is no longer closed"
+    assert tm.volume == pytest.approx(before_volume, rel=1e-9), \
+        "mirroring a symmetric body changed its volume"
+    assert_no_repeated_directed_edge(out)
 
 
 # --------------------------------------------------------------------------

@@ -201,19 +201,22 @@ def test_quad_wrapper_random_topology_no_crash(mesh_data):
     assert len(mesh.faces) > 0
 
     wrapper = QuadWrapper(target_face_count=10)
-    # wrap() swallows every exception internally and returns the untouched
-    # dense triangle mesh, so "it returned a HalfEdgeMesh" is also what a total
-    # pipeline failure looks like. Capture the give-up message to tell them
-    # apart.
+    # wrap() is strict by default: on a garbage soup it either produces a real
+    # pure-quad cage or RAISES. What it must never do is quietly hand the
+    # untouched dense triangle mesh back, which looks exactly like success to
+    # the caller and yields zero NURBS patches downstream.
     log = io.StringIO()
     with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
-        result = wrapper.wrap(mesh)
+        try:
+            result = wrapper.wrap(mesh)
+        except RuntimeError:
+            return  # a signalled failure is an acceptable outcome
     output = log.getvalue()
 
     assert isinstance(result, HalfEdgeMesh)
+    assert result is not mesh
     assert 'quad wrap failed' not in output, \
         f"quad wrap fell back to the unmodified input mesh:\n{output}"
-    assert result is not mesh
 
     # whatever came back must be a pure quad cage (an empty cage is allowed:
     # decimation can legitimately erase a soup of unconnected triangles)

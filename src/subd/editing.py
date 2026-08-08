@@ -318,6 +318,12 @@ def mirror_mesh(mesh: HalfEdgeMesh, axis: str = 'x', merge_distance: float = 0.0
     A face whose vertices all lie in the mirror plane maps onto itself, so its
     reflection is dropped instead of being stacked on top of the original as a
     zero-thickness double wall.
+
+    The same applies to a body that is ALREADY symmetric about the plane: every
+    mirrored vertex merges back onto an existing one, so every reflected face
+    lands on a face that is already there. Reflections whose vertex set repeats
+    a face already in the result are dropped, so mirroring a symmetric mesh is
+    an identity instead of a doubled, zero-thickness shell.
     """
     faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
     n_orig = len(mesh.vertices)
@@ -369,11 +375,22 @@ def mirror_mesh(mesh: HalfEdgeMesh, axis: str = 'x', merge_distance: float = 0.0
     on_plane = np.abs(positions[:, axis_idx]) <= merge_distance
 
     new_faces = list(faces)
+    # Vertex sets already present, so a reflection that lands on an existing
+    # face can be recognised regardless of winding or starting corner.
+    seen = {frozenset(int(i) for i in f) for f in faces if f}
     for f in faces:
         if f and all(on_plane[idx] for idx in f):
             # Its own reflection: adding it again would double-wall the surface.
             continue
-        new_faces.append([int(remap[idx]) for idx in f[::-1]])
+        reflected = [int(remap[idx]) for idx in f[::-1]]
+        key = frozenset(reflected)
+        if key in seen:
+            # Already-symmetric input: the reflection coincides with a face
+            # that is already there. Appending it would build a second, reverse
+            # -wound shell on the very same vertices.
+            continue
+        seen.add(key)
+        new_faces.append(reflected)
 
     return HalfEdgeMesh.from_arrays(all_verts, new_faces)
 

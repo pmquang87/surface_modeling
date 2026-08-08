@@ -77,7 +77,19 @@ class QuadWrapper:
             stacklevel=3,
         )
 
-    def wrap(self, reference_mesh: HalfEdgeMesh, frozen_face_ids: Optional[List[int]] = None) -> HalfEdgeMesh:
+    def wrap(self, reference_mesh: HalfEdgeMesh,
+             frozen_face_ids: Optional[List[int]] = None,
+             strict: bool = True) -> HalfEdgeMesh:
+        """Build a pure-quad control cage wrapped around `reference_mesh`.
+
+        Args:
+            strict: what happens when the quadrangulation stage fails outright.
+                True (default) re-raises as a RuntimeError, so the caller can
+                actually detect a total failure. False keeps the legacy
+                graceful degradation -- a RuntimeWarning plus a copy of the
+                untouched dense triangle mesh -- which looks like success to
+                every caller and silently yields zero NURBS patches downstream.
+        """
         if frozen_face_ids:
             self._warn_unimplemented(frozen=True)
 
@@ -95,13 +107,19 @@ class QuadWrapper:
             quad_V, quad_F = self._extract_pure_quads(param_V, param_F, param_field)
 
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"WARNING: quad wrap failed ({e}); returning the ORIGINAL dense "
-                  f"triangle mesh unchanged — downstream NURBS conversion will "
-                  f"find no quads and produce no patches.")
+            if strict:
+                raise RuntimeError(f"quad wrap failed: {e}") from e
+            warnings.warn(
+                f"quad wrap failed ({e}); returning the ORIGINAL dense triangle "
+                f"mesh unchanged -- downstream NURBS conversion will find no "
+                f"quads and produce no patches. Pass strict=True to raise "
+                f"instead.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return reference_mesh.copy()
-        
+
+
         # Build the initial pure quad mesh
         he_mesh = HalfEdgeMesh()
         vertex_map = {}

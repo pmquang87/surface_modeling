@@ -51,8 +51,16 @@ class SubDToNURBSConverter:
                 
         return grid
 
-    def generate_patches(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3,
+    def generate_patches(self, mesh: HalfEdgeMesh,
                          reference_mesh: Optional[HalfEdgeMesh] = None) -> List[Any]:
+        """Fit one 6x6 Bezier patch per quad face of `mesh`.
+
+        There is no subdivision step: the cage is fitted at the density it
+        arrives with. (An unused ``subdivision_levels`` argument used to be
+        accepted here and in ``convert`` -- it was never read; use
+        ``src.subd.catmull_clark.subdivide`` on the cage beforehand if you want
+        a denser one.)
+        """
         ref_tm = None
         if reference_mesh is not None and len(reference_mesh.faces) > 0:
             ref_tm = reference_mesh.to_trimesh()
@@ -241,7 +249,7 @@ class SubDToNURBSConverter:
             print(f"Shell-to-solid promotion failed: {e}")
             return shape
 
-    def convert(self, mesh: HalfEdgeMesh, subdivision_levels: int = 3, simplify: bool = False,
+    def convert(self, mesh: HalfEdgeMesh, simplify: bool = False,
                 reference_mesh: Optional[HalfEdgeMesh] = None) -> Dict[str, Any]:
         """Convert Sub-D mesh to a sewed TopoDS_Shape using cadquery-ocp.
 
@@ -249,7 +257,7 @@ class SubDToNURBSConverter:
         given, patches are fitted to that surface instead of a synthetic
         approximation of the Catmull-Clark limit surface.
         """
-        patches = self.generate_patches(mesh, subdivision_levels, reference_mesh=reference_mesh)
+        patches = self.generate_patches(mesh, reference_mesh=reference_mesh)
         shape = self.build_shape(patches, simplify=simplify)
         return {
             'shape': shape,

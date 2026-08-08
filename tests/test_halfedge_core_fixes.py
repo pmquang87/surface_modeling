@@ -484,3 +484,48 @@ def test_to_pyvista_with_faces_still_works():
     # ...and that the point array carries coordinates, not just a length.
     assert np.allclose(poly.points[8], [2.0, 2.0, 0.0])
     assert np.allclose(poly.points[0], [0.0, 0.0, 0.0])
+
+
+# ---------------------------------------------------------------------------
+# mesh elements must be weak-referenceable
+# ---------------------------------------------------------------------------
+
+def test_mesh_elements_are_weak_referenceable():
+    """Vertex/Face/Edge/HalfEdge use __slots__, which suppresses __weakref__
+    unless it is listed explicitly. Without it a leak audit cannot observe an
+    element at all: any handle it keeps is a strong one that prevents the very
+    collection it is trying to measure."""
+    import weakref
+
+    mesh = make_quad_grid(3, 3)
+    refs = {
+        "vertex": weakref.ref(mesh.vertices[0]),
+        "face": weakref.ref(mesh.faces[0]),
+        "edge": weakref.ref(mesh.edges[0]),
+        "half_edge": weakref.ref(mesh.half_edges[0]),
+    }
+    for name, ref in refs.items():
+        assert ref() is not None, f"{name} weakref is already dead"
+    assert refs["vertex"]() is mesh.vertices[0]
+    assert refs["face"]() is mesh.faces[0]
+    assert refs["edge"]() is mesh.edges[0]
+    assert refs["half_edge"]() is mesh.half_edges[0]
+
+
+def test_mesh_elements_die_with_the_mesh():
+    """The point of the weakrefs: they must actually go None once the mesh is
+    dropped, otherwise the audit reports a leak that is not there (or misses
+    one that is)."""
+    import gc
+    import weakref
+
+    mesh = make_quad_grid(3, 3)
+    refs = [weakref.ref(mesh.vertices[0]), weakref.ref(mesh.faces[0]),
+            weakref.ref(mesh.edges[0]), weakref.ref(mesh.half_edges[0])]
+
+    del mesh
+    gc.collect()
+
+    assert [r() for r in refs] == [None, None, None, None], (
+        "mesh elements outlived the mesh -- the half-edge graph is a reference "
+        "cycle, so this needs a gc pass, not just refcounting")

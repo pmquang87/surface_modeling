@@ -193,8 +193,9 @@ def test_nurbs_continuity():
         "the cage handed to the converter must be pure quad"
 
     converter = SubDToNURBSConverter(continuity='G2', tolerance=1e-4)
-    # NOTE: generate_patches ignores subdivision_levels entirely, so it is not
-    # passed here -- see the product note in the module docstring of the audit.
+    # NOTE: generate_patches has no subdivision_levels parameter -- it used to
+    # accept one and never read it; the cage is fitted at the density it
+    # arrives with.
     patches = converter.generate_patches(quad_mesh)
 
     # one patch per cage quad, each a degree-5 (6x6) control grid

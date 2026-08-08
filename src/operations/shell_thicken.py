@@ -102,7 +102,7 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
 def _marching_cubes(sdf_grid: np.ndarray, level: float,
                     grid_origin: np.ndarray, voxel_size: float) -> Tuple[np.ndarray, np.ndarray]:
     """Extract isosurface from SDF using marching cubes.
-    
+
     Returns (vertices, faces) arrays.
     """
     try:
@@ -119,7 +119,7 @@ def _marching_cubes(sdf_grid: np.ndarray, level: float,
 
 def _offset_along_normals(mesh: HalfEdgeMesh, distance: float) -> HalfEdgeMesh:
     """Simple normal-based offset (used as fallback).
-    
+
     Move each vertex along its normal by the given distance.
     This is the naive approach that fails on complex geometry.
     """
@@ -132,7 +132,7 @@ def _offset_along_normals(mesh: HalfEdgeMesh, distance: float) -> HalfEdgeMesh:
 
 def _fix_self_intersections(mesh: HalfEdgeMesh) -> HalfEdgeMesh:
     """Detect and repair self-intersecting faces.
-    
+
     Uses spatial hashing to find intersecting face pairs,
     then resolves by local remeshing.
     """
@@ -170,40 +170,117 @@ def _padding_for(vertices: np.ndarray, offset: float) -> float:
     return float(max(0.1, 2.0 * abs(offset) / max_extent))
 
 
+def _band_for(thickness: float, direction: str) -> Tuple[float, float]:
+    """(centre, half) of the wall band for `direction`.
+
+    The wall is always the slab ``centre - half <= sd <= centre + half``, i.e.
+    exactly `thickness` thick; `direction` only decides where that slab sits
+    relative to the input surface (which is sd == 0):
+
+        'inward'  -> [-thickness, 0]   input surface is the OUTER wall
+        'outward' -> [0, +thickness]   input surface is the INNER wall
+        'both'    -> [-thickness/2, +thickness/2]
+    """
+    half = abs(thickness) / 2.0
+    if direction == 'outward':
+        return half, half
+    if direction == 'inward':
+        return -half, half
+    return 0.0, half
+
+
+def _extract_wall_band(vertices: np.ndarray, faces: np.ndarray,
+                       centre: float, half: float,
+                       resolution: int, smooth_iterations: int,
+                       open_surface: bool,
+                       fallback_mesh: HalfEdgeMesh) -> HalfEdgeMesh:
+    """Closed surface bounding the slab ``centre - half <= sd <= centre + half``.
+
+    The boundary of that slab is the level set ``|sd - centre| == half``, so a
+    SINGLE marching-cubes pass extracts BOTH walls at once (plus, for an open
+    input sheet, the caps that join them) as one watertight mesh. That band
+    trick is what performs the "subtract the offset body from the original"
+    step -- no boolean operation is involved.
+
+    Args:
+        open_surface: sign the distance field by the nearest triangle's normal
+            (needed for sheets) instead of by containment (closed solids).
+        fallback_mesh: offset along its own normals and returned if marching
+            cubes is unavailable or fails.
+    """
+    padding = _padding_for(vertices, abs(centre) + half)
+    sdf_grid, grid_origin, voxel_size = _compute_sdf(
+        vertices, faces, resolution, padding=padding, open_surface=open_surface
+    )
+
+    try:
+        field = np.abs(sdf_grid - centre)
+        wall_verts, wall_faces = _marching_cubes(field, half, grid_origin, voxel_size)
+        if len(wall_verts) > 0:
+            result_mesh = HalfEdgeMesh.from_arrays(wall_verts, wall_faces.tolist())
+            _smooth_mesh(result_mesh, smooth_iterations)
+            return _fix_self_intersections(result_mesh)
+    except Exception as e:
+        print(f"SDF wall extraction failed, falling back to normal offset: {e}")
+    return _offset_along_normals(fallback_mesh, centre)
+
+
 def shell_solid(mesh: HalfEdgeMesh, thickness: float = 1.0,
                 direction: str = 'inward',
                 excluded_faces: Optional[List[int]] = None,
                 resolution: int = 64,
                 smooth_iterations: int = 3) -> HalfEdgeMesh:
-    """Create a thin-walled shell from a solid mesh body.
-    
-    Unlike traditional CAD offset which fails on high-curvature geometry,
-    this uses a point-cloud/voxel-based approach to handle self-intersections.
-    
+    """Hollow out a solid body, leaving a wall `thickness` thick.
+
+    The result is the WALL itself, not a resized copy of the body: a closed,
+    watertight mesh with TWO surfaces -- one where the input surface was, one
+    offset from it by `thickness` -- bounding the material in between. A 1x1x1
+    box shelled inward by 0.1 therefore keeps its 1x1x1 bounding box and has a
+    volume of 1 - 0.8^3 = 0.488; it does NOT come back as a solid 0.8 box.
+
+    Unlike traditional CAD offset, which fails on high-curvature geometry, this
+    uses a voxel/SDF approach that cannot self-intersect.
+
     Algorithm:
-    1. Compute signed distance field (SDF) from the input mesh
-       - Voxelize the bounding box at the given resolution
-       - For each voxel, compute signed distance to the mesh surface
-    2. Create offset surface by extracting the isosurface at distance=thickness
-       - Use marching cubes on the SDF
-    3. Boolean subtract offset from original (or just return offset shell)
-    4. Smooth the result to remove voxelization artifacts
-    5. Handle excluded faces (leave open holes for those faces)
-    
+    1. Compute a signed distance field (SDF) over the padded bounding box
+       (positive OUTSIDE -- see ``_compute_sdf``).
+    2. The wall is the slab ``centre - t/2 <= sd <= centre + t/2``, with
+       ``centre`` chosen by `direction`. Its boundary is the level set
+       ``|sd - centre| == t/2``, so ONE marching-cubes pass produces the
+       original-side and the offset-side surface together -- that single pass
+       is what makes the result hollow. Shared with ``thicken_surface`` in
+       ``_extract_wall_band``.
+    3. Smooth the result to remove voxelization artifacts.
+    4. Handle excluded faces (leave open holes for those faces).
+
+    Accuracy: the walls sit where asked to within about half a voxel, so the
+    enclosed volume is good to a few percent at the default resolution; raise
+    `resolution` for a thin wall on a large part (the wall must span several
+    voxels or marching cubes cannot resolve it at all).
+
     Args:
         mesh: Input solid mesh
-        thickness: Wall thickness
-        direction: which way the offset surface moves --
-            'inward'  = shrink the body by `thickness`
-            'outward' = grow the body by `thickness`
-            'both'    = grow by `thickness / 2` (the outer face of a wall
-                        centred on the input surface)
+        thickness: Wall thickness; must be strictly positive
+        direction: where the wall sits relative to the input surface --
+            'inward'  = material inside it (input surface = OUTER wall)
+            'outward' = material outside it (input surface = INNER wall)
+            'both'    = straddles it, half the wall on either side
         excluded_faces: Face indices to exclude (create openings)
         resolution: Voxel grid resolution (higher = more precise but slower)
         smooth_iterations: Post-processing smooth passes
 
-    Returns: HalfEdgeMesh of the offset (shell) surface
+    Returns: HalfEdgeMesh of the hollow shell (the wall)
+
+    Raises:
+        ValueError: if `thickness` is not strictly positive. A wall of zero
+            thickness is not a shell; it used to be silently accepted as
+            "offset by 0", i.e. a multi-second no-op returning the input body.
     """
+    if not np.isfinite(thickness) or thickness <= 0:
+        raise ValueError(
+            f"shell_solid: thickness must be > 0, got {thickness!r}; "
+            f"a shell with no wall is not a shell")
+
     if len(mesh.vertices) == 0:
         return mesh.copy()
 
@@ -216,7 +293,7 @@ def shell_solid(mesh: HalfEdgeMesh, thickness: float = 1.0,
         faces = arrays['faces']
         valid_faces = [f for i, f in enumerate(faces) if i not in excluded_faces]
         open_mesh = HalfEdgeMesh.from_arrays(verts, valid_faces)
-        
+
         # Thicken the open mesh
         return thicken_surface(open_mesh, thickness, direction, resolution, smooth_iterations)
 
@@ -224,32 +301,10 @@ def shell_solid(mesh: HalfEdgeMesh, thickness: float = 1.0,
     verts = np.asarray(tm.vertices, dtype=np.float64)
     tri_faces = np.asarray(tm.faces)
 
-    # Signed offset along the OUTWARD normal direction.
-    if direction == 'inward':
-        offset = -abs(thickness)
-    elif direction == 'outward':
-        offset = abs(thickness)
-    else:  # both
-        offset = abs(thickness) / 2.0
-
-    padding = _padding_for(verts, offset)
-    sdf_grid, grid_origin, voxel_size = _compute_sdf(verts, tri_faces, resolution, padding=padding)
-
-    # _compute_sdf is positive OUTSIDE, so the surface offset outward by d is
-    # exactly the level set sdf == d (and d < 0 shrinks the body).
-    level = offset
-
-    try:
-        shell_verts, shell_faces = _marching_cubes(sdf_grid, level, grid_origin, voxel_size)
-        if len(shell_verts) > 0:
-            result_mesh = HalfEdgeMesh.from_arrays(shell_verts, shell_faces.tolist())
-            _smooth_mesh(result_mesh, smooth_iterations)
-            return _fix_self_intersections(result_mesh)
-        else:
-            return _offset_along_normals(mesh, offset)
-    except Exception as e:
-        print(f"SDF shelling failed, falling back to normal offset: {e}")
-        return _offset_along_normals(mesh, offset)
+    centre, half = _band_for(thickness, direction)
+    return _extract_wall_band(verts, tri_faces, centre, half,
+                              resolution, smooth_iterations,
+                              open_surface=False, fallback_mesh=mesh)
 
 
 def thicken_surface(mesh: HalfEdgeMesh, thickness: float = 1.0,
@@ -257,10 +312,10 @@ def thicken_surface(mesh: HalfEdgeMesh, thickness: float = 1.0,
                     resolution: int = 64,
                     smooth_iterations: int = 3) -> HalfEdgeMesh:
     """Thicken a surface body to create a solid with uniform wall thickness.
-    
+
     For open surface meshes: creates a solid by offsetting in the specified
     direction and closing the boundary.
-    
+
     Algorithm:
     1. Compute an oriented distance field from the input surface (positive on
        the +normal / 'outward' side)
@@ -299,31 +354,7 @@ def thicken_surface(mesh: HalfEdgeMesh, thickness: float = 1.0,
     verts = np.asarray(tm.vertices, dtype=np.float64)
     tri_faces = np.asarray(tm.faces)
 
-    half = abs(thickness) / 2.0
-    if direction == 'outward':
-        centre = half
-    elif direction == 'inward':
-        centre = -half
-    else:  # both
-        centre = 0.0
-
-    # Room for the far side of the wall plus slack.
-    padding = _padding_for(verts, abs(centre) + half)
-    sdf_grid, grid_origin, voxel_size = _compute_sdf(
-        verts, tri_faces, resolution, padding=padding, open_surface=True
-    )
-
-    try:
-        # |sd - centre| == half is exactly the boundary of the requested slab.
-        field = np.abs(sdf_grid - centre)
-        thick_verts, thick_faces = _marching_cubes(field, half, grid_origin, voxel_size)
-
-        if len(thick_verts) > 0:
-            result_mesh = HalfEdgeMesh.from_arrays(thick_verts, thick_faces.tolist())
-            _smooth_mesh(result_mesh, smooth_iterations)
-            return _fix_self_intersections(result_mesh)
-        else:
-            return _offset_along_normals(mesh, centre)
-    except Exception as e:
-        print(f"SDF thickening failed, falling back to normal offset: {e}")
-        return _offset_along_normals(mesh, centre)
+    centre, half = _band_for(thickness, direction)
+    return _extract_wall_band(verts, tri_faces, centre, half,
+                              resolution, smooth_iterations,
+                              open_surface=True, fallback_mesh=mesh)

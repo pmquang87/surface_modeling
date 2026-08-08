@@ -578,7 +578,7 @@ def test_continuity_is_passed_as_the_string_the_backend_expects(window, monkeypa
             captured['continuity'] = continuity
             captured['tolerance'] = tolerance
 
-        def convert(self, mesh, subdivision_levels=3, simplify=False, reference_mesh=None):
+        def convert(self, mesh, simplify=False, reference_mesh=None):
             captured['reference_mesh'] = reference_mesh
             return {'shape': None, 'mesh': None, 'patches': []}
 
@@ -654,7 +654,7 @@ def test_convert_nurbs_forwards_the_loaded_reference_mesh(window, monkeypatch):
         def __init__(self, continuity='G2', tolerance=1e-4):
             pass
 
-        def convert(self, mesh, subdivision_levels=3, simplify=False, reference_mesh=None):
+        def convert(self, mesh, simplify=False, reference_mesh=None):
             captured['reference_mesh'] = reference_mesh
             return {'shape': None, 'mesh': None, 'patches': []}
 

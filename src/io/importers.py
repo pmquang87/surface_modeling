@@ -17,8 +17,16 @@ def import_step(filepath: str) -> Dict[str, Any]:
         'vertices': np.ndarray (Nx3)
         'faces': list of lists of vertex indices
     
-    Uses OCP (OpenCascade Python bindings) if available.
-    Falls back to a simple STEP parser for basic geometry.
+    Uses OCP (OpenCascade Python bindings) if available, else cadquery.
+
+    Raises:
+        FileNotFoundError: the path does not exist.
+        ValueError: the file exists but OpenCascade cannot read it or it
+            carries no shape (e.g. an empty DATA section). An unreadable STEP
+            used to come back as an all-empty result dict, which every caller
+            had to recognise by hand.
+        RuntimeError: neither OCP nor cadquery is importable, so there is no
+            STEP support at all.
     """
     result = {
         'shape': None,
@@ -54,18 +62,24 @@ def import_step(filepath: str) -> Dict[str, Any]:
         reader = STEPControl_Reader()
         status = reader.ReadFile(filepath)
         if status != 1:
-            logger.error("Error reading STEP file with OCP.")
-            return result
-        
+            logger.error(f"Error reading STEP file with OCP (status {status}).")
+            raise ValueError(
+                f"Cannot read STEP file '{filepath}': OpenCascade "
+                f"STEPControl_Reader returned status {status} (1 = OK).")
+
         transfer_status = reader.TransferRoots()
         if not transfer_status:
             logger.error("Failed to transfer roots in STEP file.")
-            
+
         shape = reader.OneShape()
         if shape.IsNull():
             logger.error("STEP file contains a null shape.")
-            return result
-            
+            raise ValueError(
+                f"STEP file '{filepath}' contains no geometry: OpenCascade "
+                f"read it (status 1) but transferred a null shape "
+                f"(TransferRoots -> {transfer_status}).")
+
+
         result['shape'] = shape
         
         # Tessellate
@@ -126,9 +140,18 @@ def import_step(filepath: str) -> Dict[str, Any]:
     # Try cadquery
     try:
         import cadquery as cq
+    except ImportError:
+        logger.warning("CadQuery not available. Falling back to simple warning.")
+        logger.error("No OCP or CadQuery installed. Cannot parse STEP B-Rep properly.")
+        raise RuntimeError(
+            "STEP support is unavailable: neither OCP nor cadquery could be "
+            "imported. Install one of them (pip install cadquery-ocp) or "
+            "convert the file to STL/OBJ first.")
+
+    try:
         shape = cq.importers.importStep(filepath)
         result['shape'] = shape
-        
+
         # Simple tessellation using CQ
         # CQ 2.x uses OCP under the hood, so if OCP failed, this might also fail.
         # But just in case:
@@ -141,12 +164,11 @@ def import_step(filepath: str) -> Dict[str, Any]:
         result['faces'] = faces
         result['mesh'] = HalfEdgeMesh.from_arrays(result['vertices'], result['faces'])
         return result
-        
-    except ImportError:
-        logger.warning("CadQuery not available. Falling back to simple warning.")
-        
-    logger.error("No OCP or CadQuery installed. Cannot parse STEP B-Rep properly.")
-    return result
+
+    except Exception as e:
+        logger.error(f"CadQuery could not read the STEP file: {e}")
+        raise ValueError(
+            f"Cannot read STEP file '{filepath}' with cadquery: {e}") from e
 
 
 def import_stl(filepath: str) -> 'HalfEdgeMesh':

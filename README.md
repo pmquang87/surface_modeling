@@ -63,7 +63,7 @@
 - **Mesh Tools**: Hole filling, Taubin smoothing, offset, decimation, quality metrics
 
 ### ⚙️ Advanced Operations
-- **Shell**: Create thin-walled solids using SDF/voxel-based approach (handles self-intersections)
+- **Shell**: Hollow out a solid into a true thin wall (two surfaces, the original and its offset) using an SDF/voxel approach that handles self-intersections
 - **Thicken**: Convert surfaces to solids with uniform wall thickness
 - Uses signed distance fields + marching cubes — inspired by "never-fail" offset techniques
 
@@ -254,7 +254,9 @@ from src.operations.shell_thicken import shell_solid, thicken_surface
 # Load a solid mesh
 mesh = import_stl("part.stl")
 
-# Create a thin-walled shell (SDF-based, handles complex geometry)
+# Hollow out the solid: the result is the WALL itself, a closed mesh whose
+# outer surface is the original one and whose inner surface sits 2.0 mm in.
+# (thickness must be > 0; 0 raises ValueError.)
 shelled = shell_solid(mesh, thickness=2.0, direction='inward', resolution=128)
 
 # Thicken a surface into a solid
@@ -327,6 +329,8 @@ The limit surface is evaluated analytically (without infinite subdivision) and f
 
 ### SDF-Based Shell/Thicken
 Traditional CAD offset fails on high-curvature geometry due to self-intersections. This implementation uses a **Signed Distance Field** approach: voxelize the mesh, compute distances, extract isosurfaces via marching cubes — guaranteeing a valid result regardless of complexity.
+
+The wall is extracted as the band `|sd - centre| == thickness/2`, so a single marching-cubes pass yields both of its surfaces at once and the result is hollow without any boolean subtraction. `direction` only decides where the band sits relative to the input surface: `'inward'` keeps it as the outer wall, `'outward'` as the inner wall, `'both'` straddles it.
 
 ---
 
