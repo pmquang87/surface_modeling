@@ -29,16 +29,41 @@ def _two_adjacent_quads():
     return HalfEdgeMesh.from_arrays(verts, faces)
 
 
+def _unique_edge_lengths(t_mesh):
+    """Lengths of the unique undirected edges of a trimesh."""
+    edges = np.unique(
+        np.sort(t_mesh.faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1), axis=0)
+    return np.linalg.norm(
+        t_mesh.vertices[edges[:, 0]] - t_mesh.vertices[edges[:, 1]], axis=1)
+
+
+def _min_over_median_edge(t_mesh):
+    lens = _unique_edge_lengths(t_mesh)
+    return float(lens.min() / np.median(lens))
+
+
 class TestQuadWrapDecimation:
     def test_miq_parametrization_actually_decimates(self):
         import trimesh
         dense = trimesh.creation.icosphere(subdivisions=4)  # 5120 tris
         wrapper = QuadWrapper(target_face_count=50)
         param_V, param_F, _ = wrapper._miq_parametrization(dense, None)
-        # target = 50 * 2.1 = 105 triangles; anything near the input count
-        # means decimation silently failed.
-        assert len(param_F) <= 3 * 105, (
-            f"decimation did not run: {len(dense.faces)} -> {len(param_F)} faces"
+        # target = 50 / 2.2 ~ 23 triangles; anything near the input count
+        # means decimation silently failed. The LOWER bound matters just as
+        # much: _repair_decimated's debris filter can delete the whole body,
+        # and an upper-bound-only assert calls that a success.
+        assert 12 <= len(param_F) <= 3 * 105, (
+            f"decimation produced {len(param_F)} faces from "
+            f"{len(dense.faces)} (expected roughly 22)"
+        )
+        assert len(param_V) >= 8, f"only {len(param_V)} vertices survived"
+
+        # ...and the decimated body must still cover the original sphere.
+        param_mesh = trimesh.Trimesh(vertices=param_V, faces=param_F, process=False)
+        scale = float(np.abs(dense.extents).max())
+        assert np.abs(param_mesh.bounds - dense.bounds).max() < 0.15 * scale, (
+            f"decimated body no longer covers the input: "
+            f"{param_mesh.bounds.tolist()} vs {dense.bounds.tolist()}"
         )
 
 
@@ -87,21 +112,34 @@ class TestPatchCornerOrder:
         )
 
     def test_patch_corners_interpolate_face_corners(self):
-        """All four ctrl-grid corners must sit on the quad's (limit) corners."""
+        """All four ctrl-grid corners must sit on the quad's (limit) corners,
+        in the same cyclic order the face is wound in.
+
+        On this flat sheet the Catmull-Clark limit positions coincide with the
+        input positions (verified: max deviation 0.0), so the face's vertex
+        positions ARE the expected patch corners.
+        """
         mesh = _two_adjacent_quads()
         conv = SubDToNURBSConverter()
         patches = conv.generate_patches(mesh)
+        assert len(patches) == 2
         for face, p in zip(mesh.faces, patches):
-            face_pts = {tuple(np.round(v.position, 4)) for v in mesh.get_face_vertices(face)}
+            face_verts = mesh.get_face_vertices(face)
+            face_pts = {tuple(np.round(v.position, 6)) for v in face_verts}
             ctrl_corner_pts = {
-                tuple(np.round(p[i, j], 4)) for i in (0, 5) for j in (0, 5)
+                tuple(np.round(p[i, j], 6)) for i in (0, 5) for j in (0, 5)
             }
-            # limit positions of a flat sheet's interior vertices stay in-plane;
-            # corners of the ctrl grid must be a subset of the face's vertex set
-            # only when limit == input (flat open sheet boundary vertices move).
-            # So instead assert the ctrl corners form a planar non-crossing cycle
-            # matching one winding of the face.
-            assert len(ctrl_corner_pts) == 4
+            assert ctrl_corner_pts == face_pts, (
+                f"patch corners {sorted(ctrl_corner_pts)} are not the face's "
+                f"corners {sorted(face_pts)}"
+            )
+            # Set equality alone still tolerates the original bowtie bug
+            # (c0,c1,c2,c3 laid onto (0,0),(5,0),(0,5),(5,5)); pin the winding.
+            for k, (i, j) in enumerate([(0, 0), (5, 0), (5, 5), (0, 5)]):
+                assert np.allclose(p[i, j], face_verts[k].position, atol=1e-9), (
+                    f"ctrl corner ({i},{j}) = {p[i, j]} does not match face "
+                    f"vertex {k} at {face_verts[k].position} -> bowtie patch"
+                )
 
 
 class TestReferenceModePatches:
@@ -125,12 +163,61 @@ class TestReferenceModePatches:
         assert np.allclose(a, b, atol=1e-9) or np.allclose(a, b[::-1], atol=1e-9)
 
     def test_reference_mode_corners_stay_on_surface(self):
-        mesh = _two_adjacent_quads()
+        """Reference mode must pin the patch corners to the CAGE vertices, not
+        to the Catmull-Clark limit positions (which are millimetres off a
+        shrink-wrapped cage).
+
+        The flat two-quad sheet cannot test this at all: there limit == cage,
+        so reference and non-reference mode produce identical output. Use a
+        twice-subdivided box, where the two differ by a measurable 0.0195.
+        """
+        import trimesh
+        from src.subd.primitives import create_box
+        from src.subd.catmull_clark import subdivide, evaluate_limit_surface
+
+        mesh = subdivide(create_box(), 2)
+        cage = np.array([v.position for v in mesh.vertices])
+        limit, _ = evaluate_limit_surface(mesh)
+        gap = np.abs(limit - cage).max()
+        # precondition: the fixture must be able to tell the two modes apart
+        assert gap > 1e-3, f"fixture cannot distinguish limit from cage (gap {gap})"
+
         conv = SubDToNURBSConverter()
         patches = conv.generate_patches(mesh, reference_mesh=mesh)
-        for p in patches:
-            for i, j in [(0, 0), (5, 0), (5, 5), (0, 5)]:
-                assert abs(p[i, j][2]) < 1e-9, "corner left the z=0 reference plane"
+        quad_faces = [f for f in mesh.faces if len(mesh.get_face_vertices(f)) == 4]
+        assert len(patches) == len(quad_faces) > 0
+
+        dev_cage = 0.0
+        dev_limit = 0.0
+        for face, p in zip(quad_faces, patches):
+            fv = mesh.get_face_vertices(face)
+            for k, (i, j) in enumerate([(0, 0), (5, 0), (5, 5), (0, 5)]):
+                dev_cage = max(dev_cage, np.abs(p[i, j] - fv[k].position).max())
+                dev_limit = max(dev_limit, np.abs(p[i, j] - limit[fv[k].index]).max())
+        assert dev_cage < 1e-9, (
+            f"reference-mode corners drifted off the cage by {dev_cage:.3e}"
+        )
+        assert dev_limit > 1e-3, (
+            "reference-mode corners are the Catmull-Clark limit positions -- "
+            "reference mode is not in effect"
+        )
+
+        # every control point (not just the corners) must hug the reference
+        # surface: a broken boundary-tangent construction throws the six-point
+        # edge curves far off the part while leaving the corners intact.
+        all_ctrl = np.vstack([p.reshape(-1, 3) for p in patches])
+        ref_tm = mesh.to_trimesh()
+        _, dist, _ = trimesh.proximity.closest_point(ref_tm, all_ctrl)
+        quad_diag = np.median([
+            np.linalg.norm(
+                np.array([p[0, 0], p[5, 0], p[5, 5], p[0, 5]]).max(axis=0)
+                - np.array([p[0, 0], p[5, 0], p[5, 5], p[0, 5]]).min(axis=0))
+            for p in patches
+        ])
+        assert dist.max() < 0.25 * quad_diag, (
+            f"control points sit up to {dist.max():.4f} off the reference "
+            f"surface (quad size {quad_diag:.4f})"
+        )
 
 
 class TestMeshToolsTrimesh5:
@@ -139,8 +226,22 @@ class TestMeshToolsTrimesh5:
         from src.reverse_engineering.mesh_tools import decimate_mesh
         dense = HalfEdgeMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=3))
         out = decimate_mesh(dense, target_faces=100)
-        assert len(out.faces) <= 300, (
+        # Bracket from BOTH sides: an upper-bound-only assert is satisfied by a
+        # 20-face blob and by an entirely EMPTY mesh. Real code returns exactly
+        # 100 faces for target_faces=100.
+        assert 50 <= len(out.faces) <= 300, (
             f"decimation silently failed: {len(dense.faces)} -> {len(out.faces)}"
+        )
+        # ...and the shape must survive the reduction.
+        tin, tout = dense.to_trimesh(), out.to_trimesh()
+        scale = float(np.abs(tin.extents).max())
+        assert np.abs(tout.bounds - tin.bounds).max() < 0.1 * scale, (
+            f"decimated mesh no longer covers the input: "
+            f"{tout.bounds.tolist()} vs {tin.bounds.tolist()}"
+        )
+        assert abs(tout.volume - tin.volume) / abs(tin.volume) < 0.15, (
+            f"decimation changed the volume too much: "
+            f"{tin.volume:.4f} -> {tout.volume:.4f}"
         )
 
     def test_remove_duplicate_vertices_merges(self):
@@ -176,7 +277,19 @@ class TestDecimationRepair:
             faces=np.vstack([base.faces, extra, debris]),
             process=False,
         )
+        # One precondition PER injected defect. `not is_watertight` is
+        # satisfied by either defect alone, so if one injection silently
+        # stopped working its post-condition below would go vacuous while the
+        # other assert kept the test green -- the exact failure mode this file
+        # exists to prevent.
         assert not dirty.is_watertight
+        assert len(dirty.split(only_watertight=False)) == 3, (
+            "debris component not created"
+        )
+        dirty_edges = np.sort(
+            dirty.faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+        _, dirty_counts = np.unique(dirty_edges, axis=0, return_counts=True)
+        assert (dirty_counts > 2).sum() == 1, "non-manifold edge not created"
 
         repaired = QuadWrapper(target_face_count=50)._repair_decimated(dirty)
         comps = repaired.split(only_watertight=False)
@@ -195,17 +308,19 @@ class TestRemoveSliverEdges:
         # shrink an ACTUAL mesh edge to 2% of its length
         a, b = base.edges_unique[0]
         verts[b] = verts[a] + 0.02 * (verts[b] - verts[a])
-        return trimesh.Trimesh(vertices=verts, faces=base.faces, process=False)
+        dirty = trimesh.Trimesh(vertices=verts, faces=base.faces, process=False)
+        # precondition: the defect must exist, or every assertion below is
+        # vacuous (a repair no-op would pass) — this is exactly how the first
+        # version of this test silently tested nothing
+        assert _min_over_median_edge(dirty) < 0.15, "defect construction failed"
+        return dirty
 
     def test_collapse_short_edges(self):
         from src.reverse_engineering.mesh_tools import collapse_short_edges
         dirty = self._mesh_with_short_edge()
         out = collapse_short_edges(dirty, rel_threshold=0.15)
         assert len(out.faces) < len(dirty.faces), "collapse did not happen"
-        edges = np.sort(out.faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
-        edges = np.unique(edges, axis=0)
-        lens = np.linalg.norm(out.vertices[edges[:, 0]] - out.vertices[edges[:, 1]], axis=1)
-        assert lens.min() >= 0.15 * np.median(lens)
+        assert _min_over_median_edge(out) >= 0.15
         assert out.is_watertight
 
     def test_flip_needle_triangles(self):
@@ -226,16 +341,51 @@ class TestRemoveSliverEdges:
         p, q, r = base.faces[0]
         verts[r] = 0.998 * (verts[p] + verts[q]) / 2.0 + 0.002 * verts[r]
         dirty = trimesh.Trimesh(vertices=verts, faces=base.faces, process=False)
+        # precondition: the needle must actually be below the repair threshold
+        med = np.median(np.linalg.norm(
+            dirty.vertices[dirty.edges_unique[:, 0]] -
+            dirty.vertices[dirty.edges_unique[:, 1]], axis=1))
+        assert worst_height(dirty) < 0.05 * med, "defect construction failed"
 
         out = flip_needle_triangles(dirty, rel_height=0.05)
         assert worst_height(out) > worst_height(dirty)
+        # "some improvement" is not enough: a stub that nudges the apex by 1e-6
+        # satisfies the strict inequality above while the needle survives.
+        # Demand the needle is actually gone, i.e. back above the threshold the
+        # repair itself works to. Measured on real code: 0.0616 vs 0.0156.
+        med_out = np.median(np.linalg.norm(
+            out.vertices[out.edges_unique[:, 0]] -
+            out.vertices[out.edges_unique[:, 1]], axis=1))
+        assert worst_height(out) >= 0.05 * med_out, (
+            f"needle not repaired: height {worst_height(out):.6f} still below "
+            f"{0.05 * med_out:.6f}"
+        )
         assert out.is_watertight
 
     def test_remove_sliver_edges_halfedge_roundtrip(self):
         from src.reverse_engineering.mesh_tools import remove_sliver_edges
         dirty = HalfEdgeMesh.from_trimesh(self._mesh_with_short_edge())
+        # Re-assert the precondition on the mesh ACTUALLY handed to the repair:
+        # _mesh_with_short_edge checks the trimesh, not the HalfEdgeMesh.
+        in_tm = dirty.to_trimesh()
+        assert _min_over_median_edge(in_tm) < 0.15, (
+            "the sliver did not survive the HalfEdgeMesh round-trip"
+        )
+        # the input is already closed, so the boundary-edge assert below is
+        # about PRESERVING that, not about the repair
+        assert sum(1 for e in dirty.edges if dirty.is_boundary_edge(e)) == 0
+
         out = remove_sliver_edges(dirty)
         assert len(out.faces) < len(dirty.faces)
+        # the missing post-condition: the sliver must be GONE. Collapsing the
+        # wrong (longest) edge also drops faces and keeps the mesh closed.
+        # Measured: real code reaches 0.879, the wrong-edge variant stays at
+        # 0.0176.
+        out_tm = out.to_trimesh()
+        assert _min_over_median_edge(out_tm) >= 0.15, (
+            f"sliver edge survived the repair: min/median = "
+            f"{_min_over_median_edge(out_tm):.4f}"
+        )
         assert sum(1 for e in out.edges if out.is_boundary_edge(e)) == 0
 
 
@@ -274,9 +424,25 @@ class TestExpectedBodyCount:
 
     def test_wrap_single_body_input_yields_single_component_cage(self):
         import trimesh
-        dense = trimesh.creation.icosphere(subdivisions=4)
+        dense = trimesh.creation.icosphere(subdivisions=4)  # 5120 tris
         cage = QuadWrapper(target_face_count=300).wrap(
             HalfEdgeMesh.from_trimesh(dense))
+
+        # `len(comps) == 1` is already true of the dense INPUT, and wrap()
+        # returns exactly that (reference_mesh.copy()) from its except branch.
+        # So first assert a real quad cage was produced. Measured on real
+        # code: 292 faces, all quads, 1 component.
+        assert len(cage.faces) < len(dense.faces), (
+            f"wrap returned an undecimated mesh: {len(dense.faces)} -> "
+            f"{len(cage.faces)} faces (the except fallback fired)"
+        )
+        assert all(len(cage.get_face_vertices(f)) == 4 for f in cage.faces), (
+            "wrap did not produce a pure-quad cage"
+        )
+        assert 150 <= len(cage.faces) <= 600, (
+            f"cage size {len(cage.faces)} far from the requested 300 quads"
+        )
+
         comps = cage.to_trimesh().split(only_watertight=False)
         assert len(comps) == 1
 
@@ -288,6 +454,21 @@ class TestLinearSubdivide:
         box = create_box()
         out = subdivide(box, 1, smooth=False)
         assert len(out.faces) == 4 * len(box.faces)
+
+        # The face count is identical for smooth=True, so a wrapper that
+        # silently discards the kwarg passes a shape-only assert. Make it
+        # behavioural: the two modes must produce different geometry.
+        smooth_out = subdivide(box, 1, smooth=True)
+        assert len(smooth_out.faces) == len(out.faces)
+        lin_pts = np.array(sorted(
+            tuple(np.round(v.position, 9)) for v in out.vertices))
+        smooth_pts = np.array(sorted(
+            tuple(np.round(v.position, 9)) for v in smooth_out.vertices))
+        assert lin_pts.shape == smooth_pts.shape
+        assert not np.allclose(lin_pts, smooth_pts), (
+            "smooth=False produced the same geometry as smooth=True -> the "
+            "kwarg is being ignored"
+        )
 
     def test_linear_subdivide_preserves_positions(self):
         from src.subd.primitives import create_box

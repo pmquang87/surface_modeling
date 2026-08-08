@@ -194,9 +194,18 @@ class TestQuadWrapSkipsCrossField:
 
     def test_miq_parametrization_accepts_no_cross_field(self):
         w = QuadWrapper(target_face_count=60)
-        V, F, field = w._miq_parametrization(_icosphere(2))
+        dense = _icosphere(2)  # 320 triangles
+        V, F, field = w._miq_parametrization(dense)
         assert len(F) > 0 and len(V) > 0
-        assert field.shape[0] == len(V)
+        # the decimation budget really was applied: 320 -> ~27 triangles
+        expected = 60 / QUADS_PER_DECIMATED_TRIANGLE
+        assert abs(len(F) - expected) <= 0.35 * expected, (
+            f"{len(F)} triangles out of {len(dense.faces)} for a budget of "
+            f"{expected:.0f} -- the decimation stage did not run"
+        )
+        # the returned cross field is the documented all-zero placeholder
+        assert field.shape == (len(V), 3)
+        assert not field.any(), "the cross field is meant to be an empty stand-in"
 
 
 # --------------------------------------------------------------------------
@@ -212,6 +221,15 @@ class TestDecimateWithFrozenVertices:
         frozen = sorted(rng.choice(len(mesh.vertices), n_frozen, replace=False).tolist())
         frozen_pos = np.array([mesh.vertices[i].position for i in frozen])
         out = decimate_mesh(mesh, target_faces=target, frozen_vertices=frozen)
+        # Precondition shared by every test in this class: decimation has to
+        # have actually happened. decimate_mesh swallows exceptions and returns
+        # mesh.copy() (mesh_tools.py:438), so without this the whole class is
+        # green for a _decimate_with_frozen that crashes or does nothing.
+        # A real run lands exactly on `target` (400 faces from 1280).
+        assert len(out.faces) <= 1.05 * target, (
+            f"decimation did not run: {len(out.faces)} faces out of "
+            f"{len(mesh.faces)} for target {target}"
+        )
         return tm, mesh, frozen_pos, out
 
     def test_every_frozen_vertex_survives_exactly(self):
@@ -234,12 +252,22 @@ class TestDecimateWithFrozenVertices:
         tm, _, _, out = self._run()
         out_tm = out.to_trimesh()
         longest = float(out_tm.edges_unique_length.max())
-        assert longest < 8 * float(tm.edges_unique_length.max()), (
+        # Input max edge 0.1646, real output max edge 0.6180. An absolute bound
+        # of 0.9 still leaves 45% head-room but rejects a 60-degree bogus
+        # collapse (chord 1.0); the old `8 * input_max` bound was 1.3172 and let
+        # those through.
+        assert longest < 0.9, (
             f"edge of length {longest:.3f} on a unit sphere -> non-adjacent collapse"
+        )
+        assert longest > float(tm.edges_unique_length.max()), (
+            "output edges no longer than the input's -> nothing was collapsed"
         )
 
     def test_result_stays_manifold_and_closed(self):
-        _, _, _, out = self._run()
+        _, mesh, _, out = self._run()
+        # the manifoldness claim has to be about a genuinely reduced mesh --
+        # the input icosphere already satisfies all three properties
+        assert len(out.vertices) < len(mesh.vertices)
         out_tm = out.to_trimesh()
         assert _non_manifold_edges(out_tm) == 0
         assert out_tm.is_watertight
@@ -247,13 +275,26 @@ class TestDecimateWithFrozenVertices:
 
     def test_volume_is_roughly_preserved(self):
         tm, _, _, out = self._run()
-        assert out.to_trimesh().volume == pytest.approx(tm.volume, rel=0.15)
+        # real error for 1280 -> 400 faces is 3.1%
+        assert out.to_trimesh().volume == pytest.approx(tm.volume, rel=0.06)
 
     def test_freezing_everything_is_a_no_op(self):
-        mesh = HalfEdgeMesh.from_trimesh(_icosphere(2))
+        mesh = HalfEdgeMesh.from_trimesh(_icosphere(2))  # 162 verts, 320 faces
+        # control: the same request WOULD decimate hard if nothing were frozen,
+        # so "unchanged" below is a real statement about the frozen set
+        control = decimate_mesh(HalfEdgeMesh.from_trimesh(_icosphere(2)),
+                                target_faces=10)
+        assert len(control.faces) < 50, (
+            f"target_faces=10 does not actually decimate this mesh "
+            f"({len(control.faces)} faces)"
+        )
+        before = np.array([v.position for v in mesh.vertices])
         allv = list(range(len(mesh.vertices)))
         out = decimate_mesh(mesh, target_faces=10, frozen_vertices=allv)
         assert len(out.faces) == len(mesh.faces)
+        after = np.array([v.position for v in out.vertices])
+        assert after.shape == before.shape
+        assert np.array_equal(after, before), "a frozen vertex was moved"
 
 
 # --------------------------------------------------------------------------
@@ -272,8 +313,14 @@ class TestFillHoles:
 
     def test_filled_patch_keeps_the_volume(self):
         holed = _sphere_with_hole(2)
+        assert not holed.is_watertight, "no hole to fill -- the fixture is broken"
         out = fill_holes(HalfEdgeMesh.from_trimesh(holed), max_hole_edges=40)
-        assert out.to_trimesh().volume == pytest.approx(_icosphere(3).volume, rel=0.02)
+        out_tm = out.to_trimesh()
+        assert out_tm.is_watertight, "hole left open"
+        # closed sphere 4.15274, unfilled holed mesh 4.10202 (1.22% low),
+        # correctly filled 4.14979 (0.07% low): rel=0.005 still gives the real
+        # implementation 7x head-room while rejecting the unfilled mesh.
+        assert out_tm.volume == pytest.approx(_icosphere(3).volume, rel=0.005)
 
     def test_max_hole_edges_is_honoured_and_reported(self):
         holed = _sphere_with_hole(2)
@@ -286,12 +333,27 @@ class TestFillHoles:
     def test_closed_mesh_is_unchanged(self):
         tm = _icosphere(2)
         out = fill_holes(HalfEdgeMesh.from_trimesh(tm))
+        out_tm = out.to_trimesh()
+        # not just the count: a triangulator that re-wound or displaced faces
+        # while keeping the count would pass the old assertion
         assert len(out.faces) == len(tm.faces)
+        assert out_tm.volume == pytest.approx(tm.volume, rel=1e-9)
+        assert np.allclose(out_tm.vertices, tm.vertices, atol=1e-12)
+        assert np.array_equal(np.sort(out_tm.faces, axis=1),
+                              np.sort(tm.faces, axis=1))
 
     def test_flat_open_sheet_boundary_is_closed(self):
         sheet = _flat_sheet(n=5, size=4.0)
+        assert not sheet.to_trimesh().is_watertight, "the sheet must start open"
         out = fill_holes(sheet, max_hole_edges=40)
-        assert len(out.faces) > len(sheet.faces)
+        out_tm = out.to_trimesh()
+        assert out_tm.is_watertight, "the boundary was not closed"
+        assert out_tm.is_winding_consistent, "patch faces wound the wrong way"
+        assert _non_manifold_edges(out_tm) == 0
+        # The rim is a 16-edge loop of collinear runs, so ear clipping finds no
+        # legal ear and the centroid-fan fallback runs: +1 vertex, +16 faces.
+        assert len(out.vertices) == len(sheet.vertices) + 1
+        assert len(out.faces) == len(sheet.faces) + 16
 
     def test_does_not_recreate_an_existing_chord(self):
         """Square sheet already split along the A-C diagonal: closing its
@@ -406,10 +468,29 @@ class TestMergeTolerance:
         out = remove_duplicate_vertices(mesh, tolerance=1e-6)
         assert len(out.vertices) == 3
 
-    def test_effective_grid_never_exceeds_the_requested_tolerance(self):
-        for tol in (5e-5, 1e-6, 2e-3, 3e-2, 1e-3):
-            digits = max(0, int(np.ceil(-np.log10(max(tol, 1e-12)))))
-            assert 10.0 ** -digits <= tol * (1 + 1e-12)
+    @pytest.mark.parametrize("tol", [5e-5, 4e-3, 1e-6, 2e-3, 3e-2, 1e-3])
+    def test_effective_grid_never_exceeds_the_requested_tolerance(self, tol):
+        """Drive the real function, not a local copy of the formula.
+
+        A pair 1.4 x tolerance apart must survive WHEREVER it sits. The old
+        round()-to-digits mapping used a quantisation grid coarser than the
+        requested tolerance (tol 5e-5 -> grid 1e-4), so the pair fused for the
+        placements that fall inside one coarse cell -- which is exactly what
+        sweeping the base coordinate probes.
+        """
+        for base in np.linspace(0.0, 10.0 * tol, 11):
+            out = remove_duplicate_vertices(
+                self._pair_mesh(base, base + 1.4 * tol), tolerance=tol)
+            assert len(out.vertices) == 4, (
+                f"tolerance {tol:g}: merged a pair {1.4 * tol:g} apart "
+                f"at x={base:g}"
+            )
+        # companion: the tolerance must still be usable at all
+        close = remove_duplicate_vertices(self._pair_mesh(0.0, 0.1 * tol),
+                                          tolerance=tol)
+        assert len(close.vertices) == 3, (
+            f"tolerance {tol:g}: failed to merge a pair {0.1 * tol:g} apart"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -495,6 +576,11 @@ class TestRayCastProjection:
         got = w._ray_cast_projection(verts, norms, ref)
         assert got.shape == (1, 3)
         assert np.isfinite(got).all()
+        # "handled" means the fallback ran, not that something shaped (1, 3)
+        # came back: the input sits at |r| = 8.66, the real answer at 0.934.
+        _, dist, _ = trimesh.proximity.closest_point(ref, got)
+        assert dist.max() < 1e-6, "the missed vertex was not put on the reference"
+        assert np.linalg.norm(got[0]) < 1.01, "outside the icosphere(1) circumradius"
 
 
 # --------------------------------------------------------------------------
@@ -511,6 +597,13 @@ class TestShrinkWrapSubdivision:
         out = ShrinkWrapper(iterations=1, subdivision_levels=0,
                             smooth_weight=0.0).wrap(cage, ref)
         assert len(out.faces) == len(cage.faces)
+        assert len(out.vertices) == len(cage.vertices)
+        # control in the same test: levels=1 MUST change the density, so an
+        # implementation that ignores subdivision_levels cannot pass the pair
+        dense = ShrinkWrapper(iterations=1, subdivision_levels=1,
+                              smooth_weight=0.0).wrap(cage, ref)
+        assert len(dense.faces) == 3 * len(cage.faces)
+        assert len(dense.vertices) > len(cage.vertices)
 
     def test_one_level_splits_every_face(self):
         """Catmull-Clark splits an n-gon into n quads, so a triangle cage
@@ -538,8 +631,13 @@ class TestShrinkWrapSubdivision:
         cage = HalfEdgeMesh.from_trimesh(_icosphere(1))
         out = ShrinkWrapper(iterations=2, subdivision_levels=1,
                             smooth_weight=0.2).wrap(cage, ref)
+        # precondition: the subdivision the test is named after actually ran.
+        # (An un-subdivided cage lands on the sphere EXACTLY, so the radius
+        # check below is easier to pass without subdividing than with.)
+        assert len(out.faces) == 3 * len(cage.faces), "cage was not subdivided"
+        assert len(out.vertices) > len(cage.vertices)
         radii = np.linalg.norm(np.array([v.position for v in out.vertices]), axis=1)
-        assert np.abs(radii - 1.0).max() < 0.05
+        assert np.abs(radii - 1.0).max() < 0.02  # real 0.0045
 
     def test_quad_wrap_relax_passes_zero_explicitly(self, monkeypatch):
         """quad_wrap must not start subdividing its cage because the default
@@ -587,10 +685,17 @@ class TestSdfGrid:
         assert ob == pytest.approx([1150.0 - 12.0, -700.0 - 12.0, 300.0 - 12.0])
 
     def test_non_cubic_box_keeps_every_axis_resolved(self):
-        b = self._box(extents=(40.0, 4.0, 12.0))
-        grid, _, _ = _compute_sdf(np.array(b.vertices), np.array(b.faces), 32)
-        assert grid.shape[0] >= 30
-        assert min(grid.shape) >= 4
+        """Translated off the origin, so the old cross-axis voxel size differs.
+
+        A box CENTRED on the origin makes `bbox_max.max() - bbox_min.min()` and
+        `(bbox_max - bbox_min).max()` identical, so the old and the fixed
+        formula agree and nothing is tested. At x = 1150 the old formula gives
+        voxel 37.0 instead of 1.5 and the grid collapses.
+        """
+        b = self._box(translate=(1150.0, 0.0, 0.0), extents=(40.0, 4.0, 12.0))
+        grid, _, voxel = _compute_sdf(np.array(b.vertices), np.array(b.faces), 32)
+        assert voxel == pytest.approx(48.0 / 32, rel=0.05)
+        assert grid.shape == (33, 9, 15)
 
 
 # --------------------------------------------------------------------------
@@ -714,6 +819,11 @@ class TestThickenSurface:
                                resolution=self.RES, smooth_iterations=0)
         lo_u, hi_u = self._z_span(up, footprint=4.0)
         lo_d, hi_d = self._z_span(down, footprint=4.0)
+        # Anchor both sides to ground truth first: comparing the two outputs
+        # only to each other passes for ANY result symmetric about z = 0,
+        # which is precisely what a direction-ignoring implementation returns.
+        assert (lo_u, hi_u) == pytest.approx((0.0, self.T), abs=0.05)
+        assert (lo_d, hi_d) == pytest.approx((-self.T, 0.0), abs=0.05)
         assert lo_u == pytest.approx(-hi_d, abs=0.05)
         assert hi_u == pytest.approx(-lo_d, abs=0.05)
 

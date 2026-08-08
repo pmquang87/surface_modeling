@@ -58,6 +58,30 @@ def assert_no_repeated_directed_edge(mesh: HalfEdgeMesh):
             seen.add(de)
 
 
+def reference_vertex_normals(mesh: HalfEdgeMesh, positions: np.ndarray) -> np.ndarray:
+    """Area-weighted vertex normals of `mesh`'s topology at `positions`.
+
+    Written out independently of src (sum of cross(P_i, P_i+1) around each face,
+    which is twice the projected area times the unit normal) so it can be used as
+    an authority on *which* positions the module's normals were built from.
+    """
+    normals = np.zeros((len(mesh.vertices), 3))
+    for f in mesh.faces:
+        fv = [v.index for v in mesh.get_face_vertices(f)]
+        if len(fv) < 3:
+            continue
+        P = positions[fv]
+        fn = np.zeros(3)
+        for k in range(len(fv)):
+            fn = fn + np.cross(P[k], P[(k + 1) % len(fv)])
+        for idx in fv:
+            normals[idx] += fn
+    lengths = np.linalg.norm(normals, axis=1)
+    good = lengths > 1e-12
+    normals[good] /= lengths[good][:, None]
+    return normals
+
+
 CLOSED_PRIMITIVES = {
     'box': create_box,
     'cylinder': create_cylinder,
@@ -98,30 +122,75 @@ def test_plane_is_open_but_consistently_wound():
     assert_no_repeated_directed_edge(mesh)
 
 
+# Two Catmull-Clark levels turn every n-gon into n quads and then each quad into
+# four, so the face count is pinned by the base cage alone. Vertex counts and
+# volumes are measured once against the working implementation; a subdivision
+# that silently does nothing cannot reproduce them.
+SUBDIVIDED_TWICE = {          # name: (vertices, faces, volume)
+    'box':      (98,   96,   0.35011720591938866),
+    'cone':     (130,  128,  0.09908914521553071),
+    'cylinder': (194,  192,  0.36082545313278970),
+    'sphere':   (706,  704,  0.37630248746478734),
+    'torus':    (2048, 2048, 1.38338436748291900),
+}
+
+
 @pytest.mark.parametrize('name', sorted(CLOSED_PRIMITIVES))
 def test_closed_primitives_survive_subdivision(name):
+    base = CLOSED_PRIMITIVES[name]()
     mesh = CLOSED_PRIMITIVES[name](subdivisions=2)
+    exp_verts, exp_faces, exp_volume = SUBDIVIDED_TWICE[name]
+
+    # Precondition: the refinement actually ran. Without this the assertions
+    # below are satisfied by the un-subdivided cage, which is already a valid
+    # solid, so a no-op `subdivide` would look correct.
+    corners = sum(len(base.get_face_vertices(f)) for f in base.faces)
+    assert len(mesh.faces) == 4 * corners == exp_faces, (
+        f"{name}: 2 levels over {len(base.faces)} faces ({corners} corners) gave "
+        f"{len(mesh.faces)} faces, expected {4 * corners}")
+    assert len(mesh.vertices) == exp_verts, \
+        f"{name}: {len(mesh.vertices)} vertices after 2 levels, expected {exp_verts}"
+
     rep = solid_report(mesh)
     assert rep['watertight'], f"subdivided {name} not watertight: {rep}"
     assert rep['winding_consistent'], f"subdivided {name} winding inconsistent: {rep}"
     assert rep['volume'] > 0, f"subdivided {name} inside-out: {rep}"
+    # Catmull-Clark pulls the cage in towards the limit surface.
+    base_volume = solid_report(base)['volume']
+    assert rep['volume'] < base_volume, \
+        f"subdivided {name} did not shrink: {rep['volume']} vs cage {base_volume}"
+    assert rep['volume'] == pytest.approx(exp_volume, rel=1e-9)
 
 
 def test_cylinder_volume_matches_analytic_prism():
-    """Sanity anchor: caps wound correctly give the regular-prism volume."""
+    """Sanity anchor: caps wound correctly give the regular-prism volume.
+
+    The volume alone does not see the cap winding - a cylinder built with the
+    finding-4 defect has the same volume to the last bit - so the winding claim
+    is carried by the integrity checks, not by the number.
+    """
     segs = 16
     r, h = 0.5, 1.0
     mesh = create_cylinder(radius=r, height=h, segments=segs)
     expected = 0.5 * segs * r * r * np.sin(2 * np.pi / segs) * h
-    assert solid_report(mesh)['volume'] == pytest.approx(expected, rel=1e-9)
+    rep = solid_report(mesh)
+    assert rep['volume'] == pytest.approx(expected, rel=1e-9)
+    assert rep['winding_consistent'], f"cap winding is inconsistent: {rep}"
+    assert dangling_half_edges(mesh) == 0, \
+        f"{dangling_half_edges(mesh)} cap half-edges never found a twin"
 
 
 def test_cone_volume_matches_analytic_pyramid():
+    """Same caveat as the cylinder: a flipped base ring leaves the volume alone."""
     segs = 16
     r, h = 0.5, 1.0
     mesh = create_cone(radius=r, height=h, segments=segs)
     base_area = 0.5 * segs * r * r * np.sin(2 * np.pi / segs)
-    assert solid_report(mesh)['volume'] == pytest.approx(base_area * h / 3.0, rel=1e-9)
+    rep = solid_report(mesh)
+    assert rep['volume'] == pytest.approx(base_area * h / 3.0, rel=1e-9)
+    assert rep['winding_consistent'], f"base winding is inconsistent: {rep}"
+    assert dangling_half_edges(mesh) == 0, \
+        f"{dangling_half_edges(mesh)} base half-edges never found a twin"
 
 
 def test_sphere_volume_is_positive_and_near_analytic():
@@ -219,10 +288,34 @@ def test_subdivide_matches_reference_vertex_rule():
         R = np.mean([edge_mid[e.index] for e in inc], axis=0)
         expected[v.index] = (F + 2 * R + (n - 3) * v.position) / n
 
+    V, E, F_count = len(mesh.vertices), len(mesh.edges), len(mesh.faces)
     out = subdivide(mesh, 1)
+    # The three blocks are laid down in order: originals, then one point per
+    # edge, then one per face. Checking only the first block leaves the edge rule
+    # structurally unreachable - the original vertices are built from edge
+    # MIDpoints, never from edge points.
+    assert len(out.vertices) == V + E + F_count, \
+        f"expected {V}+{E}+{F_count} vertices, got {len(out.vertices)}"
+
     for v in mesh.vertices:
         assert np.allclose(out.vertices[v.index].position, expected[v.index], atol=1e-12), \
             f"vertex {v.index} moved to the wrong place"
+
+    for e in mesh.edges:
+        v_src = e.half_edge.prev.vertex.position
+        v_tgt = e.half_edge.vertex.position
+        f1, f2 = mesh.get_edge_faces(e)
+        if f2 is None:                       # boundary edge -> plain midpoint
+            ref = (v_src + v_tgt) / 2.0
+        else:
+            ref = (v_src + v_tgt + face_pt[f1.index] + face_pt[f2.index]) / 4.0
+        assert np.allclose(out.vertices[V + e.index].position, ref, atol=1e-12), \
+            f"edge point {e.index} is at the wrong place"
+
+    for f in mesh.faces:
+        assert np.allclose(out.vertices[V + E + f.index].position,
+                           face_pt[f.index], atol=1e-12), \
+            f"face point {f.index} is not the face centroid"
 
 
 def test_subdivide_keyword_contract_still_works():
@@ -292,8 +385,14 @@ def test_limit_surface_is_invariant_under_subdivision():
     for mesh in (subdivide(create_box(), 1),
                  create_torus(major_segments=8, minor_segments=6)):
         nv = len(mesh.vertices)
+        fine = subdivide(mesh, 1)
+        # Precondition: the cage really was refined. Comparing a mesh with
+        # itself gives drift == 0 and asserts nothing.
+        assert len(fine.vertices) > 3 * nv, \
+            f"cage was not refined: {nv} -> {len(fine.vertices)} vertices"
+
         here, _ = evaluate_limit_surface(mesh)
-        finer, _ = evaluate_limit_surface(subdivide(mesh, 1))
+        finer, _ = evaluate_limit_surface(fine)
         drift = np.linalg.norm(here[:nv] - finer[:nv], axis=1).max()
         assert drift < 1e-12, f"limit position drifted by {drift:.3e} after one refinement"
 
@@ -318,18 +417,62 @@ def test_limit_surface_converges_to_deep_subdivision():
         f"residual plateaued instead of vanishing: {errors}"
 
 
+def _bent_grid():
+    """A 4x4 grid with a boundary, bent out of its own plane.
+
+    A *flat* uniform grid is already its own limit surface (the stencil is an
+    affine combination of symmetric coplanar points, so every interior vertex
+    maps to itself). Bending it is what makes 'interior vertices move' a claim
+    that can fail.
+    """
+    mesh = create_plane(subdivisions_x=3, subdivisions_y=3)
+    for v in mesh.vertices:
+        x, z = float(v.position[0]), float(v.position[2])
+        v.position = np.array([x, 0.4 * np.cos(2.5 * x) * np.cos(1.7 * z), z])
+    return mesh
+
+
 def test_limit_surface_preserves_boundary_vertices():
+    """Boundary vertices stay put - and only boundary vertices do."""
     plane = create_plane(subdivisions_x=3, subdivisions_y=3)
+    boundary = [v for v in plane.vertices if plane.is_boundary_vertex(v)]
+    interior = [v for v in plane.vertices if not plane.is_boundary_vertex(v)]
+    assert len(plane.vertices) == 16
+    assert len(boundary) == 12 and len(interior) == 4, \
+        f"fixture changed: {len(boundary)} boundary / {len(interior)} interior"
+
     limit, _ = evaluate_limit_surface(plane)
-    for v in plane.vertices:
-        if plane.is_boundary_vertex(v):
-            assert np.allclose(limit[v.index], v.position)
+    for v in boundary:
+        assert np.allclose(limit[v.index], v.position), \
+            f"boundary vertex {v.index} was moved off the cage"
+
+    # The complementary half: on a cage that is not already the limit surface,
+    # the interior must move. Without this the whole test is satisfied by an
+    # implementation that copies its input through.
+    bent = _bent_grid()
+    limit_b, _ = evaluate_limit_surface(bent)
+    moved = 0
+    for v in bent.vertices:
+        if bent.is_boundary_vertex(v):
+            assert np.allclose(limit_b[v.index], v.position), \
+                f"boundary vertex {v.index} was moved off the bent cage"
+        else:
+            assert not np.allclose(limit_b[v.index], v.position), \
+                f"interior vertex {v.index} did not travel to the limit surface"
+            moved += 1
+    assert moved == 4, f"expected 4 interior vertices, checked {moved}"
 
 
 def test_limit_surface_is_affine_invariant():
     """Stencil weights must sum to one, or the surface drifts under translation."""
     mesh = create_torus(major_segments=8, minor_segments=6)
     limit_a, _ = evaluate_limit_surface(mesh)
+
+    # Precondition: the identity map is trivially affine invariant, so the
+    # comparison below only means something once the stencil has moved something.
+    cage = np.array([v.position for v in mesh.vertices])
+    assert not np.allclose(limit_a, cage), \
+        "limit surface is identical to the cage - no stencil was applied"
 
     shift = np.array([3.0, -1.5, 7.25])
     moved = mesh.copy()
@@ -354,7 +497,20 @@ def test_evaluate_limit_surface_does_not_mutate_the_callers_mesh():
         f.normal = np.array([0.0, 1.0, 0.0])
     positions_before = np.array([v.position.copy() for v in mesh.vertices])
 
-    evaluate_limit_surface(mesh)
+    limit, normals = evaluate_limit_surface(mesh)
+
+    # Precondition: the call did some work. A function that touches nothing
+    # trivially mutates nothing, so the assertions below need a live result -
+    # and it has to be a plausible one, or returning zeros would also qualify.
+    assert limit.shape == (len(mesh.vertices), 3)
+    assert normals.shape == (len(mesh.vertices), 3)
+    assert np.all(np.isfinite(limit)) and np.all(np.isfinite(normals))
+    assert np.allclose(np.linalg.norm(normals, axis=1), 1.0, atol=1e-9), \
+        "limit normals are not unit length"
+    travel = np.linalg.norm(limit - positions_before, axis=1).max()
+    assert 1e-6 < travel < 0.2, (
+        f"limit positions moved by {travel:.4g}: expected a small but non-zero "
+        "shrink towards the limit surface")
 
     assert all(np.allclose(v.normal, [1.0, 0.0, 0.0]) for v in mesh.vertices), \
         "vertex normals were overwritten"
@@ -378,6 +534,35 @@ def test_evaluate_limit_surface_returns_usable_unit_normals():
         "normals do not point outward on a sphere"
 
 
+def test_limit_normals_are_built_from_the_limit_positions_not_the_cage():
+    """The documented contract: area-weighted normals of the mesh formed by the
+    LIMIT positions.
+
+    On a sphere the limit map is a radial rescale, so cage and limit normals
+    agree and the outward test above cannot tell them apart. A torus separates
+    them by ~5e-2, which is far outside any rounding.
+    """
+    mesh = create_torus(major_segments=8, minor_segments=6)
+    cage = np.array([v.position for v in mesh.vertices])
+    limit, normals = evaluate_limit_surface(mesh)
+
+    assert np.allclose(np.linalg.norm(normals, axis=1), 1.0, atol=1e-12), \
+        "limit normals are not unit length"
+
+    from_limit = reference_vertex_normals(mesh, limit)
+    from_cage = reference_vertex_normals(mesh, cage)
+
+    # Precondition: on this fixture the two really do differ.
+    separation = float(np.abs(from_limit - from_cage).max())
+    assert separation > 1e-3, \
+        f"fixture no longer separates cage from limit normals ({separation:.2e})"
+
+    assert np.allclose(normals, from_limit, atol=1e-12), \
+        "limit normals do not match the area-weighted normals of the limit mesh"
+    assert not np.allclose(normals, from_cage, atol=1e-6), \
+        "limit normals were computed from the cage positions"
+
+
 def test_identify_regular_regions_partitions_every_vertex():
     mesh = create_box()
     regular, irregular = identify_regular_regions(mesh)
@@ -389,6 +574,52 @@ def test_identify_regular_regions_partitions_every_vertex():
     regular, irregular = identify_regular_regions(torus)
     assert len(regular) + len(irregular) == len(torus.vertices)
     assert len(irregular) == 0, "a quad torus is regular everywhere"
+
+
+def test_identify_regular_regions_needs_quad_surroundings_not_just_valence():
+    """Valence 4 is not enough: the 1-ring must be quads.
+
+    Both all-quad fixtures above are blind to this - a rule that only counted
+    neighbours would score them identically.
+    """
+    sphere = create_sphere()          # 8 segments, 6 rings
+    regular, irregular = identify_regular_regions(sphere)
+    assert len(regular) + len(irregular) == len(sphere.vertices) == 42
+
+    val4_on_triangles = [v.index for v in sphere.vertices
+                         if len(sphere.get_vertex_neighbors(v)) == 4
+                         and any(len(sphere.get_face_vertices(f)) != 4
+                                 for f in sphere.get_vertex_faces(v))]
+    # the two rings flanking the poles: valence 4, but sitting on the pole fans
+    assert len(val4_on_triangles) == 16, \
+        f"fixture changed: {len(val4_on_triangles)} valence-4 vertices touch a triangle"
+    reg_idx = {v.index for v in regular}
+    for idx in val4_on_triangles:
+        assert idx not in reg_idx, \
+            f"vertex {idx} has valence 4 but triangles around it - not regular"
+    assert len(regular) == 24 and len(irregular) == 18
+
+    cone = create_cone()              # nothing but triangles and one n-gon
+    regular, irregular = identify_regular_regions(cone)
+    assert len(regular) == 0, "no vertex of a triangulated cone is regular"
+    assert len(irregular) == len(cone.vertices) == 9
+
+
+def test_identify_regular_regions_uses_the_boundary_rule():
+    """On an open patch the rule is valence <= 3, not valence == 4."""
+    plane = create_plane(subdivisions_x=3, subdivisions_y=3)
+    regular, irregular = identify_regular_regions(plane)
+    assert len(regular) + len(irregular) == len(plane.vertices) == 16
+
+    boundary = [v for v in plane.vertices if plane.is_boundary_vertex(v)]
+    assert len(boundary) == 12
+    assert all(len(plane.get_vertex_neighbors(v)) <= 3 for v in boundary)
+
+    # 12 boundary vertices of valence 2 or 3 plus 4 interior of valence 4:
+    # a plain valence == 4 count would report only 4.
+    assert len(regular) == 16, \
+        f"boundary rule ignored: {len(regular)} regular, {len(irregular)} irregular"
+    assert len(irregular) == 0
 
 
 # --------------------------------------------------------------------------
@@ -418,36 +649,87 @@ def test_extrude_edges_closes_a_box_when_all_boundary_edges_are_extruded():
     assert len(boundary) == 4
     out = extrude_edges(plane, boundary, distance=0.5,
                         direction=np.array([0.0, 1.0, 0.0]))
+
+    # The real code `continue`s past any edge it cannot handle, so "extruded
+    # nothing" is a live failure mode and the plane satisfies every winding
+    # check on its own. Pin the band that must have been built: one strip quad
+    # per boundary edge and two new vertices each.
+    assert len(out.faces) == len(plane.faces) + 4 == 5, \
+        f"expected the source face plus 4 strip quads, got {len(out.faces)}"
+    assert len(out.vertices) == len(plane.vertices) + 8 == 12, \
+        f"expected 8 new vertices, got {len(out.vertices) - len(plane.vertices)}"
+
     assert_no_repeated_directed_edge(out)
+    # Every strip quad twins with the source face and with its two neighbours;
+    # only the free outer rim (4 quads x 3 open sides) stays dangling.
+    assert dangling_half_edges(out) == 12, \
+        f"strip is not a manifold band: {dangling_half_edges(out)} dangling half-edges"
 
 
 def test_extrude_edges_normalises_the_direction_vector():
     """Finding 9: `distance` was scaled by |direction|."""
     plane = create_plane()
     e0 = [e.index for e in plane.edges if plane.is_boundary_edge(e)][:1]
+    edge = plane.edges[e0[0]]
+    src_v1 = edge.half_edge.prev.vertex.index
+    src_v2 = edge.half_edge.vertex.index
+
     unit = extrude_edges(plane, e0, distance=1.0, direction=np.array([0.0, 1.0, 0.0]))
     long = extrude_edges(plane, e0, distance=1.0, direction=np.array([0.0, 5.0, 0.0]))
+
+    # Anchor the magnitude to `distance`, not just the agreement of two results:
+    # a version that ignored `distance` altogether would also agree with itself.
+    assert len(unit.vertices) == len(plane.vertices) + 2, \
+        f"nothing was extruded ({len(unit.vertices)} vertices)"
+    assert np.linalg.norm(unit.vertices[-2].position
+                          - plane.vertices[src_v1].position) == pytest.approx(1.0, abs=1e-12)
+    assert np.linalg.norm(unit.vertices[-1].position
+                          - plane.vertices[src_v2].position) == pytest.approx(1.0, abs=1e-12)
+
     assert np.allclose(unit.vertices[-1].position, long.vertices[-1].position), \
         "extrusion distance depends on the length of `direction`"
 
 
 def test_extrude_faces_normalises_the_direction_vector():
     box = create_box()
+    src = [v.index for v in box.get_face_vertices(box.faces[0])]
     unit = extrude_faces(box, [0], distance=1.0, direction=np.array([0.0, 0.0, 1.0]))
     long = extrude_faces(box, [0], distance=1.0, direction=np.array([0.0, 0.0, 9.0]))
+
+    # Without this, "extruded nothing" makes both results the untouched box and
+    # the comparison below is trivially true.
+    assert len(unit.vertices) == len(box.vertices) + 4, \
+        f"nothing was extruded ({len(unit.vertices)} vertices)"
+    for k, v_idx in enumerate(src):
+        offset = unit.vertices[len(box.vertices) + k].position - box.vertices[v_idx].position
+        assert np.linalg.norm(offset) == pytest.approx(1.0, abs=1e-12), \
+            f"new vertex {k} moved by {np.linalg.norm(offset)}, expected the distance 1.0"
+
     assert np.allclose(np.array([v.position for v in unit.vertices]),
                        np.array([v.position for v in long.vertices]))
 
 
 def test_extrude_faces_survives_a_degenerate_face():
     """Finding 9: a zero-area face has a zero normal, and the unguarded divide
-    turned every new vertex into NaN."""
+    turned every new vertex into NaN. The documented behaviour is to skip it."""
     mesh = HalfEdgeMesh.from_arrays(
         [[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]], [[0, 1, 2, 3]])
     out = extrude_faces(mesh, [0], distance=0.5)
     positions = np.array([v.position for v in out.vertices])
     assert not np.isnan(positions).any(), "degenerate face produced NaN vertices"
     assert not np.isinf(positions).any()
+
+    # Skipped, not extruded to some other finite garbage.
+    assert len(out.vertices) == 4 and len(out.faces) == 1, \
+        f"degenerate face was not skipped: {len(out.vertices)} verts, {len(out.faces)} faces"
+    assert np.allclose(positions, np.array([v.position for v in mesh.vertices]))
+
+    # Positive control in the same test: the skip must be about *this* face, not
+    # a globally inert extrude_faces hiding behind a no-NaN assertion.
+    box = create_box()
+    good = extrude_faces(box, [0], distance=0.5)
+    assert len(good.vertices) == len(box.vertices) + 4
+    assert len(good.faces) == len(box.faces) + 4
 
 
 def test_extrude_faces_still_produces_a_solid():
@@ -494,14 +776,32 @@ def test_insert_edge_loop_keeps_the_mesh_closed():
         if abs(a[1] - b[1]) > 1e-6:
             target = e.index
             break
+    assert target is not None
     out = insert_edge_loop(cyl, target, position=0.5)
+
+    # An unmodified cylinder is already closed, so the closure checks only mean
+    # something once the loop is known to be there: 8 new vertices around the
+    # ring and each of the 8 wall quads split in two.
+    assert len(out.vertices) == len(cyl.vertices) + 8, \
+        f"expected 8 new vertices, got {len(out.vertices) - len(cyl.vertices)}"
+    assert len(out.faces) == len(cyl.faces) + 8, \
+        f"expected 8 extra faces, got {len(out.faces) - len(cyl.faces)}"
+
     assert dangling_half_edges(out) == 0
     assert solid_report(out)['watertight']
+    # catches a split quad that came out mis-wound, which the pair above cannot
+    assert_no_repeated_directed_edge(out)
 
 
 def test_insert_edge_loop_is_symmetric_about_the_midpoint():
     """position=p and position=1-p must give mirrored loops, which only holds
-    if the loop is oriented consistently."""
+    if the loop is oriented consistently.
+
+    Compared per loop, not as a multiset: for an edge (a, b) the point at p is
+    0.75*ya + 0.25*yb and at 1-p it is the swap, so flipping one edge moves a
+    value from one list to the other and the multiset mirror survives every
+    zigzag pattern. A single Y per loop is what 'consistently oriented' means.
+    """
     def loop_y(pos):
         cyl = create_cylinder(radius=1.0, height=2.0, segments=8)
         target = next(e.index for e in cyl.edges
@@ -512,6 +812,11 @@ def test_insert_edge_loop_is_symmetric_about_the_midpoint():
         return sorted(float(v.position[1]) for v in out.vertices[before:])
 
     lo, hi = loop_y(0.25), loop_y(0.75)
+    assert len(lo) == len(hi) == 8, f"no loop was inserted: {len(lo)} / {len(hi)} points"
+    # a 2.0-high cylinder runs from Y=-1 to Y=+1, so a quarter-way loop is flat
+    # at -0.5 and its mirror flat at +0.5
+    assert set(np.round(lo, 12)) == {-0.5}, f"loop at 0.25 zigzags: {lo}"
+    assert set(np.round(hi, 12)) == {0.5}, f"loop at 0.75 zigzags: {hi}"
     assert np.allclose(lo, -np.array(hi)[::-1]), f"{lo} vs {hi}"
 
 
@@ -526,6 +831,22 @@ def test_mirror_mesh_drops_faces_lying_on_the_mirror_plane():
     out = mirror_mesh(plane, axis='y')
     assert len(out.faces) == 1, \
         f"face on the mirror plane was duplicated ({len(out.faces)} faces)"
+    assert_no_repeated_directed_edge(out)
+
+    # A one-face fixture cannot tell "dropped the on-plane face" from "mirrored
+    # nothing at all". Mix the two cases: one quad in y = 0, one at y = 1.
+    mixed = HalfEdgeMesh.from_arrays(
+        [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1],
+         [0, 1, 0], [1, 1, 0], [1, 1, 1], [0, 1, 1]],
+        [[0, 1, 2, 3],        # lies in the mirror plane -> reflection dropped
+         [4, 5, 6, 7]])       # off the plane -> must be reflected to y = -1
+    out = mirror_mesh(mixed, axis='y')
+    assert len(out.faces) == 3, \
+        f"expected 2 originals + 1 reflection, got {len(out.faces)}"
+    assert len(out.vertices) == 12, \
+        f"expected 8 originals + 4 reflected, got {len(out.vertices)}"
+    ys = sorted({round(float(v.position[1]), 12) for v in out.vertices})
+    assert ys == [-1.0, 0.0, 1.0], f"reflection is missing or misplaced: {ys}"
     assert_no_repeated_directed_edge(out)
 
 
@@ -559,7 +880,14 @@ def test_mirror_mesh_is_not_quadratic():
     t0 = time.perf_counter()
     out = mirror_mesh(mesh, axis='x')
     dt = time.perf_counter() - t0
-    assert len(out.faces) >= len(mesh.faces)
+    # `>= len(mesh.faces)` accepts a mirror that produced nothing as long as it
+    # was fast. No face of a subdivided box lies wholly in x = 0, so every face
+    # must have been reflected; the box is symmetric about x = 0, so every
+    # mirrored vertex merges back onto an existing one.
+    assert len(out.faces) == 2 * len(mesh.faces), \
+        f"mirroring gave {len(out.faces)} faces, expected {2 * len(mesh.faces)}"
+    assert len(out.vertices) == len(mesh.vertices), \
+        f"merge failed: {len(out.vertices)} vertices, expected {len(mesh.vertices)}"
     assert dt < 5.0, f"mirroring {len(mesh.vertices)} vertices took {dt:.1f}s"
 
 
@@ -574,6 +902,15 @@ def test_bridge_faces_leaves_the_mesh_alone_when_loops_do_not_match():
     wall, cap = 0, len(cyl.faces) - 1
     before_faces = len(cyl.faces)
     before_verts = len(cyl.vertices)
+    before_positions = np.array([v.position for v in cyl.vertices])
+
+    # Precondition: this request really is unbridgeable. If create_cylinder ever
+    # changed so the two loops matched, the test would silently start measuring
+    # the other branch and still pass.
+    assert len(cyl.get_face_vertices(cyl.faces[wall])) == 4
+    assert len(cyl.get_face_vertices(cyl.faces[cap])) == 8
+    assert (len(cyl.get_face_vertices(cyl.faces[wall]))
+            != len(cyl.get_face_vertices(cyl.faces[cap])))
 
     out = bridge_faces(cyl, [wall], [cap])
 
@@ -581,7 +918,20 @@ def test_bridge_faces_leaves_the_mesh_alone_when_loops_do_not_match():
         f"unbridgeable request destroyed the input: {before_faces} faces in, "
         f"{len(out.faces)} out")
     assert len(out.vertices) == before_verts
+    assert np.allclose(np.array([v.position for v in out.vertices]), before_positions)
     assert solid_report(out)['watertight'], "input was left with holes"
+
+    # Positive control: refusing everything is also "not destroying the input",
+    # so the refusal has to be shown to be selective.
+    two_quads = HalfEdgeMesh.from_arrays(
+        [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+         [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]],
+        [[0, 1, 2, 3], [7, 6, 5, 4]])
+    bridged = bridge_faces(two_quads, [0], [1])
+    assert len(bridged.faces) == 4, (
+        "two matching 4-vertex loops must be bridged: expected the 2 caps "
+        f"replaced by 4 side quads, got {len(bridged.faces)} faces")
+    assert len(bridged.vertices) == 8
 
 
 def test_bridge_faces_still_bridges_matching_loops():
@@ -650,6 +1000,17 @@ def test_knife_cut_keeps_the_mesh_watertight():
     fv = [v.index for v in box.get_face_vertices(box.faces[0])]
     z = box.vertices[fv[0]].position[2]
     out = knife_cut(box, 0, np.array([-5.0, 0.0, z]), np.array([5.0, 0.0, z]))
+
+    # The uncut box is already watertight with volume 8, and no cut can change
+    # the volume, so every assertion below holds on the *input*. Pin the cut
+    # itself first: one face becomes two, and two points are inserted.
+    assert len(out.faces) == len(box.faces) + 1, \
+        f"the cut face should become two faces ({len(out.faces)} vs {len(box.faces)})"
+    assert len(out.vertices) == len(box.vertices) + 2, \
+        f"expected 2 new points on the cut, got {len(out.vertices) - len(box.vertices)}"
+
+    # trimesh's is_watertight only counts edge multiplicity, so the dangling
+    # half-edge count is what actually rules out a T-junction here.
     assert dangling_half_edges(out) == 0, "knife cut opened the mesh"
     rep = solid_report(out)
     assert rep['watertight'], rep

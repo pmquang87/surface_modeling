@@ -133,6 +133,41 @@ def _normal_labels(panel):
     return np.array(values, dtype=float)
 
 
+def _block_colours(panel, needle):
+    """Foreground colours actually stored on the log line containing `needle`.
+
+    ``toPlainText()`` throws every char format away, so it can never see a red
+    colour bleeding into the following line — the document has to be walked.
+    """
+    doc = panel.document()
+    for i in range(doc.blockCount()):
+        block = doc.findBlockByNumber(i)
+        if needle not in block.text():
+            continue
+        colours = set()
+        it = block.begin()
+        while not it.atEnd():
+            fragment = it.fragment()
+            if fragment.isValid():
+                colours.add(fragment.charFormat().foreground().color().name())
+            it += 1
+        return colours
+    return None
+
+
+def _spy_cell_picking(vp, monkeypatch):
+    """Record the ``through`` flag on every PyVista picker (re-)arm."""
+    calls = []
+    real = vp.plotter.enable_cell_picking
+
+    def spy(**kwargs):
+        calls.append(kwargs.get('through'))
+        return real(**kwargs)
+
+    monkeypatch.setattr(vp.plotter, 'enable_cell_picking', spy)
+    return calls
+
+
 def _count_to_pyvista(mesh):
     """Patch mesh.to_pyvista so the test can see every topology rebuild."""
     calls = []
@@ -277,12 +312,15 @@ def test_mesh_swap_clears_stale_selection(window):
     vp.set_mesh(big)
     vp.set_selection_mode('face')
     high = len(big.faces) - 1
-    vp.highlight_selection([high], 'face')
-    assert vp.get_selected_faces() == [high]
+    # Index 0 is valid in BOTH meshes: selecting only an out-of-range index
+    # would let plain clamping satisfy the assertion below even if the
+    # identity-change reset were gone.
+    vp.highlight_selection([0, high], 'face')
+    assert sorted(vp.get_selected_faces()) == [0, high]
 
-    small = _box()  # 6 faces — index `high` no longer exists
+    small = _box()  # 6 faces — index `high` no longer exists, index 0 does
     vp.update_mesh(small)  # must not raise IndexError
-    assert vp.get_selected_faces() == []
+    assert vp.get_selected_faces() == [], "index 0 survived the mesh swap"
 
 
 def test_highlight_selection_clamps_out_of_range_indices(window):
@@ -319,9 +357,13 @@ def test_extract_original_cell_ids_handles_multiblock_and_legacy_keys():
     a = pv.Cube().cast_to_unstructured_grid()
     a.cell_data['original_cell_ids'] = np.arange(a.n_cells)
     b = pv.Cube().cast_to_unstructured_grid()
-    b.cell_data['vtkOriginalCellIds'] = np.arange(b.n_cells)
+    # Distinct id ranges: with both blocks numbered 0..n the values cannot tell
+    # a correct read from counting the first block twice, or from block-local
+    # indices being reported instead of global ones.
+    b.cell_data['vtkOriginalCellIds'] = np.arange(b.n_cells) + 100
     ids = MeshViewport._extract_original_cell_ids(pv.MultiBlock([a, b]))
     assert len(ids) == a.n_cells + b.n_cells
+    assert ids == list(range(a.n_cells)) + list(range(100, 100 + b.n_cells))
     assert MeshViewport._extract_original_cell_ids(None) == []
 
 
@@ -346,10 +388,19 @@ def test_box_pick_callback_selects_vertices_of_picked_faces(window):
 
     grid = mesh.to_pyvista().cast_to_unstructured_grid()
     grid.cell_data['original_cell_ids'] = np.arange(grid.n_cells)
-    picked = grid.extract_cells([0])  # what the frustum extraction hands back
+    # Two opposite faces of the cube: a callback that collapses every picked id
+    # onto one cell still returns "the right number of vertices" for a single
+    # quad, so it has to be asked for a disjoint pair.
+    picked = grid.extract_cells([0, 1])  # what the frustum extraction hands back
+
+    expected = sorted({v.index
+                       for fid in (0, 1)
+                       for v in mesh.get_face_vertices(mesh.faces[fid])})
+    assert len(expected) == 8, expected  # precondition: the faces are disjoint
+
     vp._on_box_picked(picked)
 
-    assert len(vp._selected_indices) == 4  # one quad
+    assert sorted(vp._selected_indices) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -371,18 +422,38 @@ def test_custom_style_survives_enabling_box_picking(window):
 
 
 def test_style_supports_rubber_band_and_trackball_navigation():
+    # vtkInteractorStyleRubberBandPick already derives from
+    # vtkInteractorStyleTrackballCamera, so asserting both base classes is one
+    # check, not two. What the viewport actually relies on is the gate that
+    # keeps the left button free for single-element picking.
     assert issubclass(SolidWorksStyle, pv._vtk.vtkInteractorStyleRubberBandPick)
-    assert issubclass(SolidWorksStyle, pv._vtk.vtkInteractorStyleTrackballCamera)
+
+    style = SolidWorksStyle(plotter=None)
+    assert style.rubber_band_enabled is False   # left button free for picking
+    style.set_rubber_band_enabled(True)
+    assert style.rubber_band_enabled is True
+    style.set_rubber_band_enabled(0)            # truthiness, not identity
+    assert style.rubber_band_enabled is False
 
 
-def test_toggling_select_through_does_not_raise(window):
+def test_toggling_select_through_does_not_raise(window, monkeypatch):
     vp = window.viewport
     vp.set_selection_method('box')
+    # Spy on the plotter, not on the viewport flag: a setter that only records
+    # the flag never re-arms the picker, so `through` never reaches VTK and
+    # "does not raise" becomes true for the trivial reason that nothing runs.
+    calls = _spy_cell_picking(vp, monkeypatch)
+
     for through in (False, True, False, True):
         vp.set_box_select_through(through)  # used to raise PyVistaPickingError
         assert vp.box_select_through is through
+        assert calls and calls[-1] is through, (
+            f"the picker was not re-armed with through={through}: {calls}"
+        )
         assert vp._box_picking_enabled
         assert vp.plotter.iren.interactor.GetInteractorStyle() is vp._custom_style
+
+    assert len(calls) == 4, f"expected one re-arm per toggle, got {calls}"
 
 
 def test_double_enable_without_disable_is_the_original_bug(window):
@@ -399,15 +470,24 @@ def test_double_enable_without_disable_is_the_original_bug(window):
     assert vp._box_picking_enabled
 
 
-def test_select_through_checkbox_signal_path(window):
+def test_select_through_checkbox_signal_path(window, monkeypatch):
     """The panel wires cb_through.toggled straight into the viewport."""
     vp = window.viewport
     vp.set_selection_method('box')
+    window.selection_panel.cb_through.setChecked(False)
+    calls = _spy_cell_picking(vp, monkeypatch)
+
     window.selection_panel.cb_through.setEnabled(True)
     window.selection_panel.cb_through.setChecked(True)   # must not raise
     assert vp.box_select_through is True
+    # The observable downstream effect, not the flag the slot mirrors: a
+    # checkbox wired to a dead setter must not pass.
+    assert calls and calls[-1] is True, f"picker never re-armed: {calls}"
+
     window.selection_panel.cb_through.setChecked(False)
     assert vp.box_select_through is False
+    assert calls and calls[-1] is False, f"picker never re-armed: {calls}"
+    assert len(calls) == 2
 
 
 def test_switching_back_to_pick_disables_box_picking(window):
@@ -517,14 +597,49 @@ def test_continuity_is_passed_as_the_string_the_backend_expects(window, monkeypa
         assert captured['continuity'] == expected
 
 
-def test_continuity_string_reaches_the_fitter_weight_table():
+class _SpyFitter:
+    """Stands in for G3Fitter and records what convert() builds it with."""
+
+    constructed = []      # continuity_weight of every instance
+    fitted = []           # quad_mesh_data of every fit_surface call
+
+    def __init__(self, continuity_weight=20.0, **kwargs):
+        type(self).constructed.append(continuity_weight)
+
+    def fit_surface(self, quad_mesh_data):
+        type(self).fitted.append(quad_mesh_data)
+        return []
+
+    @classmethod
+    def install(cls, monkeypatch):
+        cls.constructed = []
+        cls.fitted = []
+        # converter.py imports G3Fitter *inside* generate_patches, so the
+        # defining module is what has to be patched.
+        import src.nurbs.g3_fitter as g3_fitter
+        monkeypatch.setattr(g3_fitter, 'G3Fitter', cls)
+        return cls
+
+
+def test_continuity_string_reaches_the_fitter_weight_table(monkeypatch):
     """The converter maps 'G0'..'G3' to distinct fitter weights; ints do not."""
     from src.nurbs.converter import SubDToNURBSConverter
-    weights = {'G0': 0.0, 'G1': 5.0, 'G2': 20.0, 'G3': 50.0}
-    for key in weights:
-        assert SubDToNURBSConverter(continuity=key).continuity in weights
-    # An int (the old GUI value) is not a key -> the dropdown had no effect.
-    assert 2 not in weights
+
+    # Restating the table inside the test proves nothing about src; capture the
+    # weight the real converter constructs the fitter with instead.
+    spy = _SpyFitter.install(monkeypatch)
+    for key in ('G0', 'G1', 'G2', 'G3'):
+        SubDToNURBSConverter(continuity=key).convert(_box())
+
+    seen = list(spy.constructed)
+    assert len(seen) == 4, seen
+    assert len(set(seen)) == 4, f"continuity levels collapsed to {set(seen)}"
+    assert seen == sorted(seen), f"stricter continuity must weigh more: {seen}"
+
+    # An int (the old GUI value) is not a key -> it silently falls back to G2.
+    spy.constructed.clear()
+    SubDToNURBSConverter(continuity=2).convert(_box())
+    assert spy.constructed == [seen[2]], spy.constructed
 
 
 def test_convert_nurbs_forwards_the_loaded_reference_mesh(window, monkeypatch):
@@ -549,18 +664,45 @@ def test_convert_nurbs_forwards_the_loaded_reference_mesh(window, monkeypatch):
     assert captured['reference_mesh'] is reference
 
 
-def test_converter_convert_accepts_the_reference_mesh_kwarg():
+def test_converter_convert_accepts_the_reference_mesh_kwarg(monkeypatch):
     import inspect
     from src.nurbs.converter import SubDToNURBSConverter
     sig = inspect.signature(SubDToNURBSConverter.convert)
     assert 'reference_mesh' in sig.parameters
 
+    # Declaring the parameter is not consuming it. Capture the sample points the
+    # converter hands the fitter and check they were projected onto the
+    # reference surface instead of the cage's own limit approximation.
+    spy = _SpyFitter.install(monkeypatch)
+
+    SubDToNURBSConverter().convert(_box(2.0))
+    without = np.array([q['dense_points'] for q in spy.fitted[-1]])
+
+    SubDToNURBSConverter().convert(_box(2.0), reference_mesh=_box(4.0))
+    with_ref = np.array([q['dense_points'] for q in spy.fitted[-1]])
+
+    assert with_ref.shape == without.shape
+    assert not np.allclose(with_ref, without), "reference_mesh was accepted and ignored"
+    # The reference box has half-extent 2.0 and every sample lands on its skin.
+    assert np.abs(with_ref).max() == pytest.approx(2.0, abs=1e-6)
+    assert np.abs(without).max() < 1.5
+
 
 def test_set_reference_mesh_stores_the_mesh(window):
-    reference = _box(3.0)
+    reference = _box(3.0)          # half-extent 1.5
     window.viewport.set_reference_mesh(reference)
     assert window.viewport.reference_mesh is reference
     assert window.viewport.proximity_query is not None
+
+    # `is not None` cannot tell a query built from THIS mesh from one built off
+    # unrelated geometry, which would silently break Snap-to-Reference and
+    # Shrink Wrap. Ask it something only this box can answer.
+    closest, dist, _ = window.viewport.proximity_query.on_surface(
+        np.array([[10.0, 0.0, 0.0]])
+    )
+    assert np.allclose(closest[0], [1.5, 0.0, 0.0], atol=1e-6), closest
+    assert dist[0] == pytest.approx(8.5, abs=1e-6)
+
     window.viewport.set_reference_mesh(None)
     assert window.viewport.reference_mesh is None
     assert window.viewport.proximity_query is None
@@ -593,6 +735,16 @@ def test_error_colour_does_not_bleed_into_the_next_line(window):
     window._append_log("all good")
     assert "boom" in window.log_panel.toPlainText()
     assert "all good" in window.log_panel.toPlainText()
+
+    # The point of the test: the colour, not the text. Both lines exist under a
+    # bleeding implementation too.
+    error_colours = _block_colours(window.log_panel, "boom")
+    normal_colours = _block_colours(window.log_panel, "all good")
+    assert error_colours == {"#cc0000"}, error_colours
+    assert normal_colours is not None
+    assert "#cc0000" not in normal_colours, (
+        f"the error colour bled into the following line: {normal_colours}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +805,18 @@ def test_populating_the_panel_does_not_emit_edits(window):
     emitted = []
     window.properties_panel.property_changed.connect(lambda *a: emitted.append(a))
     window.properties_panel.set_vertex_properties(5, mesh)
+
+    # Precondition: the editors were really built and show the live value. A
+    # panel that populates nothing emits nothing either, and would otherwise
+    # satisfy the silence assertion below for the wrong reason.
+    from PySide6.QtWidgets import QDoubleSpinBox
+    layout = window.properties_panel.form_layout
+    spins = [layout.itemAt(i).widget() for i in range(layout.count())
+             if isinstance(layout.itemAt(i).widget(), QDoubleSpinBox)]
+    assert len(spins) == 3, "panel did not populate the X/Y/Z editors"
+    assert spins[0].value() == pytest.approx(1.234567)
+    assert window.properties_panel.current_target == ('vertex', 5)
+
     assert emitted == []
     assert mesh.vertices[5].position[0] == pytest.approx(1.234567)
 
@@ -668,11 +832,28 @@ def test_property_change_without_a_target_is_a_no_op(window):
 def test_stale_vertex_target_after_mesh_swap_is_ignored(window):
     big = primitives.create_sphere(radius=1.0, segments=12, rings=10)
     window.current_mesh = big
-    window.properties_panel.set_vertex_properties(len(big.vertices) - 1, big)
+    stale_index = len(big.vertices) - 1
+    window.properties_panel.set_vertex_properties(stale_index, big)
+    # Precondition: the defect really is injected — the panel points at an index
+    # the next mesh does not have.
+    assert window.properties_panel.current_target == ('vertex', stale_index)
 
     window.current_mesh = _box()
+    assert stale_index >= len(window.current_mesh.vertices)
+
+    before = np.array([v.position.copy() for v in window.current_mesh.vertices])
     window.on_property_changed('pos_x', 5.0)  # index no longer exists
-    assert all(abs(v.position[0]) <= 1.0 for v in window.current_mesh.vertices)
+    after = np.array([v.position for v in window.current_mesh.vertices])
+
+    # Any implementation that clamps or wraps the stale index writes 5.0 onto a
+    # live vertex; a bound check leaves the mesh untouched.
+    assert np.array_equal(before, after), "stale index was clamped onto a live vertex"
+
+    # Positive control: "ignored" must mean the guard fired, not that the whole
+    # write-back path is dead.
+    window.properties_panel.set_vertex_properties(2, window.current_mesh)
+    window.on_property_changed('pos_x', 5.0)
+    assert window.current_mesh.vertices[2].position[0] == pytest.approx(5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -684,8 +865,25 @@ def test_subdivide_accepts_the_smooth_kwarg():
     from src.subd import catmull_clark
     sig = inspect.signature(catmull_clark.subdivide)
     assert 'smooth' in sig.parameters
-    mesh = catmull_clark.subdivide(_box(), 1, smooth=True)
-    assert len(mesh.faces) == 24
+
+    cage = np.array([v.position for v in _box().vertices])
+    smooth = catmull_clark.subdivide(_box(), 1, smooth=True)
+    linear = catmull_clark.subdivide(_box(), 1, smooth=False)
+
+    # One Catmull-Clark level turns 6 quads into 24 either way, so the face
+    # count cannot tell a consumed `smooth` from an ignored one - the vertex
+    # positions can.
+    assert len(smooth.faces) == len(linear.faces) == 24
+    ps = np.array([v.position for v in smooth.vertices])
+    pl = np.array([v.position for v in linear.vertices])
+    assert ps.shape == pl.shape
+    assert not np.allclose(ps, pl), "smooth= had no effect on the geometry"
+
+    # Linear subdivision leaves the cage corners exactly where they were;
+    # smoothing pulls them in towards the centroid.
+    assert np.allclose(pl[:len(cage)], cage)
+    assert np.abs(ps[:len(cage)]).max() < 0.9
+    assert np.linalg.norm(ps, axis=1).max() < np.linalg.norm(pl, axis=1).max()
 
 
 def test_export_failure_surfaces_as_a_message_box(window, monkeypatch):

@@ -138,10 +138,19 @@ class TestMeshOperationCommand:
 
         cmd = MeshOperationCommand("Shell", window, lambda m: make_grid(3, 3), window.current_mesh)
         cmd.execute()
+
+        # execute() already notified once, so the counters have to be bracketed
+        # across undo() - otherwise both assertions below hold before undo runs.
+        calls_before = window.viewport.update_calls
+        msgs_before = len(window.messages)
+
         cmd.undo()   # keep_selection= / _update_status() would blow up here
 
-        assert window.viewport.update_calls > 0
-        assert window.messages
+        assert window.viewport.update_calls == calls_before + 1
+        assert len(window.messages) == msgs_before + 1
+        assert window.messages[-1] == "Shell: undone"
+        assert len(window.current_mesh.faces) == 4          # the 2x2 grid is back
+        assert window.viewport.mesh is window.current_mesh
 
     def test_undo_restores_empty_document(self):
         window = FakeMainWindow(None)   # nothing loaded yet
@@ -152,10 +161,16 @@ class TestMeshOperationCommand:
         cmd = MeshOperationCommand("Create Box", window, operation)
         cmd.execute()
         assert window.current_mesh is not None
+        assert window.viewport.update_calls == 1
+        assert window.viewport.clear_calls == 0
 
         cmd.undo()
 
         assert window.current_mesh is None
+        # `viewport.mesh is None` alone cannot tell clear() from
+        # update_mesh(None) - the fake assigns self.mesh either way.
+        assert window.viewport.clear_calls == 1     # empty document -> clear()
+        assert window.viewport.update_calls == 1    # only execute() pushed a mesh
         assert window.viewport.mesh is None
 
     def test_redo_reuses_cached_mesh(self):
@@ -205,6 +220,10 @@ class TestFeatureTreeRebuild:
         tree = make_tree(['A', 'B', 'C'])
         tree.feature_evaluator = make_evaluator(calls)
         tree.features[1].enabled = False
+        # Seed a stale snapshot: a fresh Feature has mesh_snapshot None already,
+        # so without this the invalidation assertion below holds before rebuild.
+        tree.features[1].mesh_snapshot = FakeMesh(('stale',))
+        assert tree.features[1].mesh_snapshot is not None
 
         tree.rebuild(0)
 
@@ -310,6 +329,24 @@ class TestTVertexClassification:
         assert border.valence == 3
         assert not border.is_t_junction()      # boundary, not a T-junction
         assert not border.is_extraordinary()
+
+        # Positive control: every assertion above is negative, so predicates
+        # stubbed to a constant False would satisfy the whole test. Pin two
+        # vertices that MUST be classified.
+        probe = TMesh()
+        dangling = probe.add_vertex(0.0, 0.0, 0.0, is_boundary=True)
+        interior = probe.add_vertex(1.0, 0.0, 0.0)
+        up = probe.add_vertex(1.0, 1.0, 0.0, is_boundary=True)
+        down = probe.add_vertex(1.0, -1.0, 0.0, is_boundary=True)
+        probe.add_edge(dangling.id, interior.id, 'right', 'left')
+        probe.add_edge(interior.id, up.id, 'up', 'down')
+        probe.add_edge(interior.id, down.id, 'down', 'up')
+
+        assert dangling.valence == 1
+        assert dangling.is_extraordinary()     # boundary valence not in (2, 3)
+        assert interior.valence == 3
+        assert interior.is_t_junction()        # interior valence 3
+        assert not interior.is_extraordinary()
 
     def test_interior_valence_three_is_t_junction(self):
         mesh = TMesh()

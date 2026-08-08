@@ -17,6 +17,9 @@ from src.core.halfedge_mesh import HalfEdgeMesh
 
 def assert_half_edge_invariants(mesh: HalfEdgeMesh):
     """The invariants that must hold for *any* input, manifold or not."""
+    # Without this the whole helper is a loop over an empty list: an add_face
+    # that silently builds nothing would satisfy every caller vacuously.
+    assert mesh.half_edges, "invariant check ran on an empty mesh"
     for he in mesh.half_edges:
         assert he.twin is not he, f"HalfEdge {he.index} is its own twin"
         assert he.twin is None or he.twin.twin is he, (
@@ -118,23 +121,64 @@ def test_duplicate_face_does_not_corrupt_topology():
         mesh.add_vertex(p)
     mesh.add_face([0, 1, 2])
     mesh.add_face([1, 3, 2])
+
+    # Precondition: the two legitimate faces really do share one twinned edge,
+    # so the duplicates below have something they could corrupt.
+    he_12 = mesh._he_dict[(1, 2)]
+    he_21 = mesh._he_dict[(2, 1)]
+    assert he_12.twin is he_21 and he_21.twin is he_12
+    shared_edge = he_12.edge
+    assert he_21.edge is shared_edge
+    n_he, n_edges, n_faces = len(mesh.half_edges), len(mesh.edges), len(mesh.faces)
+    assert (n_he, n_edges, n_faces) == (6, 5, 2)
+
     mesh.add_face([0, 1, 2])   # exact duplicate
     mesh.add_face([2, 0, 1])   # rotated duplicate, same directed edges
 
     assert_half_edge_invariants(mesh)
 
+    # The duplicates must get their own (boundary) half-edges and edges instead
+    # of stealing the pairing the first two faces established.
+    assert he_12.twin is he_21 and he_21.twin is he_12
+    assert he_12.edge is shared_edge and he_21.edge is shared_edge
+    assert len(mesh.faces) == n_faces + 2
+    assert len(mesh.half_edges) == n_he + 6
+    assert len(mesh.edges) == n_edges + 6
+    # Still exactly one twin pair - every duplicate half-edge stays unpaired.
+    assert sum(1 for he in mesh.half_edges if he.twin is not None) == 2
+
 
 def test_bowtie_fan_keeps_twin_involution():
-    """Four triangles all hanging off the same directed edge (0,1)."""
+    """Four triangles all hanging off the same edge {0, 1}.
+
+    The winding alternates on purpose: with all four faces wound the same way
+    the directed edge (1,0) is never produced, nothing can ever pair, and every
+    twin assertion below would be vacuously true.
+    """
     mesh = HalfEdgeMesh()
     mesh.add_vertex([0, 0, 0])
     mesh.add_vertex([1, 0, 0])
     for k in range(4):
         mesh.add_vertex([0.5, np.cos(k), np.sin(k)])
     for k in range(4):
-        mesh.add_face([0, 1, 2 + k])
+        mesh.add_face([0, 1, 2 + k] if k % 2 == 0 else [1, 0, 2 + k])
+
+    # Preconditions: the fan was really built, and it really does contain the
+    # twin pairing whose involution the invariants below check.
+    assert len(mesh.faces) == 4
+    assert len(mesh.half_edges) == 12
+    twinned = [he for he in mesh.half_edges if he.twin is not None]
+    assert len(twinned) >= 2, "fan built no twin pairs - nothing to test"
 
     assert_half_edge_invariants(mesh)
+
+    # The first pairing of the shared edge wins; the two later faces reusing the
+    # same directed edges get boundary half-edges of their own.
+    he_01 = mesh._he_dict[(0, 1)]
+    he_10 = mesh._he_dict[(1, 0)]
+    assert he_01.twin is he_10 and he_10.twin is he_01
+    assert he_01.edge is he_10.edge
+    assert len(mesh.edges) == 11
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +217,13 @@ def test_boundary_vertex_fan_walks_both_directions():
     # Vertex 4 is reachable only through the half-edge 4->0; this structure has
     # no boundary half-edges, so vertex 0 owns no outgoing spoke towards it and
     # an outgoing-fan walk cannot report it.
-    assert {1, 2, 3}.issubset(neighbours)
-    assert mesh.vertex_valence(v0) == len(mesh.get_vertex_neighbors(v0))
-    assert mesh.vertex_valence(v0) >= 3
+    assert neighbours == {1, 2, 3}
+    # Asserting the number, not `len(get_vertex_neighbors(...))` - vertex_valence
+    # *is* that len(), so comparing the two can never fail.
+    assert mesh.vertex_valence(v0) == 3
+    # The two-sided walk must not hand the same spoke back twice.
+    fan = mesh.get_vertex_fan(v0)
+    assert len({he.index for he in fan}) == len(fan) == 3
 
 
 def test_boundary_vertex_normal_uses_whole_fan():
@@ -254,6 +302,13 @@ def test_face_normal_is_translation_invariant():
         f = mesh.add_face([0, 1, 2, 3])
         mesh.compute_face_normals()
         normals.append(f.normal.copy())
+
+    # The absolute answer, at BOTH offsets. Comparing the two against each other
+    # alone proves nothing: a no-op (both stay zero) and the pre-fix corner
+    # triangle (both come out as [0, 0, -1]) are translation invariant too.
+    for shift, n in zip(("origin", "far away"), normals):
+        assert np.linalg.norm(n) == pytest.approx(1.0, abs=1e-9), f"{shift}: {n}"
+        assert np.allclose(n, [0.0, 0.0, 1.0], atol=1e-9), f"{shift}: {n}"
     assert np.allclose(normals[0], normals[1], atol=1e-9)
 
 
@@ -272,6 +327,15 @@ def test_add_face_rejects_degenerate_vertex_list():
     assert mesh.faces == []
     assert mesh.half_edges == []
     assert mesh.edges == []
+
+    # Positive control: rejecting everything (an add_face that silently drops
+    # every face) must not pass this test.
+    face = mesh.add_face([0, 1, 2])
+    assert face is not None
+    assert len(mesh.faces) == 1
+    assert [v.index for v in mesh.get_face_vertices(face)] == [0, 1, 2]
+    assert len(mesh.half_edges) == 3
+    assert len(mesh.edges) == 3
 
 
 def test_add_face_drops_repeated_consecutive_indices():
@@ -404,3 +468,19 @@ def test_to_pyvista_with_faces_still_works():
     poly = mesh.to_pyvista()
     assert poly.n_points == 9
     assert poly.n_cells == 4
+
+    # Counts alone cannot tell a correct export from four degenerate cells, so
+    # check the connectivity pyvista actually received. Faces are packed as
+    # [n, i0, .., in-1, n, ...].
+    packed = [int(i) for i in np.asarray(poly.faces)]
+    cells = []
+    pos = 0
+    while pos < len(packed):
+        n = packed[pos]
+        cells.append(packed[pos + 1:pos + 1 + n])
+        pos += n + 1
+    assert cells == [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
+    assert cells == [[0, 1, 4, 3], [1, 2, 5, 4], [3, 4, 7, 6], [4, 5, 8, 7]]
+    # ...and that the point array carries coordinates, not just a length.
+    assert np.allclose(poly.points[8], [2.0, 2.0, 0.0])
+    assert np.allclose(poly.points[0], [0.0, 0.0, 0.0])
