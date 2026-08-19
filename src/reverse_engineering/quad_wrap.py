@@ -129,7 +129,22 @@ class QuadWrapper:
             
         for q in quad_F:
             he_mesh.add_face([vertex_map[v] for v in q])
-            
+
+        # Cage topology is fixed from here on (relaxation and the repairs
+        # below only move vertices). A closed watertight input must yield a
+        # closed cage; an unpaired half-edge here becomes a free edge in the
+        # sewn B-Rep, so say so loudly instead of letting the STEP audit be
+        # the first to notice.
+        n_open = sum(1 for e in he_mesh.edges if he_mesh.is_boundary_edge(e))
+        if n_open:
+            warnings.warn(
+                f"quad cage has {n_open} boundary edge(s); the sewn B-Rep "
+                f"will be an OPEN shell (decimation repair failed to close "
+                f"the surface).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         # 5. Relax the final quad mesh (Shrinkwrap/Laplacian)
         pre_relax = np.array([v.position.copy() for v in he_mesh.vertices])
         he_mesh = self._relax_mesh(he_mesh, reference_mesh)
@@ -265,17 +280,6 @@ class QuadWrapper:
         will blow up into roughly ``target_face_count`` quads.
         """
         target_triangles = max(4, int(round(self.target_face_count / QUADS_PER_DECIMATED_TRIANGLE)))
-        try:
-            # trimesh >= 5 renamed the args to (percent, face_count, aggression);
-            # passing the count positionally lands in `percent` and raises.
-            decimated = mesh.simplify_quadric_decimation(face_count=target_triangles)
-        except TypeError:
-            # older trimesh: face_count was the first positional argument
-            decimated = mesh.simplify_quadric_decimation(target_triangles)
-        except Exception as e:
-            print(f"Warning: quadric decimation failed ({e}); continuing with "
-                  f"undecimated mesh of {len(mesh.faces)} faces")
-            decimated = mesh
 
         # Ground truth for how many bodies the cage may have: components of
         # the INPUT mesh that are big enough to matter. Decimation fragments
@@ -290,7 +294,59 @@ class QuadWrapper:
         except Exception:
             expected_bodies = None
 
-        decimated = self._repair_decimated(decimated, expected_bodies=expected_bodies)
+        def _decimate(budget: int) -> trimesh.Trimesh:
+            try:
+                # trimesh >= 5 renamed the args to (percent, face_count,
+                # aggression); the count passed positionally lands in
+                # `percent` and raises.
+                return mesh.simplify_quadric_decimation(face_count=budget)
+            except TypeError:
+                # older trimesh: face_count was the first positional argument
+                return mesh.simplify_quadric_decimation(budget)
+            except Exception as e:
+                print(f"Warning: quadric decimation failed ({e}); continuing "
+                      f"with undecimated mesh of {len(mesh.faces)} faces")
+                return mesh
+
+        # Repair (debris drop, sliver collapse) eats part of the triangle
+        # budget -- on strut-lattice parts enough that the final quad count
+        # landed at half the request. Near the topological floor of a
+        # high-genus part the budget->survivors curve is a CLIFF (a genus-28
+        # lattice decimated to 182 faces shattered into 45 components and 10
+        # surviving faces), so proportional re-scaling overshoots wildly;
+        # bracket the budget instead: double while the repaired mesh is too
+        # small, bisect once it is too big, keep the closest result.
+        lo, hi = 0, None
+        budget = target_triangles
+        best = None
+        for _ in range(6):
+            decimated = self._repair_decimated(_decimate(budget),
+                                               expected_bodies=expected_bodies)
+            n = max(len(decimated.faces), 1)
+            # A closed candidate always beats an open one -- closure of the
+            # cage is the hard requirement, the count is best-effort.
+            closed = bool(decimated.is_watertight
+                          and decimated.is_winding_consistent)
+            score = (0 if closed else 1, abs(np.log(n / target_triangles)))
+            if best is None or score < best[0]:
+                best = (score, decimated)
+            if closed and 0.85 * target_triangles <= n <= 1.25 * target_triangles:
+                break
+            if n < 0.85 * target_triangles:
+                lo = budget
+                if budget >= len(mesh.faces):
+                    break
+                new_budget = ((budget + hi) // 2 if hi is not None
+                              else min(len(mesh.faces), budget * 2))
+            else:
+                hi = budget
+                new_budget = (lo + budget) // 2
+            if new_budget in (lo, hi, budget) or new_budget <= 4:
+                break
+            print(f"Quad wrap: {n} of {target_triangles} budgeted triangles "
+                  f"survived repair; re-decimating with budget {new_budget}")
+            budget = new_budget
+        decimated = best[1]
 
         return np.array(decimated.vertices), np.array(decimated.faces), np.zeros((len(decimated.vertices), 3))
 
@@ -328,36 +384,83 @@ class QuadWrapper:
                       f"after decimation (kept {len(keep)})")
                 mesh = keep[0] if len(keep) == 1 else trimesh.util.concatenate(keep)
 
-        # Remove extra faces on non-manifold edges (incidence > 2), keeping
-        # the two largest faces, then close any holes this opened.
-        for _ in range(3):
-            edges = np.sort(mesh.faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
-            edge_faces = {}
-            for fi, e in zip(np.repeat(np.arange(len(mesh.faces)), 3), map(tuple, edges)):
-                edge_faces.setdefault(e, []).append(fi)
-            bad = {e: fs for e, fs in edge_faces.items() if len(fs) > 2}
-            if not bad:
-                break
-            areas = mesh.area_faces
-            remove = set()
-            for e, fs in bad.items():
-                fs_sorted = sorted(fs, key=lambda fi: areas[fi], reverse=True)
-                remove.update(fs_sorted[2:])
-            mask = np.ones(len(mesh.faces), dtype=bool)
-            mask[list(remove)] = False
-            mesh.update_faces(mask)
-            trimesh.repair.fill_holes(mesh)
-            mesh.merge_vertices()
-            mesh.remove_unreferenced_vertices()
+        # Make the surface closed, manifold and coherently wound: every
+        # unpaired half-edge left here surfaces as a cage boundary edge and a
+        # free edge in the sewn B-Rep. Extra faces on over-shared edges
+        # (incidence > 2) are excised down to one per traversal direction,
+        # every boundary loop is closed with real hole filling
+        # (trimesh.repair.fill_holes handles only 3/4-edge holes and, fed
+        # decimation junk, kept re-creating the very faces just removed), and
+        # the winding is reoriented until globally consistent.
+        from src.reverse_engineering.mesh_tools import (
+            close_boundary_loops, collapse_short_edges, flip_needle_triangles)
+
+        def _make_closed(m: trimesh.Trimesh, rounds: int = 10) -> trimesh.Trimesh:
+            for _ in range(rounds):
+                if m.is_watertight and m.is_winding_consistent:
+                    break
+                edges = np.sort(m.faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+                edge_faces = {}
+                for fi, e in zip(np.repeat(np.arange(len(m.faces)), 3),
+                                 map(tuple, edges)):
+                    edge_faces.setdefault(e, []).append(fi)
+                bad = {e: fs for e, fs in edge_faces.items() if len(fs) > 2}
+                if bad:
+                    areas = m.area_faces
+                    inc_all = {e: len(fs) for e, fs in edge_faces.items()}
+
+                    def support(fi):
+                        # how many of the face's edges pair correctly with
+                        # the rest of the mesh -- a glued fin or decimation
+                        # scrap has dangling edges, the real surface does not
+                        f = [int(x) for x in m.faces[fi]]
+                        return sum(
+                            1 for k in range(3)
+                            if inc_all.get(
+                                (f[k], f[(k + 1) % 3])
+                                if f[k] < f[(k + 1) % 3]
+                                else (f[(k + 1) % 3], f[k]), 0) == 2)
+
+                    remove = set()
+                    for e, fs in bad.items():
+                        # Keep at most ONE face per traversal direction: two
+                        # faces crossing the edge the same way can never pair
+                        # as half-edge twins, and the (directed) hole filler
+                        # would legitimately add a third face back -- the
+                        # old keep-two-largest rule cycled forever on that.
+                        fwd, rev = [], []
+                        for fi in fs:
+                            f = [int(x) for x in m.faces[fi]]
+                            i0 = f.index(int(e[0]))
+                            (fwd if f[(i0 + 1) % 3] == e[1] else rev).append(fi)
+                        keep = {
+                            max(group, key=lambda fi: (support(fi), areas[fi]))
+                            for group in (fwd, rev) if group}
+                        remove.update(set(fs) - keep)
+                    mask = np.ones(len(m.faces), dtype=bool)
+                    mask[list(remove)] = False
+                    m.update_faces(mask)
+                m = close_boundary_loops(m)
+                m.merge_vertices()
+                m.update_faces(m.nondegenerate_faces())
+                m.update_faces(m.unique_faces())
+                m.remove_unreferenced_vertices()
+                if not m.is_winding_consistent:
+                    trimesh.repair.fix_normals(m)
+            return m
+
+        mesh = _make_closed(mesh)
 
         # Slivers here become clusters of sub-tolerance quad edges after the
         # midpoint split — and SolidWorks' solid validator silently drops any
         # face with such an edge, leaving a hole that stops the body from
         # knitting. Shared implementation in mesh_tools.
-        from src.reverse_engineering.mesh_tools import (
-            collapse_short_edges, flip_needle_triangles)
         mesh = collapse_short_edges(mesh)
         mesh = flip_needle_triangles(mesh)
+        # Both preserve closure (link-condition / duplicate-edge guards), but
+        # decimation junk can be arbitrarily creative: one cheap safety pass,
+        # a no-op on a mesh that is already closed and coherently wound.
+        mesh = _make_closed(mesh, rounds=3)
 
         return mesh
         

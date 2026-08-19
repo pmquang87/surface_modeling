@@ -149,6 +149,93 @@ def _ear_clip(poly2d: np.ndarray,
     return tris
 
 
+def _close_loops_impl(verts: List[np.ndarray], faces: List[List[int]],
+                      max_hole_edges: Optional[int]) -> List[int]:
+    """Close boundary loops of a triangle face list IN PLACE.
+
+    Each loop is closed by ear-clipping it in its best-fit plane; loops the
+    ear clipper cannot handle (self-intersecting when projected), and fills
+    that would coincide with an existing face (a two-sided fin), fall back to
+    a fan from a new centroid vertex, which can duplicate neither an existing
+    edge nor an existing face.
+
+    Loops longer than ``max_hole_edges`` are skipped (never skips when it is
+    None); the skipped loop sizes are returned so the caller can report them.
+    """
+    # Chords already present in the mesh: an ear whose diagonal duplicates
+    # one would put a third face on that edge.
+    existing = set()
+    for f in faces:
+        m = len(f)
+        for i in range(m):
+            a, b = f[i], f[(i + 1) % m]
+            existing.add((a, b) if a < b else (b, a))
+    face_keys = {frozenset(f) for f in faces if len(f) == 3}
+
+    loops = _boundary_loops(faces)
+    skipped = []
+    for loop in loops:
+        if max_hole_edges is not None and len(loop) > max_hole_edges:
+            skipped.append(len(loop))
+            continue
+        pts = np.array([verts[i] for i in loop], dtype=np.float64)
+        _, e1, e2 = _polygon_frame(pts)
+        poly2d = np.column_stack([pts @ e1, pts @ e2])
+        n_loop = len(loop)
+        forbidden = set()
+        for i in range(n_loop):
+            for j in range(i + 2, n_loop):
+                if i == 0 and j == n_loop - 1:
+                    continue  # the closing edge of the loop itself
+                a, b = loop[i], loop[j]
+                if ((a, b) if a < b else (b, a)) in existing:
+                    forbidden.add((i, j))
+        tris = _ear_clip(poly2d, forbidden=forbidden)
+        if tris is not None and any(
+                frozenset((loop[a], loop[b], loop[c])) in face_keys
+                for a, b, c in tris):
+            # e.g. a 3-loop opened by dropping one face of a coincident
+            # opposite-winding pair: re-adding the same triangle would just
+            # re-create the fin, so use the centroid fan instead
+            tris = None
+        if tris is None:
+            center = len(verts)
+            verts.append(pts.mean(axis=0))
+            for i in range(n_loop):
+                faces.append([loop[i], loop[(i + 1) % n_loop], center])
+        else:
+            for a, b, c in tris:
+                tri = [loop[a], loop[b], loop[c]]
+                faces.append(tri)
+                face_keys.add(frozenset(tri))
+                # keep `existing` current so a later loop sharing these
+                # vertices cannot duplicate one of the new chords
+                for i in range(3):
+                    p, q = tri[i], tri[(i + 1) % 3]
+                    existing.add((p, q) if p < q else (q, p))
+    return skipped
+
+
+def close_boundary_loops(t_mesh: 'trimesh.Trimesh',
+                         max_hole_edges: Optional[int] = None) -> 'trimesh.Trimesh':
+    """Close every boundary loop of a triangle trimesh with new faces.
+
+    Unlike ``trimesh.repair.fill_holes``, which handles only 3- and 4-edge
+    holes (and, fed decimation junk, kept re-creating the very faces the
+    non-manifold repair had just removed), this closes loops of any size.
+    Used by the decimation repair, where every hole is an artifact on what
+    was a closed surface.
+    """
+    if len(t_mesh.faces) == 0:
+        return t_mesh
+    verts = [np.asarray(p, dtype=np.float64)
+             for p in np.asarray(t_mesh.vertices)]
+    faces = [[int(i) for i in f] for f in np.asarray(t_mesh.faces)]
+    _close_loops_impl(verts, faces, max_hole_edges)
+    return trimesh.Trimesh(vertices=np.array(verts, dtype=np.float64),
+                           faces=faces, process=False)
+
+
 def fill_holes(mesh: HalfEdgeMesh, max_hole_edges: int = 20) -> HalfEdgeMesh:
     """Fill boundary holes with new triangles.
 
@@ -174,50 +261,7 @@ def fill_holes(mesh: HalfEdgeMesh, max_hole_edges: int = 20) -> HalfEdgeMesh:
         verts = [np.asarray(p, dtype=np.float64) for p in np.asarray(t_mesh.vertices)]
         faces = [[int(i) for i in f] for f in np.asarray(t_mesh.faces)]
 
-        # Chords already present in the mesh: an ear whose diagonal duplicates
-        # one would put a third face on that edge.
-        existing = set()
-        for f in faces:
-            m = len(f)
-            for i in range(m):
-                a, b = f[i], f[(i + 1) % m]
-                existing.add((a, b) if a < b else (b, a))
-
-        loops = _boundary_loops(faces)
-        skipped = []
-        for loop in loops:
-            if len(loop) > max_hole_edges:
-                skipped.append(len(loop))
-                continue
-            pts = np.array([verts[i] for i in loop], dtype=np.float64)
-            _, e1, e2 = _polygon_frame(pts)
-            poly2d = np.column_stack([pts @ e1, pts @ e2])
-            n_loop = len(loop)
-            forbidden = set()
-            for i in range(n_loop):
-                for j in range(i + 2, n_loop):
-                    if i == 0 and j == n_loop - 1:
-                        continue  # the closing edge of the loop itself
-                    a, b = loop[i], loop[j]
-                    if ((a, b) if a < b else (b, a)) in existing:
-                        forbidden.add((i, j))
-            tris = _ear_clip(poly2d, forbidden=forbidden)
-            if tris is None:
-                center = len(verts)
-                verts.append(pts.mean(axis=0))
-                n = len(loop)
-                for i in range(n):
-                    faces.append([loop[i], loop[(i + 1) % n], center])
-            else:
-                for a, b, c in tris:
-                    tri = [loop[a], loop[b], loop[c]]
-                    faces.append(tri)
-                    # keep `existing` current so a later loop sharing these
-                    # vertices cannot duplicate one of the new chords
-                    for i in range(3):
-                        p, q = tri[i], tri[(i + 1) % 3]
-                        existing.add((p, q) if p < q else (q, p))
-
+        skipped = _close_loops_impl(verts, faces, max_hole_edges)
         if skipped:
             warnings.warn(
                 f"fill_holes: {len(skipped)} hole(s) left open, boundary loops of "
@@ -474,14 +518,29 @@ def decimate_mesh(mesh: HalfEdgeMesh, target_faces: int = None,
         return mesh.copy()
 
 def collapse_short_edges(t_mesh: 'trimesh.Trimesh',
-                         rel_threshold: float = 0.15) -> 'trimesh.Trimesh':
+                         rel_threshold: float = 0.15,
+                         max_rounds: int = 8) -> 'trimesh.Trimesh':
     """Collapse triangle-mesh edges much shorter than the median edge length.
 
-    Each short edge's endpoints merge at their midpoint (disjoint pairs per
-    round, up to 4 rounds). Degenerate and duplicate faces are dropped after
-    every round.
+    Each short edge's endpoints merge at their midpoint (disjoint
+    neighbourhoods per round). Degenerate and duplicate faces are dropped
+    after every round.
+
+    The threshold is measured ONCE, on the input mesh: re-deriving it from
+    the current mesh every round let it ratchet upward -- collapsing the
+    short population raises the median, which raises the threshold -- until
+    it was collapsing legitimate geometry (measured 0.26 -> 1.00 over four
+    rounds on a lattice part, eating half of all faces).
+
+    A collapse must also satisfy the edge link condition: the common
+    neighbours of the two endpoints are exactly the apexes of the shared
+    faces. Anything else pinches the surface into non-manifold junk,
+    boundary edges or loose scraps, which later surface as free edges in the
+    sewn B-Rep. Link-violating short edges are left alone (the cage-level
+    edge stretcher deals with them geometrically).
     """
-    for _ in range(4):
+    threshold = None
+    for _ in range(max_rounds):
         verts = np.asarray(t_mesh.vertices).copy()
         faces = np.asarray(t_mesh.faces)
         if len(faces) == 0:
@@ -489,17 +548,43 @@ def collapse_short_edges(t_mesh: 'trimesh.Trimesh',
         edges = np.sort(faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
         edges = np.unique(edges, axis=0)
         lens = np.linalg.norm(verts[edges[:, 0]] - verts[edges[:, 1]], axis=1)
-        threshold = rel_threshold * np.median(lens)
-        short = edges[lens < threshold]
-        if len(short) == 0:
+        if threshold is None:
+            threshold = rel_threshold * float(np.median(lens))
+        short_ids = np.where(lens < threshold)[0]
+        if len(short_ids) == 0:
             break
+        short = edges[short_ids[np.argsort(lens[short_ids])]]
+
+        # vertex adjacency and per-edge apex sets for the link condition
+        adj = [set() for _ in range(len(verts))]
+        edge_apex = {}
+        for f in faces:
+            a, b, c = int(f[0]), int(f[1]), int(f[2])
+            adj[a].update((b, c))
+            adj[b].update((a, c))
+            adj[c].update((a, b))
+            for u, v, w in ((a, b, c), (b, c, a), (c, a, b)):
+                key = (u, v) if u < v else (v, u)
+                edge_apex.setdefault(key, set()).add(w)
+
         used = set()
         remap = np.arange(len(verts))
         n_collapsed = 0
         for a, b in short:
+            a, b = int(a), int(b)
             if a in used or b in used:
                 continue
-            used.update((int(a), int(b)))
+            key = (a, b) if a < b else (b, a)
+            apexes = edge_apex.get(key, set())
+            if len(apexes) > 2:
+                continue  # non-manifold edge: not ours to fix
+            if (adj[a] & adj[b]) != apexes:
+                continue  # link condition: the collapse would pinch
+            # lock the whole 1-ring: a second collapse inside it this round
+            # would invalidate the adjacency the link check was made with
+            used.update((a, b))
+            used.update(adj[a])
+            used.update(adj[b])
             verts[a] = (verts[a] + verts[b]) / 2.0
             remap[b] = a
             n_collapsed += 1
@@ -549,9 +634,12 @@ def flip_needle_triangles(t_mesh: 'trimesh.Trimesh',
             break
 
         edge_face = {}
+        existing_edges = set()
         for fi, f in enumerate(faces):
             for k in range(3):
-                edge_face[(f[k], f[(k + 1) % 3])] = fi
+                a_, b_ = int(f[k]), int(f[(k + 1) % 3])
+                edge_face[(a_, b_)] = fi
+                existing_edges.add((a_, b_) if a_ < b_ else (b_, a_))
 
         def height_of(tri):
             p = verts[tri]
@@ -577,6 +665,12 @@ def flip_needle_triangles(t_mesh: 'trimesh.Trimesh',
             if len(d) != 1:
                 continue
             d = d[0]
+            # The flip replaces edge AB with CD. If CD already exists
+            # elsewhere in the mesh, the flip would make it 4-incident
+            # (non-manifold) -- refuse.
+            key_cd = (int(c), int(d)) if c < d else (int(d), int(c))
+            if key_cd in existing_edges:
+                continue
             # flip AB -> CD: (A,B,C),(B,A,D) => (A,D,C),(D,B,C)
             new1 = np.array([a, d, c])
             new2 = np.array([d, b, c])
@@ -584,6 +678,7 @@ def flip_needle_triangles(t_mesh: 'trimesh.Trimesh',
                 continue
             faces[fi] = new1
             faces[nb] = new2
+            existing_edges.add(key_cd)
             flipped.update((fi, nb))
             n_flips += 1
         if n_flips == 0:
