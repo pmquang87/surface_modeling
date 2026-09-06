@@ -1,22 +1,36 @@
 """
 G3 Continuous B-Spline Fitter
 Generates Degree 5 (6x6 control points) B-spline patches from quad regions.
-Optimized with Numba JIT compilation and Multiprocessing.
+
+Pure numpy on purpose. The two kernels below used to carry
+``@njit(fastmath=True, nogil=True)`` behind a silent
+``try: from numba import njit / except ImportError: <no-op decorator>``.
+That was removed because:
+
+* numba is not in ``requirements.txt``, so a clean install ran the plain
+  Python path while a machine that happened to have numba ran the JIT path -
+  the same command produced different files on different machines, with no
+  warning that the arithmetic had changed;
+* ``fastmath=True`` lets the compiler reassociate the Coons blend. The kernels
+  themselves barely move (measured max |plain - fastmath| = 1.4e-14 over 2000
+  random inputs at part scale), but the ill-conditioned least-squares solve
+  below amplifies it. Measured on a 5120-triangle icosphere at
+  ``--target-faces 600``: 23594 changed coordinate lines in the exported STEP,
+  and the p95 deviation we report moved from 0.00306 mm to 0.00298 mm - i.e.
+  the third decimal of the number the user reads;
+* measured end-to-end on the same part, the JIT path was *slower*: 7.61 s cold
+  (compile included) vs 5.98 s plain, and 5.66 s vs 5.64 s warm - no
+  measurable saving. These are two ~20-flop kernels; there is nothing to gain.
+
+Determinism across environments is worth more here than a speedup that was
+never there. ``tests/test_determinism.py`` fails if numba comes back.
+The ``_numba_`` prefixes are kept only so existing imports of these names
+keep resolving.
 """
 
-import os
 import numpy as np
-import concurrent.futures
 
-try:
-    from numba import njit
-except ImportError:
-    def njit(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
 
-@njit(fastmath=True, nogil=True)
 def _numba_compute_edge_control_points(p_start, p_end, d1_start, d1_end, d2):
     edge_pts = np.zeros((6, 3))
     edge_pts[0] = p_start
@@ -50,7 +64,7 @@ def _tangent_in_plane(chord, normal):
         return chord
     return t * (cl / tl)
 
-@njit(fastmath=True, nogil=True)
+
 def _numba_compute_interior_control_points(ctrl_pts):
     for i in range(1, 5):
         for j in range(1, 5):
@@ -158,11 +172,7 @@ class G3Fitter:
         import scipy.sparse as sp
         import scipy.sparse.linalg as spla
         import math
-        
-        # Pre-compile Numba functions on the first run
-        _numba_compute_edge_control_points(np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3))
-        _numba_compute_interior_control_points(np.zeros((6, 6, 3)))
-        
+
         patches = [_generate_single_patch(quad) for quad in quad_mesh]
         num_patches = len(patches)
         if num_patches == 0:

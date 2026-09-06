@@ -4,8 +4,12 @@ __pycache__/
 *$py.class
 *.so
 *.egg-info/
-dist/
-build/
+# Anchored to the repo root: an unanchored "build/"/"dist/" matches a directory
+# of that name at ANY depth, so src/build/ or tests/fixtures/build/ silently
+# disappears from git (stl2step FINDINGS-0 D5: an unanchored build*/ hid
+# committed test data until a clean clone failed).
+/dist/
+/build/
 *.egg
 
 # Virtual environments

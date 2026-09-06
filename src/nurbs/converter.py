@@ -184,10 +184,13 @@ class SubDToNURBSConverter:
             if simplify:
                 try:
                     from src.nurbs.simplifier import NURBSSimplifier
-                    # angular tolerance is in radians, not mm — keep the
-                    # simplifier's intended ~0.1 rad merge threshold
-                    simplifier = NURBSSimplifier(linear_tolerance=self.tolerance, angular_tolerance=0.1)
+                    # use the simplifier's conservative defaults (0.001 deg
+                    # merge angle, Confusion-level linear tolerance); it keeps
+                    # the original shape when the merge moves the volume
+                    simplifier = NURBSSimplifier()
                     shape = simplifier.simplify(shape)
+                    if simplifier.last_report and not simplifier.last_report.get("accepted", True):
+                        print(f"Simplification rejected: {simplifier.last_report.get('reason')}")
                 except Exception as e:
                     print(f"Simplification failed: {e}")
             return shape
