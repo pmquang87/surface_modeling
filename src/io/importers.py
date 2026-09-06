@@ -59,6 +59,8 @@ def import_step(filepath: str) -> Dict[str, Any]:
             from OCP.OCP.TopLoc import TopLoc_Location
             from OCP.OCP.TopoDS import TopoDS
         
+        from src.io.occt_utils import quiet_occt
+        quiet_occt()  # keep OCCT's transfer banner off stdout
         reader = STEPControl_Reader()
         status = reader.ReadFile(filepath)
         if status != 1:

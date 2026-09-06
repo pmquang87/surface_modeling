@@ -263,6 +263,26 @@ shelled = shell_solid(mesh, thickness=2.0, direction='inward', resolution=128)
 solid = thicken_surface(mesh, thickness=1.5, direction='both')
 ```
 
+### Command-line conversion (STL → STEP)
+
+```bash
+python -m src.convert part.stl part.step                       # smooth NURBS solid (default)
+python -m src.convert part.stl part.step --target-faces 2200 --continuity G1
+python -m src.convert part.stl part.step --faceted             # exact faceted solid, one planar face per triangle
+python -m src.convert part.stl part.step --quiet --volume-tol 2
+```
+
+Two output modes:
+
+| Mode | What you get | When |
+|------|--------------|------|
+| **NURBS** (default) | Quad retopology → bicubic B-spline patches fitted to the STL → sewn solid. Smooth, editable, ~2000 faces. | Organic parts (topology optimisation, scans) that must be edited or feature-recognised in CAD. |
+| **Faceted** (`--faceted`) | The mesh itself as a B-Rep solid: one planar face per triangle with shared edges, coplanar faces merged, closed by construction. Exact geometry, large file (~2.5 kB per triangle before merging). | Boolean tools, fixtures, anything where exactness beats editability; the former FreeCAD "polyhedral STEP" step. |
+
+Every run re-reads the written file and audits it independently: shell closure (measured, not the stored flag), free edges, BRepCheck, signed volume against the mesh, tessellated bounding box against the STL, sampled deviation, and an OpenCascade-free text census of the STEP entities.
+
+Machine-readable contract: progress goes to stderr; **stdout carries exactly one line, `RESULT {json}`**, with every audit number. Exit codes: `0` clean, `2` a STEP was written but the audit found something (see `audit_reasons`), `1` failed, nothing usable written. `--volume-tol PCT` turns the volume comparison into a gate (a smooth fit differs from its chord mesh by about 0.1 % on good parts; the faceted mode holds 1e-4 %, i.e. 1e-6 relative, measured on a 63,676-triangle real part).
+
 ---
 
 ## Project Structure
@@ -278,6 +298,7 @@ python-power-surfacing/
 └── src/
     ├── __init__.py
     ├── main.py                          # Application entry point
+    ├── convert.py                       # CLI: STL -> STEP (NURBS or --faceted), RESULT json contract
     ├── core/
     │   ├── __init__.py
     │   ├── halfedge_mesh.py             # Half-edge mesh data structure
@@ -291,7 +312,12 @@ python-power-surfacing/
     ├── io/
     │   ├── __init__.py
     │   ├── importers.py                 # STEP/STL/OBJ import
-    │   └── exporters.py                 # STEP/STL/OBJ export
+    │   ├── exporters.py                 # STEP/STL/OBJ export
+    │   ├── faceted_step.py              # STL -> faceted B-Rep solid STEP (exact, no fitting)
+    │   ├── step_audit.py                # read-back audit: measure_step / verdict
+    │   ├── step_census.py               # OpenCascade-free STEP Part 21 census (from stl2step)
+    │   ├── step_canonical.py            # canonical STEP text for determinism tests
+    │   └── occt_utils.py                # OCCT process state: STEP statics, console printer
     ├── subd/
     │   ├── __init__.py
     │   ├── catmull_clark.py             # Catmull-Clark subdivision
@@ -375,6 +401,19 @@ This project is licensed under the MIT License — see [LICENSE](LICENSE) for de
 - **[PyVista](https://pyvista.org/)** — 3D visualization framework
 - **[PySide6](https://doc.qt.io/qtforpython-6/)** — Qt6 Python bindings
 - **[trimesh](https://trimesh.org/)** — Mesh processing library
+- **[stl2step](https://github.com/BlinkingSun/stl2step)** — see the thank-you section below
+
+## Thanks to stl2step
+
+A sincere thank you to **[Joshua Roberts (BlinkingSun)](https://github.com/BlinkingSun)** and the contributors of **[stl2step](https://github.com/BlinkingSun/stl2step)** (MIT License, Copyright (c) 2026 stl2step contributors). stl2step is a C++/OpenCASCADE engine that turns triangle meshes into B-Rep STEP solids, and its code and engineering write-ups directly improved this project (reviewed at v1.3.0, commit `162631f`, September 2026):
+
+- **Faceted STEP exporter** (`src/io/faceted_step.py`) — the pipeline discipline of stl2step's Verbatim mode: a mesh-side edge census before any OpenCASCADE object exists, a direct shell for clean components and sewing only for dirty ones, closure re-measured instead of trusted, orientation via the solid classifier, coplanar merging with `ConcatBSplines=False` and a measured post-condition, and raising vertex/edge tolerances to the measured planar deviation instead of running a blind ShapeFix.
+- **STEP text census** (`src/io/step_census.py`) — vendored from stl2step's `tests/tools/step_census.py`, an OpenCASCADE-free Part 21 parser used here as an independent witness of what the writer produced ("a witness that shares the defendant's code is worthless").
+- **Audit and output contract** (`src/io/step_audit.py`, `src/convert.py`) — closure and BRepCheck are necessary but not sufficient, the signed volume is the cheap global falsifier, and every run ends with a single machine-readable `RESULT {json}` line and documented exit tiers.
+- **Determinism discipline** (`src/io/step_canonical.py`) — compare canonical STEP text with only the file timestamp blanked, never renumbering entities.
+- **OpenCASCADE lessons** — STEP statics must be set after the controller is initialised, the transfer banner belongs off stdout, and the adaptive volume integrator (`Eps = Precision::Confusion`) is the one to trust.
+
+The transferable lessons, including what we deliberately did not port and why, are written up in [docs/lessons_from_stl2step.md](docs/lessons_from_stl2step.md).
 
 ---
 
