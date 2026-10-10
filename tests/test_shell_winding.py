@@ -5,18 +5,23 @@ component that does not touch the grid border as a whole. Commit 267d66b did
 that by a cosine-weighted vote of the component's near-surface cells' exact
 nearest-triangle sides. The vote is LOCAL: material between internal,
 same-orientation bodies (plates inside a box, not booleaned) only sees the
-plates' outward faces and votes "air". A reviewer measured 10,972 such
-far-field material cells signed as air (box + 5 plates, resolution 48).
+plates' outward faces and votes "air": box + 5 plates at resolution 48, the
+vote signs 5,492 far-field material cells (all four gaps) as air.
 
 The fix signs each enclosed component by the generalized winding number
-w (Jacobson, Kavan & Sorkine-Hornung 2013) at its deepest cells: inside iff
-w > 0.5, so overlapping bodies (w = 2) are inside, voids (w = 0) are air. The
-vote survives only as the fallback when w is ambiguous
-(|w - 0.5| < _GWN_AMBIGUOUS), which is logged.
+w (Jacobson, Kavan & Sorkine-Hornung 2013), inside iff w > 0.5, so
+overlapping bodies (w = 2) are inside and voids (w = 0) are air. w is sampled
+at deep cells SPREAD over the component and trusted only near an integer:
+  * all samples near an integer, one side of 0.5 -> that side;
+  * near-integer samples on both sides (a hole wider than the wall seal joins
+    a void and the material into one component) -> each cell by w, logged;
+  * w fractional (holes, flipped triangles) -> the old vote, logged.
+The wall cells next to the surface keep the local exact side, so shell_solid
+of unbooleaned overlapping bodies is NOT improved by any of this.
 
-Ground truth here is analytic (box membership / box distances, solid angles
-of a cube seen from its centre) or trimesh's ray containment, never the
-module's own output.
+Ground truth here is analytic (box membership / box and sphere distances,
+solid angles of a cube seen from its centre) or trimesh's ray containment,
+never the module's own output.
 """
 import logging
 import os
@@ -29,8 +34,8 @@ import pytest
 import trimesh
 
 from src.operations import shell_thicken
-from src.operations.shell_thicken import (_GWN_AMBIGUOUS, _compute_sdf,
-                                          _winding_numbers)
+from src.operations.shell_thicken import (_GWN_INTEGER_TOL, _compute_sdf,
+                                          _sample_cells, _winding_numbers)
 
 LOGGER = shell_thicken.__name__
 
@@ -218,6 +223,7 @@ class TestNestedPlates:
         # ... while the winding number says inside (w = 1 exactly)
         assert diag['winding'][at] == pytest.approx(1.0, abs=1e-9)
         assert not diag['fallback'].any()
+        assert np.all(diag['mode'] == 'winding')
 
         g = grid.ravel()
         assert far_material.sum() > 15_000 and (far & ~material).sum() > 20_000
@@ -228,19 +234,158 @@ class TestNestedPlates:
         assert np.all(diag['sign'][at] == -1.0)       # the winding decided
 
 
+
 # --------------------------------------------------------------------------
-# the ambiguous band: fallback to the vote
+# the sampler: deep AND spread
 # --------------------------------------------------------------------------
 
-class TestAmbiguousWindingFallsBackToVote:
+class TestSampleCells:
+    @staticmethod
+    def _field():
+        """Label 1: a 12^3 block whose depth peaks at (7.5, 7.5, 7.5) (so its
+        5 deepest cells all lie in ONE of the 3^3 blocks); label 2: a 3-cell
+        rod; label 3: not requested. Depth is distinct everywhere."""
+        shape = (16, 16, 16)
+        labels = np.zeros(shape, dtype=np.int32)
+        labels[2:14, 2:14, 2:14] = 1
+        labels[0, 0, 0:3] = 2
+        labels[15, 15, 15] = 3
+        ijk = np.stack(np.meshgrid(*[np.arange(n) for n in shape],
+                                   indexing='ij'), axis=-1).reshape(-1, 3)
+        depth = 100.0 - np.linalg.norm(ijk - 7.5, axis=1) + 1e-6 * np.arange(len(ijk))
+        return shape, labels.ravel(), depth, ijk
+
+    def test_takes_the_k_deepest_and_the_deepest_of_every_block(self):
+        shape, labels, depth, ijk = self._field()
+        cells, lab = _sample_cells(labels, depth, np.array([1, 2]), shape)
+        assert len(np.unique(cells)) == len(cells)
+        assert np.all(np.diff(lab) >= 0)                  # grouped, ascending
+        assert set(lab.tolist()) == {1, 2}                # label 3 not asked
+        assert np.array_equal(labels[cells], lab)
+
+        one = np.flatnonzero(labels == 1)
+        top5 = one[np.argsort(-depth[one])[:5]]
+        picked = set(cells[lab == 1].tolist())
+        assert set(top5.tolist()) <= picked, "the 5 deepest cells are missing"
+        # independent block deepest: bbox 2..13 cut into 3 blocks of 4 cells
+        blk = (ijk[one] - 2) // 4
+        key = blk[:, 0] * 9 + blk[:, 1] * 3 + blk[:, 2]
+        block_deepest = {int(one[key == b][np.argmax(depth[one][key == b])])
+                         for b in range(27)}
+        assert len(block_deepest) == 27
+        assert block_deepest <= picked, "a block's deepest cell is missing"
+        # the 5 deepest share one block, so exactly 27 + 4 samples
+        assert len(picked) == 27 + 4
+        # the rod has fewer cells than samples: all of them
+        assert sorted(cells[lab == 2].tolist()) == np.flatnonzero(labels == 2).tolist()
+
+    def test_the_sample_is_the_deep_end(self):
+        """An input the depth check must reject: the shallowest cells. The
+        sample's depths dominate every non-sampled cell of its block."""
+        shape, labels, depth, ijk = self._field()
+        cells, lab = _sample_cells(labels, depth, np.array([1]), shape)
+        one = np.flatnonzero(labels == 1)
+        shallow = one[np.argsort(depth[one])[:5]]
+        assert not set(shallow.tolist()) & set(cells.tolist())
+        assert np.median(depth[cells]) > np.percentile(depth[one], 75)
+
+
+# --------------------------------------------------------------------------
+# P1: a hole wider than the wall seal joins the void and the material
+# --------------------------------------------------------------------------
+
+R_VOID = 0.6
+CAP_DEG = 20.0
+
+
+def _holed_hollow_sphere():
+    """Outward sphere r = 1 plus an inside-out sphere r = 0.6 (the void's
+    faces point into it) with every triangle within 20 degrees of +z removed:
+    a hole about 0.4 across, much wider than the wall seal (2 x 1.62 voxels
+    = 0.16 at resolution 48), so the flood fill joins void and material."""
+    outer = trimesh.creation.icosphere(subdivisions=4, radius=1.0)
+    void = trimesh.creation.icosphere(subdivisions=4, radius=R_VOID)
+    void.invert()
+    c = void.triangles_center
+    polar = np.degrees(np.arccos(c[:, 2] / np.linalg.norm(c, axis=1)))
+    void = trimesh.Trimesh(void.vertices, void.faces[polar > CAP_DEG],
+                           process=False)
+    return trimesh.util.concatenate([outer, void])
+
+
+class TestHoleJoinsVoidAndMaterial:
+    RES = 48   # voxel 0.05
+
+    def test_far_field_cells_are_signed_per_cell_by_w(self, caplog):
+        """Far-field material (0.6 < r < 1) inside, far-field void (r < 0.6,
+        away from the hole's throat) outside. Fails on d3e9416: one component
+        sampled at its 5 deepest cells -- all at the void centre, w = 0.03 --
+        signed all 12,861 far-field material cells air. A median over spread
+        samples (w = 1 in most of them) fails the other way: the void inside."""
+        tm = _holed_hollow_sphere()
+        assert 100 < 5120 - (len(tm.faces) - 5120) < 200    # cap removed
+        assert not tm.is_watertight
+        diag = {}
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            grid, origin, voxel = _compute_sdf(np.asarray(tm.vertices, float),
+                                               np.asarray(tm.faces), self.RES,
+                                               diagnostics=diag)
+        assert voxel == pytest.approx(0.05)
+        assert 2 * 1.62 * voxel < 0.3      # the hole is far wider than the seal
+        pts = _grid_points(grid, origin, voxel)
+        r = np.linalg.norm(pts, axis=1)
+        polar = np.degrees(np.arccos(np.clip(pts[:, 2] / np.maximum(r, 1e-12), -1, 1)))
+        sd = np.maximum(r - 1.0, R_VOID - r)                 # + in air
+        far = np.abs(sd) > 2 * voxel
+        far_material = far & (sd < 0)
+        far_void = far & (r < R_VOID) & ((polar > CAP_DEG + 20) | (r < 0.3))
+
+        # precondition: ONE enclosed component holds both regions ...
+        labels = diag['labels'].ravel()
+        assert len(diag['enclosed']) == 1
+        L = diag['enclosed'][0]
+        assert np.all(labels[far_material] == L) and np.all(labels[far_void] == L)
+        # ... and its deepest cells see only the void (w ~ 0): sampling only
+        # them would sign the material air
+        comp = np.flatnonzero(labels == L)
+        deep_cells = comp[np.argsort(-np.abs(grid.ravel()[comp]))[:5]]
+        assert np.all(r[deep_cells] < 0.2)
+        w_deep = _winding_numbers(tm.triangles, pts[deep_cells])
+        assert np.all(w_deep < _GWN_INTEGER_TOL)
+
+        g = grid.ravel()
+        assert 10_000 < far_material.sum() < 16_000 and 3_000 < far_void.sum() < 5_000
+        wrong_material = int((g[far_material] >= 0).sum())
+        wrong_void = int((g[far_void] <= 0).sum())
+        assert wrong_material == 0, f"{wrong_material} far material cells signed air"
+        assert wrong_void == 0, f"{wrong_void} far void cells signed inside"
+        # the throat itself (no surface there) is a transition; it holds
+        # only a handful of cells signed against the radial truth
+        wrong_all = int(((g < 0) != (sd < 0))[far].sum())
+        assert wrong_all < 20, wrong_all
+
+        # the spread samples straddle 0.5 at both integers: the per-cell path
+        assert diag['w_min'][0] < _GWN_INTEGER_TOL
+        assert abs(diag['w_max'][0] - 1.0) < _GWN_INTEGER_TOL
+        assert diag['mode'][0] == 'split'
+        logs = [r_ for r_ in caplog.records
+                if r_.name == LOGGER and 'span both sides' in r_.getMessage()]
+        assert len(logs) == 1
+
+
+# --------------------------------------------------------------------------
+# P2 and the fallback: w fractional -> the vote
+# --------------------------------------------------------------------------
+
+class TestFractionalWindingFallsBackToVote:
     RES = 32   # voxel 0.075, origin -1.2: the faces at +-1 are off the grid
 
     @staticmethod
     def _cube_two_faces_reversed():
         """Cube [-1, 1]^3 with its +z and -z faces wound inward. Each face
         subtends 1/6 of the sphere from the centre, so w(centre) =
-        4/6 - 2/6 = 1/3: in the ambiguous band and BELOW 0.5, so the winding
-        number alone would call the interior air."""
+        4/6 - 2/6 = 1/3: fractional and BELOW 0.5, so the winding number
+        alone would call the interior air."""
         tm = _cube()
         faces = np.array(tm.faces)
         z_faces = np.abs(tm.face_normals[:, 2]) > 0.5
@@ -248,27 +393,31 @@ class TestAmbiguousWindingFallsBackToVote:
         faces[z_faces] = faces[z_faces, ::-1]
         return trimesh.Trimesh(tm.vertices, faces, process=False)
 
-    def test_ambiguous_interior_is_signed_by_the_vote_and_logged(self, caplog):
+    @staticmethod
+    def _run(tm, res, caplog):
+        diag = {}
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            grid, origin, voxel = _compute_sdf(np.asarray(tm.vertices, float),
+                                               np.asarray(tm.faces), res,
+                                               diagnostics=diag)
+        logs = [r for r in caplog.records
+                if r.name == LOGGER and 'fractional winding' in r.getMessage()]
+        return grid, origin, voxel, diag, logs
+
+    def test_fractional_interior_is_signed_by_the_vote_and_logged(self, caplog):
         tm = self._cube_two_faces_reversed()
         assert not tm.is_winding_consistent       # the injected defect
         w_centre = _winding_numbers(tm.triangles, [[0.0, 0.0, 0.0]])[0]
         assert w_centre == pytest.approx(1.0 / 3.0, abs=1e-9)
-        assert abs(w_centre - 0.5) < _GWN_AMBIGUOUS < 0.5   # inside the band
 
-        diag = {}
-        with caplog.at_level(logging.WARNING, logger=LOGGER):
-            grid, origin, voxel = _compute_sdf(np.asarray(tm.vertices, float),
-                                               np.asarray(tm.faces), self.RES,
-                                               diagnostics=diag)
+        grid, origin, voxel, diag, logs = self._run(tm, self.RES, caplog)
         assert len(diag['enclosed']) == 1             # the interior
-        w = diag['winding'][0]
-        assert abs(w - 0.5) < _GWN_AMBIGUOUS and w < 0.5
-        assert bool(diag['fallback'][0])
+        assert diag['w_max'][0] < 0.5                 # w alone says air
+        assert diag['w_min'][0] > _GWN_INTEGER_TOL    # ... but fractional
+        assert diag['mode'][0] == 'vote' and bool(diag['fallback'][0])
         assert diag['vote_sign'][0] == -1.0           # 4 good faces outvote 2
         assert diag['sign'][0] == -1.0                # the vote decided
-        fallback_logs = [r for r in caplog.records
-                         if r.name == LOGGER and 'ambiguous winding' in r.getMessage()]
-        assert len(fallback_logs) == 1
+        assert len(logs) == 1
 
         assert grid[_index_of([0.0, 0.0, 0.0], origin, voxel)] == pytest.approx(
             -1.0, abs=0.01)
@@ -277,18 +426,42 @@ class TestAmbiguousWindingFallsBackToVote:
         assert deep.sum() > 10_000
         assert np.all(grid.ravel()[deep] < 0)
 
+    def test_sphere_with_40_percent_flipped_triangles(self, caplog):
+        """P2: 40 % of a sphere's triangles flipped at random gives w ~ 0.2
+        everywhere inside -- below 0.5 and outside the old ambiguity band
+        |w - 0.5| < 0.25, so d3e9416 signed all far-field material air. w is
+        far from an integer: the vote decides (it gets the interior right)."""
+        s = trimesh.creation.icosphere(subdivisions=4, radius=1.0)
+        faces = np.array(s.faces)
+        flip = np.random.default_rng(0).random(len(faces)) < 0.4
+        assert 0.38 < flip.mean() < 0.42
+        faces[flip] = faces[flip, ::-1]
+        tm = trimesh.Trimesh(s.vertices, faces, process=False)
+        assert not tm.is_winding_consistent
+
+        grid, origin, voxel, diag, logs = self._run(tm, self.RES, caplog)
+        assert len(diag['enclosed']) == 1
+        assert 0.1 < diag['w_min'][0] and diag['w_max'][0] < 0.3   # precondition
+        assert diag['mode'][0] == 'vote' and diag['sign'][0] == -1.0
+        assert len(logs) == 1
+
+        pts = _grid_points(grid, origin, voxel)
+        sd = np.linalg.norm(pts, axis=1) - 1.0
+        far = np.abs(sd) > 2 * voxel
+        g = grid.ravel()
+        assert (far & (sd < 0)).sum() > 5_000
+        assert int((g[far & (sd < 0)] >= 0).sum()) == 0
+        assert int((g[far & (sd > 0)] <= 0).sum()) == 0
+
     def test_consistent_cube_uses_no_fallback(self, caplog):
         """Control (an input the fallback check must reject): the same cube
         wound consistently has w = 1 in its interior, no fallback, no log."""
         tm = _cube()
-        diag = {}
-        with caplog.at_level(logging.WARNING, logger=LOGGER):
-            grid, origin, voxel = _compute_sdf(np.asarray(tm.vertices, float),
-                                               np.asarray(tm.faces), self.RES,
-                                               diagnostics=diag)
+        grid, origin, voxel, diag, logs = self._run(tm, self.RES, caplog)
         assert len(diag['enclosed']) == 1
-        assert diag['winding'][0] == pytest.approx(1.0, abs=1e-9)
-        assert not diag['fallback'].any()
+        assert diag['w_min'][0] == pytest.approx(1.0, abs=1e-9)
+        assert diag['w_max'][0] == pytest.approx(1.0, abs=1e-9)
+        assert diag['mode'][0] == 'winding' and not diag['fallback'].any()
         assert not [r for r in caplog.records if r.name == LOGGER]
         assert grid[_index_of([0.0, 0.0, 0.0], origin, voxel)] == pytest.approx(
             -1.0, abs=0.01)
