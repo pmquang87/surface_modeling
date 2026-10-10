@@ -13,7 +13,11 @@ Each test names its item and the original bug it mirrors:
 * R2 (mirrors M14, cand 17 - "bridge_faces punches holes") - ``bridge_faces``
   still punched holes when the two groups shared a face (also through index
   aliases such as [4] and [-2] on a 6-face box), and for opposite faces of a
-  box, whose new side quads coincide with the existing walls.
+  box, whose new side quads coincide with the existing walls; and (found in
+  the review of that fix) when the groups touch at a single corner (a
+  bow-tie vertex with back-to-back side triangles) or share a chain of
+  boundary edges (its inner vertices orphaned, the side faces folded or of
+  zero area).
 
 Test discipline (the repo's vacuous-test rules): each test first asserts that
 the defect / precondition really is in its input, every checker gets an input
@@ -32,7 +36,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from src.core.halfedge_mesh import HalfEdgeMesh  # noqa: E402
 from src.nurbs.converter import SubDToNURBSConverter  # noqa: E402
 from src.subd.editing import bridge_faces  # noqa: E402
-from src.subd.primitives import create_box, create_plane  # noqa: E402
+from src.subd.primitives import (  # noqa: E402
+    create_box, create_cylinder, create_plane, create_torus)
 
 
 # --------------------------------------------------------------------------
@@ -188,14 +193,61 @@ def _same(a, b):
     return np.array_equal(pa, pb)
 
 
+def _link_components(mesh):
+    """For each vertex, the number of connected pieces of its link: nodes are
+    its neighbours, and each face corner at the vertex joins the corner's two
+    neighbours. A manifold vertex has one piece (a path or a cycle), a pinched
+    bow-tie vertex two or more, an unused vertex none."""
+    links = {v: [] for v in range(len(mesh.vertices))}
+    for fv in _faces(mesh):
+        for k, v in enumerate(fv):
+            links[v].append((fv[k - 1], fv[(k + 1) % len(fv)]))
+    pieces = {}
+    for v, link in links.items():
+        adj = {}
+        for p, q in link:
+            adj.setdefault(p, set()).add(q)
+            adj.setdefault(q, set()).add(p)
+        seen, n = set(), 0
+        for start in adj:
+            if start in seen:
+                continue
+            n += 1
+            stack = [start]
+            while stack:
+                u = stack.pop()
+                if u not in seen:
+                    seen.add(u)
+                    stack.extend(adj[u] - seen)
+        pieces[v] = n
+    return pieces
+
+
 def _sound_bridge(before, after) -> bool:
     """Every directed edge used at most once, the open boundary unchanged
-    (none for a closed input), and every face has 3+ distinct vertices."""
+    (none for a closed input), every face has all-distinct vertices, and every
+    vertex is manifold: one fan of faces, and no vertex that had faces before
+    is left without one (a single-face group has no inner vertex to drop)."""
     if max(_directed(after).values(), default=0) > 1:
         return False
-    if any(len(set(fv)) < 3 for fv in _faces(after)):
+    if any(len(set(fv)) != len(fv) for fv in _faces(after)):
         return False
-    return _boundary(after) == _boundary(before)
+    if _boundary(after) != _boundary(before):
+        return False
+    was_used = _link_components(before)
+    pieces = _link_components(after)
+    if any(c > 1 for c in pieces.values()):
+        return False
+    return all(pieces.get(v, 0) == 1 for v, c in was_used.items() if c > 0)
+
+
+# Verbatim outputs of bridge_faces at 45087dd (the first R2 fix), kept as inputs
+# the checker must reject.
+_PLANE3_BOWTIE = [[1, 5, 6, 2], [2, 6, 7, 3], [4, 8, 9, 5], [6, 10, 11, 7], [8, 12, 13, 9],
+                  [9, 13, 14, 10], [10, 14, 15, 11], [0, 4, 9, 10], [4, 5, 9], [5, 1, 6],
+                  [1, 0, 10, 6]]       # plane 3x3, bridge_faces(m, [0], [4])
+_BOX_ORPHAN = [[2, 3, 7, 6], [1, 2, 6, 5], [3, 2, 7], [2, 1, 6, 7],
+               [1, 5, 6]]              # box, bridge_faces(m, [0, 2], [1, 4])
 
 
 def test_r2_checkers_reject_broken_meshes():
@@ -210,6 +262,31 @@ def test_r2_checkers_reject_broken_meshes():
     moved = box.copy()
     moved.vertices[0].position = moved.vertices[0].position + 1e-9
     assert not _same(box, moved)
+
+    # bow-tie: every directed edge once and the boundary unchanged, so only
+    # the fan check can see that vertex 5 has two separate fans
+    plane = create_plane(subdivisions_x=3, subdivisions_y=3)
+    bowtie = HalfEdgeMesh.from_arrays([v.position for v in plane.vertices], _PLANE3_BOWTIE)
+    assert _faces(bowtie) == _PLANE3_BOWTIE
+    assert max(_directed(bowtie).values()) == 1 and _boundary(bowtie) == _boundary(plane)
+    assert _link_components(bowtie)[5] == 2
+    assert not _sound_bridge(plane, bowtie)
+
+    # closed and every directed edge once, but vertices 0 and 4 lost all faces
+    orphan = HalfEdgeMesh.from_arrays([v.position for v in box.vertices], _BOX_ORPHAN)
+    assert max(_directed(orphan).values()) == 1 and not _boundary(orphan)
+    assert max(_link_components(orphan).values()) == 1
+    assert [v for v, c in _link_components(orphan).items() if c == 0] == [0, 4]
+    assert not _sound_bridge(box, orphan)
+
+    # a face that passes the same vertex twice (not consecutively); otherwise
+    # sound, so only the all-distinct check rejects it
+    pts = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]]
+    pinched = HalfEdgeMesh.from_arrays(pts, [[0, 1, 2, 1, 3]])
+    assert _faces(pinched) == [[0, 1, 2, 1, 3]]
+    assert max(_directed(pinched).values()) == 1
+    assert max(_link_components(pinched).values()) == 1
+    assert not _sound_bridge(pinched, pinched)
 
 
 @pytest.mark.parametrize("a,b", [([f], [f]) for f in range(6)] + [([4], [-2]), ([-6], [0]),
@@ -255,26 +332,125 @@ def test_r2_every_ordered_pair_of_box_faces():
     assert len(bridged) == 24
 
 
-@pytest.mark.parametrize("nx,ny", [(3, 3), (4, 2), (3, 1), (1, 3)])
-def test_r2_every_ordered_pair_of_grid_faces(nx, ny):
-    """R2 (mirrors M14) on open input: every ordered pair of cells of a flat
-    grid gives a sound bridge (boundary unchanged, every directed edge used at
-    most once) or exactly the untouched grid."""
-    grid = create_plane(subdivisions_x=nx, subdivisions_y=ny)
-    n = len(grid.faces)
-    assert n == nx * ny and len(_boundary(grid)) == 2 * (nx + ny)
+_SCAN_MESHES = {
+    "plane3x3": lambda: create_plane(subdivisions_x=3, subdivisions_y=3),
+    "plane4x2": lambda: create_plane(subdivisions_x=4, subdivisions_y=2),
+    "plane3x1": lambda: create_plane(subdivisions_x=3, subdivisions_y=1),
+    "plane1x3": lambda: create_plane(subdivisions_x=1, subdivisions_y=3),
+    "torus8x4": lambda: create_torus(major_segments=8, minor_segments=4),
+    "cylinder8": lambda: create_cylinder(segments=8),
+}
+
+
+@pytest.mark.parametrize("name", list(_SCAN_MESHES))
+def test_r2_every_ordered_pair_of_single_faces(name):
+    """R2 (mirrors M14) on open grids and closed meshes: every ordered pair of
+    faces gives a sound bridge (boundary unchanged, every directed edge used at
+    most once, every vertex one fan and none orphaned) or exactly the
+    untouched mesh."""
+    m = _SCAN_MESHES[name]()
+    n = len(m.faces)
+    fl = _faces(m)
+    if name.startswith("plane"):
+        nx, ny = (int(k) for k in name[5:].split("x"))
+        assert n == nx * ny and len(_boundary(m)) == 2 * (nx + ny)
+    else:
+        assert not _boundary(m) and _sound_bridge(m, m)
     n_bridged = 0
     for a in range(n):
         for b in range(n):
-            out = bridge_faces(grid, [a], [b])
-            if _same(out, grid):
+            out = bridge_faces(m, [a], [b])
+            if _same(out, m):
                 continue
-            assert _sound_bridge(grid, out), (a, b, _faces(out))
+            assert _sound_bridge(m, out), (a, b, _faces(out))
             n_bridged += 1
-    # both sides of the bracket: same-cell pairs are always refused, and the
-    # operation is not refusing everything
+    # both sides of the bracket: same-face pairs are always refused, and the
+    # operation is not refusing everything (pairs of same-size faces that
+    # share an edge still bridge; a cylinder cap and a side quad cannot)
     assert n_bridged <= n * n - n
-    assert n_bridged > 0
+    edge_sharing = sum(1 for a in range(n) for b in range(n)
+                       if len(set(fl[a]) & set(fl[b])) == 2 and len(fl[a]) == len(fl[b]))
+    assert n_bridged >= edge_sharing > 0
+
+
+@pytest.mark.parametrize("make,a,b,edge_pair", [
+    (lambda: create_plane(subdivisions_x=3, subdivisions_y=3), 0, 4, (0, 1)),
+    (lambda: create_plane(subdivisions_x=3, subdivisions_y=3), 1, 3, (1, 4)),
+    (lambda: create_torus(major_segments=8, minor_segments=4), 0, 5, (0, 1)),
+    (lambda: create_box(subdivisions=1), 0, 2, (0, 1)),
+], ids=["plane3x3-0-4", "plane3x3-1-3", "torus8x4-0-5", "box_sub1-0-2"])
+def test_r2_corner_touching_faces_return_the_untouched_mesh(make, a, b, edge_pair):
+    """R2 (mirrors M14): two faces that share exactly one corner. The side
+    quads at that corner collapse to triangles lying back-to-back on kept
+    faces, and the corner keeps two separate face fans (a bow-tie). Every
+    directed edge is still used once, so the directed-edge check let it
+    through (45087dd gave plane 3x3 (0, 4) a pinched vertex 5). Expected: the
+    untouched mesh, both ways round; bracket: on the same mesh, two faces
+    that share a full edge still bridge soundly."""
+    m = make()
+    fl = _faces(m)
+    assert len(set(fl[a]) & set(fl[b])) == 1, "precondition: exactly one shared vertex"
+    for x, y in ((a, b), (b, a)):
+        out = bridge_faces(m, [x], [y])
+        assert _same(out, m), (x, y, _faces(out), _link_components(out))
+        assert out is not m
+    ea, eb = edge_pair
+    assert len(set(fl[ea]) & set(fl[eb])) == 2
+    out = bridge_faces(m, [ea], [eb])
+    assert not _same(out, m) and _sound_bridge(m, out)
+
+
+@pytest.mark.parametrize("make,a,b,orphans", [
+    (create_box, [0, 2], [1, 4], [0, 4]),
+    (lambda: create_plane(subdivisions_x=3, subdivisions_y=3), [0, 1], [3, 4], [5]),
+], ids=["box", "plane3x3"])
+def test_r2_groups_sharing_an_edge_chain_return_the_untouched_mesh(make, a, b, orphans):
+    """R2 (mirrors M14): two 2-face groups whose boundary loops share a chain
+    of edges. The side quads along the chain collapse, the chain's inner
+    vertices lose every face, and what is built is degenerate (box: triangle
+    [3, 2, 7] folded onto [2, 3, 7, 6]; plane: the collinear triangle
+    [0, 4, 8]). Expected: the untouched mesh."""
+    m = make()
+    fl = _faces(m)
+    for v in orphans:
+        # precondition: every face at v is in one of the groups, and both
+        # groups touch v, so v is on both loops (not inside one group)
+        at_v = {i for i, f in enumerate(fl) if v in f}
+        assert at_v <= set(a + b) and at_v & set(a) and at_v & set(b)
+    out = bridge_faces(m, a, b)
+    assert _same(out, m), (_faces(out), _link_components(out))
+
+
+def test_r2_inner_vertex_of_a_group_may_still_be_dropped():
+    """R2 positive control for the orphan rule: two 2x2 patches facing each
+    other on parallel 4x4 grids. Each patch's centre vertex is inside its group
+    (on neither loop), so dropping it is the normal result of a bridge.
+    Expected: 32 - 8 + 8 faces, the two grid rims as the only boundary, and
+    every vertex one fan except the two dropped centres."""
+    verts, faces = [], []
+    for z, flip in ((0.0, False), (1.0, True)):
+        off = len(verts)
+        verts.extend([x, y, z] for y in range(5) for x in range(5))
+        for j in range(4):
+            for i in range(4):
+                q = [off + 5 * j + i, off + 5 * j + i + 1,
+                     off + 5 * (j + 1) + i + 1, off + 5 * (j + 1) + i]
+                faces.append(q[::-1] if flip else q)
+    m = HalfEdgeMesh.from_arrays(verts, faces)
+    patch_a = [5, 6, 9, 10]
+    patch_b = [16 + f for f in patch_a]
+    centres = [12, 25 + 12]
+    fl = _faces(m)
+    # precondition: each centre is surrounded by its own patch only
+    assert {i for i, f in enumerate(fl) if 12 in f} == set(patch_a)
+    assert {i for i, f in enumerate(fl) if 37 in f} == set(patch_b)
+    out = bridge_faces(m, patch_a, patch_b)
+    assert not _same(out, m)
+    assert len(out.faces) == 32 - 8 + 8 and len(out.vertices) == 50
+    assert max(_directed(out).values()) == 1 and _boundary(out) == _boundary(m)
+    pieces = _link_components(out)
+    assert sorted(v for v, c in pieces.items() if c == 0) == centres
+    assert all(c == 1 for v, c in pieces.items() if v not in centres)
 
 
 def test_r2_facing_quads_on_parallel_grids_still_bridge():
