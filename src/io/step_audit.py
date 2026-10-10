@@ -34,6 +34,7 @@ BlinkingSun/stl2step (MIT).
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -294,9 +295,12 @@ def verdict(m: Dict[str, Any], volume_tol_pct: Optional[float] = None
     if not m.get("readable"):
         return 1, ["written STEP cannot be re-read as a shape"]
     reasons: List[str] = []
-    if m.get("shells", 0) == 0:
+    # Every comparison with NaN is False, so each gate is written to fail
+    # closed: "not x >= 1" rejects NaN where "x < 1" would wave it through
+    # (and a missing / None count counts as 0).
+    if not (m.get("shells") or 0) >= 1:
         reasons.append("no shell in the file")
-    if m.get("solids", 0) < 1:
+    if not (m.get("solids") or 0) >= 1:
         reasons.append("no solid body (SolidWorks would import a surface body)")
     if m.get("free_edges") is None or m["free_edges"] != 0:
         reasons.append(f"free edges: {m.get('free_edges')}")
@@ -306,13 +310,21 @@ def verdict(m: Dict[str, Any], volume_tol_pct: Optional[float] = None
     if closed and not all(closed):
         reasons.append(f"measured shell closure: {closed}")
     vol = m.get("brep_volume_mm3")
-    if vol is None or vol <= 0:
+    if vol is not None and not math.isfinite(vol):
+        # NaN compares False with everything, so "vol <= 0" alone would
+        # accept a failed integration
+        reasons.append(f"B-Rep volume is not finite: {vol!r}")
+    elif vol is None or vol <= 0:
         reasons.append(f"B-Rep volume not positive: {vol}")
     delta = m.get("volume_delta_pct")
     if (volume_tol_pct is not None and m.get("mesh_watertight")
-            and delta is not None and abs(delta) > volume_tol_pct):
-        reasons.append(f"volume differs from the mesh by {delta:.4g} % "
-                       f"(budget {volume_tol_pct:g} %)")
+            and delta is not None):
+        if not math.isfinite(delta):
+            reasons.append(f"volume difference from the mesh is not finite: "
+                           f"{delta!r}")
+        elif not abs(delta) <= volume_tol_pct:
+            reasons.append(f"volume differs from the mesh by {delta:.4g} % "
+                           f"(budget {volume_tol_pct:g} %)")
     exp_faces = m.get("expected_faces")
     if exp_faces is not None and m.get("faces") != exp_faces:
         reasons.append(f"{exp_faces} faces expected but {m.get('faces')} in the file")

@@ -8,6 +8,11 @@ test here names its follow-up item and the original bug it mirrors:
 * F1 (mirrors M15, cand 7/8) - ``gui.panels.face_normal`` kept the absolute
   ``norm > 1e-8`` degeneracy test and no centring, so the Properties panel
   showed a zero normal for a valid triangle with 1e-5 legs.
+* F2 (mirrors S:nan_volume, the NaN volume gates fixed in
+  ``faceted_step.unify_verdict`` and ``NURBSSimplifier.simplify``) -
+  ``step_audit.verdict`` gated the B-Rep volume with ``vol <= 0``, the volume
+  budget with ``abs(delta) > tol`` and the shell / solid counts with ``== 0`` /
+  ``< 1``; every comparison with NaN is False, so NaN passed all four.
 
 Test discipline (the repo's vacuous-test rules): each test first asserts that
 the defect / precondition really is in its input, every checker gets an input
@@ -84,3 +89,93 @@ def test_f1_panel_face_normal_matches_the_m15_core_rule(name, points, expected):
     assert np.array_equal(shown, core), (name, shown, core)
     # the value is cached on the face, as before
     assert np.array_equal(np.asarray(face.normal), shown)
+
+
+# --------------------------------------------------------------------------
+# F2 (mirrors S:nan_volume): NaN pass-through in step_audit.verdict
+# --------------------------------------------------------------------------
+
+NAN = float("nan")
+INF = float("inf")
+
+
+def _clean_measurement(**overrides):
+    """A measurement every gate of ``verdict`` accepts (as in test_step_audit)."""
+    m = {
+        "readable": True, "faces": 6, "solids": 1, "shells": 1,
+        "closed_stored": [True], "closed_measured": [True],
+        "free_edges": 0, "brepcheck_valid": True,
+        "brep_volume_mm3": 1000.0, "mesh_volume_mm3": 1000.0,
+        "mesh_watertight": True, "volume_delta_pct": 0.0,
+        "bbox_max_diff_mm": 0.0, "expected_faces": None,
+        "census_faces": None,
+    }
+    m.update(overrides)
+    return m
+
+
+def test_f2_verdict_positive_controls():
+    """F2: the clean measurement passes, with and without a volume budget,
+    and a finite delta inside the budget passes too."""
+    from src.io.step_audit import verdict
+    assert verdict(_clean_measurement()) == (0, [])
+    assert verdict(_clean_measurement(), volume_tol_pct=1e-4) == (0, [])
+    assert verdict(_clean_measurement(volume_delta_pct=5e-5),
+                   volume_tol_pct=1e-4) == (0, [])
+    # report-only (no budget): a non-finite delta is not gated, as documented
+    assert verdict(_clean_measurement(volume_delta_pct=NAN)) == (0, [])
+    # finite out-of-budget delta and non-positive volume still fail as before
+    assert verdict(_clean_measurement(volume_delta_pct=5.0), volume_tol_pct=1.0) == (
+        2, ["volume differs from the mesh by 5 % (budget 1 %)"])
+    assert verdict(_clean_measurement(brep_volume_mm3=-1.0)) == (
+        2, ["B-Rep volume not positive: -1.0"])
+
+
+@pytest.mark.parametrize("vol", [NAN, INF, -INF])
+def test_f2_verdict_rejects_a_non_finite_brep_volume(vol):
+    """F2 (mirrors S:nan_volume): ``vol <= 0`` is False for NaN, so a failed
+    volume integration passed the audit as a clean solid."""
+    from src.io.step_audit import verdict
+    assert not (NAN <= 0), "precondition: NaN compares False"
+    code, reasons = verdict(_clean_measurement(brep_volume_mm3=vol,
+                                               volume_delta_pct=None))
+    assert code == 2
+    assert reasons == [f"B-Rep volume is not finite: {vol!r}"], reasons
+
+
+@pytest.mark.parametrize("delta", [NAN, INF, -INF])
+def test_f2_verdict_rejects_a_non_finite_volume_delta(delta):
+    """F2 (mirrors S:nan_volume): ``abs(delta) > budget`` is False for NaN, so
+    an unmeasurable volume difference passed the faceted exporter's budget."""
+    from src.io.step_audit import verdict
+    assert not (abs(NAN) > 1e-4), "precondition: NaN compares False"
+    code, reasons = verdict(_clean_measurement(volume_delta_pct=delta),
+                            volume_tol_pct=1e-4)
+    assert code == 2
+    assert reasons == [f"volume difference from the mesh is not finite: {delta!r}"], \
+        reasons
+
+
+@pytest.mark.parametrize("key,value,reason", [
+    ("shells", NAN, "no shell in the file"),
+    ("solids", NAN, "no solid body (SolidWorks would import a surface body)"),
+    ("shells", None, "no shell in the file"),
+    ("solids", None, "no solid body (SolidWorks would import a surface body)"),
+])
+def test_f2_verdict_count_gates_reject_nan(key, value, reason):
+    """F2: the shell and solid count gates were written as ``== 0`` / ``< 1``,
+    which NaN also slips through; they must fail closed like the others.
+    (free_edges / faces / census_faces use ``!=`` and already reject NaN.)"""
+    from src.io.step_audit import verdict
+    assert verdict(_clean_measurement(**{key: 0})) == (2, [reason])  # rejects 0
+    code, reasons = verdict(_clean_measurement(**{key: value}))
+    assert (code, reasons) == (2, [reason]), reasons
+
+
+def test_f2_verdict_ne_gates_already_reject_nan():
+    """F2 control: the ``!=`` gates were already NaN-safe; pin that."""
+    from src.io.step_audit import verdict
+    code, reasons = verdict(_clean_measurement(free_edges=NAN))
+    assert code == 2 and reasons == ["free edges: nan"], reasons
+    code, reasons = verdict(_clean_measurement(expected_faces=6, faces=NAN))
+    assert code == 2 and reasons == ["6 faces expected but nan in the file"], reasons
