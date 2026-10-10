@@ -12,6 +12,9 @@ class Feature:
         self.parameters: Dict[str, Any] = parameters
         self.enabled: bool = True
         self.mesh_snapshot: Optional[HalfEdgeMesh] = None
+        # True when the last evaluation returned no mesh. A None snapshot alone
+        # cannot tell "evaluated to empty" from "never evaluated".
+        self.evaluated_empty: bool = False
         self.timestamp: datetime = datetime.now()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -111,12 +114,15 @@ class FeatureTree:
             if feat.mesh_snapshot is not None:
                 current_mesh = feat.mesh_snapshot.copy()
                 break
+            if feat.evaluated_empty:
+                break  # its (empty) result is known: resume after it with None
             start = i
 
         for i in range(start, len(self.features)):
             feat = self.features[i]
             if not feat.enabled:
                 feat.mesh_snapshot = None
+                feat.evaluated_empty = False
                 continue
             try:
                 current_mesh = self.feature_evaluator(feat, current_mesh)
@@ -126,8 +132,10 @@ class FeatureTree:
                 # stale geometry as current.
                 for stale in self.features[i:]:
                     stale.mesh_snapshot = None
+                    stale.evaluated_empty = False
                 raise
             feat.mesh_snapshot = current_mesh.copy() if current_mesh else None
+            feat.evaluated_empty = feat.mesh_snapshot is None
 
         for cb in self.on_rebuild_complete:
             cb(self.get_current_mesh())
@@ -136,8 +144,15 @@ class FeatureTree:
 
     def get_current_mesh(self) -> Optional[HalfEdgeMesh]:
         for i in range(len(self.features) - 1, -1, -1):
-            if self.features[i].enabled and self.features[i].mesh_snapshot:
-                return self.features[i].mesh_snapshot.copy()
+            feat = self.features[i]
+            if not feat.enabled:
+                continue
+            if feat.mesh_snapshot:
+                return feat.mesh_snapshot.copy()
+            if feat.evaluated_empty:
+                # the newest evaluated feature produced nothing; an older
+                # snapshot is not the current geometry
+                return None
         return None
 
     def undo(self) -> None:

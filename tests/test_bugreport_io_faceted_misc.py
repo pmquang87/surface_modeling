@@ -168,3 +168,87 @@ def test_m21_import_step_works_with_nested_ocp_layout(tmp_path, monkeypatch):
     assert np.allclose(np.sort(nested["vertices"], axis=0),
                        np.sort(flat["vertices"], axis=0))
 
+
+# --------------------------------------------------------------------------
+# M19: feature tree with an empty last result
+# --------------------------------------------------------------------------
+
+class _FakeMesh:
+    def __init__(self, tag=()):
+        self.tag = tuple(tag)
+
+    def copy(self):
+        return _FakeMesh(self.tag)
+
+
+def _tree(names, empty=(), calls=None):
+    """Tree whose evaluator appends the feature name, or returns None for the
+    names in ``empty``. ``calls`` records (name, input tag or None)."""
+    from src.core.feature_tree import Feature, FeatureTree
+    tree = FeatureTree()
+    for name in names:
+        tree.features.append(Feature(name, "test", {}))
+    calls = [] if calls is None else calls
+
+    def evaluate(feature, mesh):
+        calls.append((feature.name, None if mesh is None else mesh.tag))
+        if feature.name in empty:
+            return None
+        base = mesh.tag if mesh is not None else ()
+        return _FakeMesh(base + (feature.name,))
+    tree.feature_evaluator = evaluate
+    return tree, calls
+
+
+def test_m19_empty_last_feature_reports_no_mesh():
+    """M19 (cand 32): A -> mesh, B -> None. ``get_current_mesh()``, the
+    ``rebuild`` return value and the rebuild callback must all be None, not
+    A's mesh."""
+    tree, calls = _tree(["A", "B"], empty={"B"})
+    seen = []
+    tree.on_rebuild_complete.append(seen.append)
+
+    result = tree.rebuild(0)
+
+    # preconditions: both features really ran, A really produced a mesh
+    assert calls == [("A", None), ("B", ("A",))]
+    assert tree.features[0].mesh_snapshot is not None
+    assert tree.features[0].mesh_snapshot.tag == ("A",)
+    assert tree.features[1].mesh_snapshot is None
+
+    assert result is None
+    assert tree.get_current_mesh() is None
+    assert seen == [None]
+
+
+def test_m19_controls_non_empty_disabled_and_following_feature():
+    """M19 (cand 32) controls: the empty-result rule must not swallow real
+    meshes. B producing a mesh -> ('A', 'B'); B empty but disabled -> A's mesh;
+    a feature C after an empty B gets None as input and its mesh is current."""
+    tree, _ = _tree(["A", "B"])
+    assert tree.rebuild(0).tag == ("A", "B")
+    assert tree.get_current_mesh().tag == ("A", "B")
+
+    tree, calls = _tree(["A", "B"], empty={"B"})
+    tree.features[1].enabled = False
+    assert tree.rebuild(0).tag == ("A",)
+    assert calls == [("A", None)]
+
+    tree, calls = _tree(["A", "B", "C"], empty={"B"})
+    assert tree.rebuild(0).tag == ("C",)
+    assert calls[-1] == ("C", None)
+
+    # partial rebuild from C, after B evaluated empty: C must still get None
+    del calls[:]
+    assert tree.rebuild(2).tag == ("C",)
+    assert calls and calls[-1] == ("C", None)
+    assert all(inp is None for name, inp in calls if name == "C")
+
+    # empty again at the end after a partial rebuild
+    tree, calls = _tree(["A", "B"], empty={"B"})
+    tree.rebuild(0)
+    del calls[:]
+    assert tree.rebuild(1) is None
+    assert calls == [("B", ("A",))]
+    assert tree.get_current_mesh() is None
+
