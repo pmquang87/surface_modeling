@@ -215,3 +215,88 @@ def test_m8_on_click_edge_mode_selects_edge_under_click(monkeypatch):
     MeshViewport._on_click(stub, None)
     assert applied == [[e12]]
     assert emitted == [e12]
+
+
+# ----------------------------------------------------------------------------
+# M9: PropertiesPanel.clear() must remove the Apply/Cancel row
+# ----------------------------------------------------------------------------
+
+def _buttons(panel, text=None):
+    btns = panel.findChildren(QPushButton)
+    if text is not None:
+        btns = [b for b in btns if b.text() == text]
+    return btns
+
+
+def test_m9_clear_removes_apply_cancel_buttons(qapp):
+    """M9 (cand 29): after set_tool_ui(...) then clear(), the panel holds no
+    Apply/Cancel buttons any more (deleted, not merely detached), the form is
+    empty, and the stale Apply can no longer run its callback."""
+    panel = PropertiesPanel()
+    calls = []
+    tool = QLabel("tool parameters")
+    panel.set_tool_ui("Shell / Thicken", tool,
+                      lambda: calls.append('apply'), lambda: calls.append('cancel'))
+    _flush_deletes(qapp)
+
+    # Preconditions: both buttons exist, live under the panel and are wired.
+    apply_btns = _buttons(panel, "Apply")
+    cancel_btns = _buttons(panel, "Cancel")
+    assert len(apply_btns) == 1 and len(cancel_btns) == 1
+    apply_btn, cancel_btn = apply_btns[0], cancel_btns[0]
+    assert not apply_btn.isHidden()
+    apply_btn.click()
+    assert calls == ['apply']
+    calls.clear()
+    assert panel.form_layout.count() == 2  # tool row + button row
+
+    panel.clear()
+    _flush_deletes(qapp)
+
+    assert panel.form_layout.count() == 0
+    assert _buttons(panel) == []
+    assert not shiboken6.isValid(apply_btn)
+    assert not shiboken6.isValid(cancel_btn)
+    assert not shiboken6.isValid(tool)
+    # A stale Apply cannot fire: if the wrapper were still alive, clicking it
+    # would run the callback of a tool that is already closed.
+    if shiboken6.isValid(apply_btn):
+        apply_btn.click()
+    assert calls == []
+    assert panel.group_box.title() == "Properties"
+    panel.deleteLater()
+    _flush_deletes(qapp)
+
+
+def test_m9_reopening_tool_ui_does_not_stack_buttons(qapp):
+    """M9 (cand 29): opening a tool UI twice leaves exactly ONE Apply and ONE
+    Cancel button (the old row is removed by the clear() inside set_tool_ui),
+    and clear() called from inside the Apply click itself (what every tool's
+    apply() does) neither crashes nor leaves buttons behind."""
+    panel = PropertiesPanel()
+    hits = []
+    panel.set_tool_ui("T1", QLabel("a"), lambda: hits.append(1), lambda: None)
+    panel.set_tool_ui("T2", QLabel("b"), lambda: hits.append(2), lambda: None)
+    _flush_deletes(qapp)
+    assert len(_buttons(panel, "Apply")) == 1
+    assert len(_buttons(panel, "Cancel")) == 1
+    assert panel.group_box.title() == "T2"
+
+    # The only Apply is the second tool's.
+    (apply_btn,) = _buttons(panel, "Apply")
+    hits.clear()
+
+    def apply_and_close():
+        hits.append('applied')
+        panel.clear()
+
+    panel.set_tool_ui("T3", QLabel("c"), apply_and_close, lambda: None)
+    _flush_deletes(qapp)
+    (apply_btn,) = _buttons(panel, "Apply")
+    apply_btn.click()
+    _flush_deletes(qapp)
+    assert hits == ['applied']
+    assert _buttons(panel) == []
+    assert panel.form_layout.count() == 0
+    panel.deleteLater()
+    _flush_deletes(qapp)
