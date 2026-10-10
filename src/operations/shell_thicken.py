@@ -1,8 +1,97 @@
+import logging
+
 import numpy as np
 from typing import List, Optional, Tuple, Any
 import trimesh
 
 from src.core.halfedge_mesh import HalfEdgeMesh
+
+logger = logging.getLogger(__name__)
+
+# An enclosed flood-fill component is signed by the generalized winding number
+# w at its deepest cells: inside iff w > 0.5. For a closed, consistently wound
+# surface w is an integer off the surface (0 air, 1 inside, 2 where two
+# same-orientation bodies overlap), exact to round-off. It drifts from an
+# integer only through defects: a hole of solid angle Omega seen from the
+# point shifts w by Omega / 4 pi, a flipped triangle by twice that. Inside
+# the band |w - 0.5| < _GWN_AMBIGUOUS such defects cover a large part of the
+# view sphere, w no longer says which side the component is on, and the
+# component falls back to the local vote of its near-surface cells.
+_GWN_AMBIGUOUS = 0.25
+_GWN_SAMPLES = 5          # deepest cells per component; the median decides
+
+
+def _winding_numbers(triangles: np.ndarray, points: np.ndarray,
+                     budget: int = 32_768) -> np.ndarray:
+    """Generalized winding number of a triangle soup at `points`.
+
+    w(p) = 1/(4 pi) * sum of the signed solid angles of the triangles seen
+    from p (Jacobson, Kavan & Sorkine-Hornung 2013), each by Van Oosterom &
+    Strackee: Omega = 2 atan2(a . (b x c),
+    |a||b||c| + (a.b)|c| + (a.c)|b| + (b.c)|a|), with a, b, c the corners
+    relative to p. A triangle counts positive when p lies behind it (on its
+    -normal side), so w = +1 inside an outward-wound closed body, 0 outside,
+    -1 inside an inside-out one.
+
+    Args:
+        triangles: (T, 3, 3) corner coordinates.
+        points: (P, 3) query points.
+        budget: point x triangle pairs evaluated at once. Small enough that
+            the ~40 (budget,) float64 temporaries stay in cache: 32k pairs
+            run ~3x faster per pair than 1M (measured, 64k triangles).
+    Returns:
+        (P,) winding numbers.
+    """
+    tri = np.asarray(triangles, dtype=np.float64)
+    pts = np.asarray(points, dtype=np.float64)
+    if tri.ndim != 3 or tri.shape[1:] != (3, 3):
+        raise ValueError(f"triangles must be (T, 3, 3), got {tri.shape}")
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError(f"points must be (P, 3), got {pts.shape}")
+    w = np.zeros(len(pts))
+    if len(tri) == 0 or len(pts) == 0:
+        return w
+    corners = np.ascontiguousarray(tri.transpose(1, 2, 0))  # (corner, xyz, T)
+    p_chunk = max(1, min(len(pts), 64, budget))
+    t_chunk = max(1, budget // p_chunk)
+    for ps in range(0, len(pts), p_chunk):
+        p = pts[ps:ps + p_chunk]
+        px, py, pz = p[:, 0:1], p[:, 1:2], p[:, 2:3]
+        acc = np.zeros(len(p))
+        for ts in range(0, len(tri), t_chunk):
+            k = corners[:, :, ts:ts + t_chunk]
+            ax, ay, az = k[0, 0] - px, k[0, 1] - py, k[0, 2] - pz
+            bx, by, bz = k[1, 0] - px, k[1, 1] - py, k[1, 2] - pz
+            cx, cy, cz = k[2, 0] - px, k[2, 1] - py, k[2, 2] - pz
+            la = np.sqrt(ax * ax + ay * ay + az * az)
+            lb = np.sqrt(bx * bx + by * by + bz * bz)
+            lc = np.sqrt(cx * cx + cy * cy + cz * cz)
+            det = (ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz)
+                   + az * (bx * cy - by * cx))
+            den = (la * lb * lc + (ax * bx + ay * by + az * bz) * lc
+                   + (ax * cx + ay * cy + az * cz) * lb
+                   + (bx * cx + by * cy + bz * cz) * la)
+            acc += np.arctan2(det, den).sum(axis=1)
+        w[ps:ps + p_chunk] = acc / (2.0 * np.pi)   # 2 atan2 / (4 pi)
+    return w
+
+
+def _deepest_cells(labels_flat: np.ndarray, depth: np.ndarray,
+                   comp_ids: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Up to `k` cells of largest `depth` for each label in `comp_ids`.
+
+    Returns (cell indices into the flat grid, their label), grouped by label.
+    """
+    member = np.zeros(int(labels_flat.max()) + 1, dtype=bool)
+    member[comp_ids] = True
+    cells = np.flatnonzero(member[labels_flat])
+    lab = labels_flat[cells]
+    order = np.lexsort((-depth[cells], lab))     # by label, deepest first
+    cells, lab = cells[order], lab[order]
+    starts = np.flatnonzero(np.r_[True, lab[1:] != lab[:-1]])
+    rank = np.arange(len(lab)) - np.repeat(starts, np.diff(np.r_[starts, len(lab)]))
+    keep = rank < k
+    return cells[keep], lab[keep]
 
 
 def _oriented_distance(tmesh: 'trimesh.Trimesh', points: np.ndarray) -> np.ndarray:
@@ -22,7 +111,8 @@ def _oriented_distance(tmesh: 'trimesh.Trimesh', points: np.ndarray) -> np.ndarr
 def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
                  grid_resolution: int, padding: float = 0.1,
                  open_surface: bool = False,
-                 exact_band: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, float]:
+                 exact_band: Optional[float] = None,
+                 diagnostics: Optional[dict] = None) -> Tuple[np.ndarray, np.ndarray, float]:
     """Compute a signed distance field on a voxel grid.
 
     Sign convention: POSITIVE OUTSIDE / on the +normal side, negative inside.
@@ -35,13 +125,15 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
       2. exact unsigned distance (chunked closest-point queries) only inside
          ``exact_band`` -- the region whose values marching cubes will read,
       3. sign from a voxel flood fill: cells the surface crosses are walls,
-         the component reachable from the padded corner is outside, and each
-         enclosed component is signed as a whole by a vote of its cells'
-         exact nearest-triangle sides -- enclosed is not the same as inside
-         (the void of a hollow solid, a cavity behind a vent narrower than
-         the wall cells). Near-surface cells sign by the exact nearest
-         triangle's normal. This stays correct at thin features where pure
-         normal-based signing is ambiguous.
+         every component touching the grid border is outside, and each
+         enclosed component is signed as a whole by the generalized winding
+         number at its deepest cells (inside iff w > 0.5), falling back to a
+         vote of its cells' exact nearest-triangle sides when w is ambiguous
+         -- enclosed is not the same as inside (the void of a hollow solid, a
+         cavity behind a vent narrower than the wall cells). Near-surface
+         cells sign by the exact nearest triangle's normal. This stays
+         correct at thin features where pure normal-based signing is
+         ambiguous.
 
     Args:
         open_surface: sign by the nearest triangle's normal instead of by
@@ -49,6 +141,12 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
         exact_band: absolute distance (same units as the mesh) within which
             values are refined to exact surface distance. None -> 4 voxels
             (enough to extract the level-0 surface).
+        diagnostics: if a dict is given, it is filled with the per-component
+            sign decision of the flood fill (closed surfaces only): arrays
+            ``enclosed`` (label ids), ``size``, ``winding`` (median w),
+            ``vote`` / ``vote_sign`` (the near-surface vote), ``sign`` (final,
+            +1 outside), ``fallback`` (vote used), plus ``labels`` (the label
+            grid) and ``n_components``.
 
     Returns:
         sdf_grid: 3D numpy array of signed distances
@@ -159,24 +257,67 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
     # vent narrower than the wall cells, is sealed off by wall cells yet is
     # air. The surface never passes between two face-adjacent non-wall cells
     # (a crossing would put one of them within half a voxel of it), so each
-    # component lies on ONE side of the surface: sign it by a vote of its
-    # refined cells' exact nearest-triangle sides -- the crease-robust test
-    # the wall cells use below -- each weighted by the cosine between
-    # (p - closest) and the normal, so near-ties at edges and vertices count
-    # for little and a few flipped triangles cannot outvote the rest. A
-    # component touching the grid border is outside; one without votes stays
-    # inside.
+    # component lies on ONE side of the surface and is signed as a whole:
+    #   * touching the grid border -> outside;
+    #   * else by the generalized winding number at its deepest cells
+    #     (median of up to _GWN_SAMPLES): inside iff w > 0.5. This is a
+    #     global test -- it sees every body, so overlapping same-orientation
+    #     bodies (w = 2) stay inside, where a local test sees only the
+    #     nearest one (material between nested internal plates is next to
+    #     the plates' outward faces and looks like air);
+    #   * if w is ambiguous (|w - 0.5| < _GWN_AMBIGUOUS: holes, many flipped
+    #     triangles), by a vote of its refined cells' exact nearest-triangle
+    #     sides -- the crease-robust test the wall cells use below -- each
+    #     weighted by the cosine between (p - closest) and the normal, so
+    #     near-ties at edges and vertices count for little. A component
+    #     without votes stays inside.
     labels_flat = labels.ravel()
-    comp_sign = np.full(n_labels + 1, -1.0)
+    votes = np.zeros(n_labels + 1)
     if len(refine_pts):
         side = _exact_side()
         cosine = side / np.maximum(exact, 1e-300)
         votes = np.bincount(labels_flat[refine_mask], weights=cosine,
                             minlength=n_labels + 1)
-        comp_sign[votes > 0.0] = 1.0
-    comp_sign[labels[[0, -1]]] = 1.0
-    comp_sign[labels[:, [0, -1]]] = 1.0
-    comp_sign[labels[:, :, [0, -1]]] = 1.0
+    vote_sign = np.where(votes > 0.0, 1.0, -1.0)
+    comp_sign = vote_sign.copy()
+
+    border = np.zeros(n_labels + 1, dtype=bool)
+    for face in (labels[[0, -1]], labels[:, [0, -1]], labels[:, :, [0, -1]]):
+        border[face.ravel()] = True
+    comp_sign[border] = 1.0
+    enclosed = np.flatnonzero(~border)
+    enclosed = enclosed[enclosed > 0]            # label 0 = wall cells
+    winding = np.zeros(len(enclosed))
+    fallback = np.zeros(len(enclosed), dtype=bool)
+    if len(enclosed):
+        cells, cell_lab = _deepest_cells(labels_flat, d_est, enclosed,
+                                         _GWN_SAMPLES)
+        w_cells = _winding_numbers(tmesh.triangles, points[cells])
+        starts = np.flatnonzero(np.r_[True, cell_lab[1:] != cell_lab[:-1]])
+        # _deepest_cells groups by ascending label, as `enclosed` is sorted
+        winding = np.array([np.median(g) for g in np.split(w_cells, starts[1:])])
+        fallback = np.abs(winding - 0.5) < _GWN_AMBIGUOUS
+        comp_sign[enclosed] = np.where(winding > 0.5, -1.0, 1.0)
+        comp_sign[enclosed[fallback]] = vote_sign[enclosed[fallback]]
+        if fallback.any():
+            logger.warning(
+                "SDF sign: %d of %d enclosed component(s) have an ambiguous "
+                "winding number (w = %s; holes or flipped triangles?) and are "
+                "signed by the near-surface vote instead",
+                int(fallback.sum()), len(enclosed),
+                ", ".join(f"{v:.2f}" for v in winding[fallback][:5])
+                + (", ..." if fallback.sum() > 5 else ""))
+    if diagnostics is not None:
+        diagnostics.update(
+            n_components=int(n_labels),
+            enclosed=enclosed,
+            size=np.bincount(labels_flat, minlength=n_labels + 1)[enclosed],
+            winding=winding,
+            vote=votes[enclosed],
+            vote_sign=vote_sign[enclosed],
+            sign=comp_sign[enclosed],
+            fallback=fallback,
+            labels=labels)
     sign_flat = comp_sign[labels_flat]
 
     # Near-surface (wall) cells: enclosure says nothing — they ARE the wall.
