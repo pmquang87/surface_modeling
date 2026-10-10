@@ -388,6 +388,85 @@ def test_m4_m5_random_open_sheets_stay_manifold_and_fold_free():
     assert reduced >= 150
 
 
+def _euler_and_loops(faces):
+    """(V - E + F over the used vertices, number of boundary loops)."""
+    edges = {}
+    for f in faces:
+        for i in range(3):
+            a, b = int(f[i]), int(f[(i + 1) % 3])
+            k = (min(a, b), max(a, b))
+            edges[k] = edges.get(k, 0) + 1
+    used = {int(v) for f in faces for v in f}
+    chi = len(used) - len(edges) + len(faces)
+    nbr = {}
+    for (a, b), c in edges.items():
+        if c == 1:
+            nbr.setdefault(a, set()).add(b)
+            nbr.setdefault(b, set()).add(a)
+    loops, seen = 0, set()
+    for v in nbr:
+        if v in seen:
+            continue
+        loops += 1
+        stack = [v]
+        seen.add(v)
+        while stack:
+            for w in nbr[stack.pop()]:
+                if w not in seen:
+                    seen.add(w)
+                    stack.append(w)
+    return chi, loops
+
+
+def test_m4_m5_larger_sheets_with_holes_and_frozen_vertices():
+    """M4 (cand 5) + M5 (cand 20): 80 seeded jittered sheets of 4x4..8x8
+    cells, half of them with a one-cell hole, 0-3 random frozen vertices:
+    no bowtie, no fold, the topology (Euler characteristic, boundary-loop
+    count) kept, every frozen vertex still used, and the face count reduced
+    on most of them."""
+    # checker says yes to a disc and no to two separate triangles (chi 2,
+    # 2 loops) and to a square with a hole (chi 0, 2 loops)
+    assert _euler_and_loops([[0, 1, 2], [0, 2, 3]]) == (1, 1)
+    assert _euler_and_loops([[0, 1, 2], [3, 4, 5]]) == (2, 2)
+    ring = [[0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6],
+            [3, 0, 4], [3, 4, 7]]
+    assert _euler_and_loops(ring) == (0, 2)
+    rng = np.random.default_rng(2024)
+    reduced = 0
+    for _ in range(80):
+        n, m = int(rng.integers(4, 9)), int(rng.integers(4, 9))
+        xs, ys = np.meshgrid(np.arange(n + 1.0), np.arange(m + 1.0))
+        V = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)])
+        V[:, :2] += rng.uniform(-0.3, 0.3, (len(V), 2))
+        hole = (int(rng.integers(1, n - 1)), int(rng.integers(1, m - 1))) \
+            if rng.random() < 0.5 else None
+        F = []
+        for j in range(m):
+            for i in range(n):
+                if (i, j) == hole:
+                    continue
+                a = j * (n + 1) + i
+                if rng.random() < 0.5:
+                    F += [[a, a + 1, a + n + 2], [a, a + n + 2, a + n + 1]]
+                else:
+                    F += [[a, a + 1, a + n + 1], [a + 1, a + n + 2, a + n + 1]]
+        assert np.all(_signed_areas_z(V, F) > 0)
+        chi, loops = _euler_and_loops(F)
+        assert (chi, loops) == ((0, 2) if hole else (1, 1))
+        frozen = set(int(x) for x in rng.choice(len(V), int(rng.integers(0, 4)), replace=False))
+        tgt = int(rng.integers(1, len(F)))
+        out = _decimate_with_frozen(V.copy(), [list(f) for f in F], frozen, tgt)
+        assert out
+        # an interior collapse removes two faces, so it may undershoot by one
+        assert len(out) >= tgt - 1
+        assert _bowtie_vertices(out) == set(), (V.tolist(), F, frozen, tgt)
+        assert np.all(_signed_areas_z(V, out) > 0)
+        assert _euler_and_loops(out) == (chi, loops)
+        assert frozen <= {int(v) for f in out for v in f}
+        reduced += len(out) < len(F)
+    assert reduced >= 70
+
+
 def test_m5_public_decimation_keeps_boundary_manifold():
     """M5 (cand 20): same strip through decimate_mesh(frozen_vertices=[2]),
     target 2: two faces, manifold, frozen vertex 2 kept at (2,1,0)."""
