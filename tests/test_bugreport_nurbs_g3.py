@@ -172,9 +172,11 @@ def _oracle_fit(quad_mesh, weight):
 
 
 def _limit(p):
+    """The fitter's divergence clamp: 1.25 x the corner bbox diagonal around
+    the corner centroid (scale-free; tests/test_g3_clamp_scale.py)."""
     corners = np.array([p[0, 0], p[5, 0], p[5, 5], p[0, 5]])
     diag = np.linalg.norm(corners.max(axis=0) - corners.min(axis=0))
-    return corners.mean(axis=0), max(1.25 * diag, diag + 0.5)
+    return corners.mean(axis=0), 1.25 * diag
 
 
 # --------------------------------------------------------------------- M1

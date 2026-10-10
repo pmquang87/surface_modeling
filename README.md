@@ -30,7 +30,7 @@
 |--------|-------------|
 | **Additive Manufacturing** | Smooth topology-optimized parts for SLM/3D printing |
 | **Industrial Design** | Sculpt ergonomic consumer products with engineering precision |
-| **Automotive** | Create Class A exterior surfaces with curvature continuity |
+| **Automotive** | Smooth exterior surface studies from SubD cages (patches share boundary curves; tangent/curvature continuity is not enforced, so not Class A) |
 | **Prosthetics & Medical** | Convert body scans to clean, editable CAD geometry |
 | **Reverse Engineering** | Transform 3D scans into lightweight parametric models |
 
@@ -54,7 +54,9 @@
 
 ### 🔄 NURBS Conversion
 - Sub-D → B-spline patch fitting
-- G0/G1/G2 continuity enforcement between patches
+- Degree-5 Bezier patches sharing their boundary curves exactly (G0); optional
+  third-derivative smoothing rows across patches (`--continuity G1`, `G2` and `G3`
+  currently act alike) - tangent/curvature continuity is not enforced
 - Optional export via OpenCascade (OCP) if installed
 
 ### 🔁 Reverse Engineering
@@ -276,7 +278,7 @@ Two output modes:
 
 | Mode | What you get | When |
 |------|--------------|------|
-| **NURBS** (default) | Quad retopology → bicubic B-spline patches fitted to the STL → sewn solid. Smooth, editable, ~2000 faces. | Organic parts (topology optimisation, scans) that must be edited or feature-recognised in CAD. |
+| **NURBS** (default) | Quad retopology → degree-5 Bezier patches fitted to the STL → sewn solid. Smooth, editable, ~2000 faces. | Organic parts (topology optimisation, scans) that must be edited or feature-recognised in CAD. |
 | **Faceted** (`--faceted`) | The mesh itself as a B-Rep solid: one planar face per triangle with shared edges, coplanar faces merged, closed by construction. Exact geometry, large file (~2.5 kB per triangle before merging). | Boolean tools, fixtures, anything where exactness beats editability; the former FreeCAD "polyhedral STEP" step. |
 
 Every run re-reads the written file and audits it independently: shell closure (measured, not the stored flag), free edges, BRepCheck, signed volume against the mesh, tessellated bounding box against the STL, sampled deviation, and an OpenCascade-free text census of the STEP entities.
@@ -351,7 +353,7 @@ The core algorithm recursively smooths a coarse polygon mesh toward a theoretica
 Edge **crease weights** (0–100%) allow smooth-to-sharp transitions, critical for industrial design where organic surfaces must meet precise parting lines.
 
 ### NURBS Conversion
-The limit surface is evaluated analytically (without infinite subdivision) and fitted with **bicubic B-spline patches**, enforcing tangent (G1) and curvature (G2) continuity between adjacent patches for Class A surface quality.
+Every cage quad becomes one **degree-5 Bezier patch**, fitted to a 6x6 grid of surface samples. Without a reference mesh the samples lie on the true Catmull-Clark limit surface: the cage is subdivided twice (creases included), the limit positions of the resulting vertices give 5x5 exact limit points per quad, and these are resampled to the 6x6 grid. With a reference mesh (the STL path) the samples are the bilinear quad grid projected onto the reference. Neighbouring patches share their boundary curves exactly (G0); the interiors come from one global least-squares fit with optional third-derivative (C3) smoothing rows across patch edges (`--continuity G1`..`G3`, which currently give practically the same surface) and, on reference fits only, a light control-net fairing term that damps the noise of projected samples. Tangent (G1) and curvature (G2) continuity are not enforced: hard tangent rows were measured to cost 24 % (mean) to 37 % (p95) more deviation on a real topology-optimisation part.
 
 ### SDF-Based Shell/Thicken
 Traditional CAD offset fails on high-curvature geometry due to self-intersections. This implementation uses a **Signed Distance Field** approach: voxelize the mesh, compute distances, extract isosurfaces via marching cubes — guaranteeing a valid result regardless of complexity.
@@ -366,7 +368,7 @@ Contributions are welcome! Areas where help is particularly valuable:
 
 - [x] **GPU acceleration** for real-time subdivision (CUDA/OpenCL compute shaders)
 - [x] **T-Spline support** for local refinement without global subdivision
-- [x] **Improved NURBS fitting** with higher-order continuity (G3)
+- [ ] **Improved NURBS fitting** with true tangent/curvature (G1/G2) continuity across patches
 - [x] **Unit test coverage** for all modules
 - [x] **Performance optimization** for meshes >1M faces
 - [x] **Documentation** with visual examples and tutorials

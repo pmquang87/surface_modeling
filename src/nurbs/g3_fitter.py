@@ -1,6 +1,10 @@
 """
-G3 Continuous B-Spline Fitter
-Generates Degree 5 (6x6 control points) B-spline patches from quad regions.
+Degree-5 Bezier patch fitter for quad cages (6x6 control points per quad).
+
+The "G3" in the names is historical: neighbouring patches share their
+boundary curves (G0), and the optional cross-patch rows match only the third
+cross-boundary derivative - tangent (G1) and curvature (G2) continuity are
+not enforced. See G3Fitter.fit_surface for the equations.
 
 Pure numpy on purpose. The two kernels below used to carry
 ``@njit(fastmath=True, nogil=True)`` behind a silent
@@ -36,11 +40,11 @@ def _numba_compute_edge_control_points(p_start, p_end, d1_start, d1_end, d2):
     edge_pts[0] = p_start
     edge_pts[5] = p_end
 
-    # 1st derivative (G1) — independent end tangents
+    # end tangents (1st derivative of the boundary curve), independent
     edge_pts[1] = edge_pts[0] + d1_start / 5.0
     edge_pts[4] = edge_pts[5] - d1_end / 5.0
 
-    # 2nd derivative (G2)
+    # 2nd derivative of the boundary curve, one value for both ends
     edge_pts[2] = 2 * edge_pts[1] - edge_pts[0] + d2 / 20.0
     edge_pts[3] = 2 * edge_pts[4] - edge_pts[5] + d2 / 20.0
     return edge_pts
@@ -144,17 +148,26 @@ def _generate_single_patch(quad_data):
 
 
 class G3Fitter:
-    def __init__(self, continuity_weight: float = 1000.0):
+    def __init__(self, continuity_weight: float = 1000.0, fairing_weight: float = 0.0):
         """
-        Initialize the G3 Fitter for Degree 5 B-spline patches.
-        A degree 5 Bezier/B-spline patch requires a 6x6 grid of control points.
+        Fitter for degree-5 Bezier patches (a 6x6 grid of control points
+        per quad).
 
-        continuity_weight: weight of the cross-boundary smoothness equations
-        relative to the surface data equations (weight 1). 0 disables them.
+        continuity_weight: weight of the cross-boundary rows relative to the
+        surface data rows (weight 1). 0 disables them. The rows match the
+        THIRD cross-boundary derivative only (see fit_surface); tangent (C1)
+        and curvature (C2) matching are not enforced.
+
+        fairing_weight: weight of the control-net fairing rows (see
+        fit_surface), dimensionless like continuity_weight. 0 (the default
+        here) gives the bare least-squares system. SubDToNURBSConverter uses
+        0.01 at every continuity level when it fits a reference mesh and 0
+        without one; the value is tuned for its 6x6 sample grid.
         """
         self.degree = 5
         self.num_ctrl_pts = 6
         self.continuity_weight = continuity_weight
+        self.fairing_weight = fairing_weight
 
     def generate_patch(self, corners, derivatives=None):
         """
@@ -164,10 +177,56 @@ class G3Fitter:
 
     def fit_surface(self, quad_mesh):
         """
-        Fits a completely G3 continuous surface over a network of quad regions.
-        Replaces local Coons blending with a Global Sparse Solver (LSPIA).
-        Optimizes interior control points by minimizing projection distance 
-        while explicitly solving G3 continuity constraint equations across patch boundaries.
+        Fit the 16 interior control points of every patch in one global
+        least-squares solve. Boundary control rows stay fixed (corners plus
+        tangent-plane chords), so neighbouring patches always share their
+        boundary curve (G0). Three kinds of rows:
+
+        * data rows (weight 1): the patch evaluated at the parameters of its
+          ``dense_points`` samples equals the samples;
+        * continuity rows (``continuity_weight``): per shared edge and per
+          interior boundary column, 3P1 - 3P2 + P3 + 3Q1 - 3Q2 + Q3 = 2P0
+          (P_m / Q_m the m-th poles inward on either side, P0 = Q0 on the
+          curve), i.e. the THIRD cross-boundary derivatives match (C3).
+          Tangent (C1) and second-derivative (C2) matching are NOT enforced,
+          so the result is not G1 in general. The exact solve treats any
+          weight of order 1 or more like a hard constraint, which is why the
+          converter's G1, G2 and G3 (weights 5, 20, 50) give practically the
+          same surface;
+        * fairing rows (``fairing_weight``): every second difference of the
+          control net along u and along v that involves an interior pole,
+          P[i-1,j] - 2 P[i,j] + P[i+1,j] = 0 and P[i,j-1] - 2 P[i,j] +
+          P[i,j+1] = 0 - a discrete bending energy of the control polygon
+          (no twist term). It vanishes on any bilinear net, so planes and
+          ruled bilinear patches stay exact.
+
+        Why fairing: with 6x6 samples per patch the data rows are badly
+        conditioned (sigma_min ~1.5e-3: an alternating pole pattern barely
+        moves the surface), so sample noise blows up into oscillating
+        interiors. lsqr's early stop used to damp those modes implicitly;
+        the exact SuperLU solve (bug M1) removed that, and the clamp below
+        had to reset 570 of 2152 patches at G0 and 44 at G1 on a real
+        topology-optimisation part, and SolidWorks 2025 dropped one face of
+        its STEP (all 2152 import with fairing). The alternating mode has
+        second differences four times its amplitude while smooth bulges have
+        small ones, so a small weight (0.01) suppresses the runaway and keeps
+        the fit: on that part 0 resets and audit deviation mean 0.069 mm
+        instead of 0.074. Fairing is a bias, though: on clean samples it only
+        pulls curved patches flatter, which is why the converter uses it on
+        the (noisy) reference fit only.
+        The weight is tuned for the converter's 6x6 sample grid: the data
+        rows grow with the sample count while the 32 fairing rows per patch
+        do not, so the same weight is weaker on denser grids (max pole
+        change faired vs bare on a curved 5x4 grid: 4.4e-2 / 1.9e-2 /
+        8.4e-3 at 6 / 11 / 21 samples per side).
+        The rows are homogeneous in the coordinates and their coefficients
+        sum to zero, so the faired result moves with a rigid translation and
+        scales with a uniform scaling of the input, like the data rows.
+
+        Adjacency comes only from each quad's ``neighbors`` list: an entry of
+        -1 adds no continuity row across that edge. SubDToNURBSConverter
+        writes -1 across creased cage edges (crease_weight > 0) so a crease
+        stays sharp.
         """
         import scipy.sparse as sp
         import scipy.sparse.linalg as spla
@@ -229,7 +288,13 @@ class G3Fitter:
                                 
                         eq_idx += 1
                         
-        # 2. G3 Continuity Constraints
+        # 2. Cross-boundary continuity rows. Despite the name G3, this is the
+        # third-derivative match (C3) alone: with P_m / Q_m listed inward from
+        # the shared curve on both sides, -Delta^3 P_0 = Delta^3 Q_0. Tangent
+        # (C1: P1 + Q1 = 2 P0) and C2 rows are not added - measured in
+        # 2026-10, hard C1 rows on the 2152-quad real part cost 24 % mean /
+        # 37 % p95 audit deviation (irregular cage, fixed tangent-plane
+        # boundary curves) and are left as a possible later opt-in.
         weight_g3 = self.continuity_weight
         
         def get_inward(patch_idx, edge_id, idx):
@@ -316,6 +381,34 @@ class G3Fitter:
                                 
                             eq_idx += 1
 
+        # 3. Control-net fairing rows (see the docstring): every second
+        # difference along u or v whose three poles include an interior one,
+        # weight fairing_weight; the fixed boundary poles go to the right side.
+        lam = float(self.fairing_weight)
+        if lam > 0:
+            for k in range(num_patches):
+                for axis in (0, 1):
+                    for a in range(1, 5):
+                        for c in range(6):
+                            if axis == 0:
+                                pts = [(a - 1, c), (a, c), (a + 1, c)]
+                            else:
+                                pts = [(c, a - 1), (c, a), (c, a + 1)]
+                            if not any(1 <= i <= 4 and 1 <= j <= 4 for i, j in pts):
+                                continue
+                            rhs = np.zeros(3)
+                            for (i, j), cf in zip(pts, (1.0, -2.0, 1.0)):
+                                if 1 <= i <= 4 and 1 <= j <= 4:
+                                    rows.append(eq_idx)
+                                    cols.append(k * 16 + (i - 1) * 4 + (j - 1))
+                                    data.append(cf * lam)
+                                else:
+                                    rhs -= cf * lam * patches[k][i, j]
+                            bx.append(rhs[0])
+                            by.append(rhs[1])
+                            bz.append(rhs[2])
+                            eq_idx += 1
+
         if len(data) > 0:
             initial_interiors = [p[1:5, 1:5].copy() for p in patches]
 
@@ -356,10 +449,14 @@ class G3Fitter:
                 if dx is not None and not np.all(np.isfinite(dx)):
                     dx = None
             if dx is None:
-                # Rank deficient (a patch without dense samples): lsqr's
-                # minimum-norm answer is the smallest change from Coons, not
-                # the point nearest the origin, and a variable that is in no
-                # equation keeps x0 exactly.
+                # A patch without dense samples: lsqr's minimum-norm answer is
+                # the smallest change from Coons, not the point nearest the
+                # origin. Without fairing the system is rank deficient and a
+                # variable that is in no equation keeps x0 exactly; with
+                # fairing every interior pole is in a fairing row, so a
+                # sample-less patch is determined by its fairing and
+                # continuity rows and does move off Coons wherever its Coons
+                # net has non-zero second differences.
                 dx = np.column_stack([spla.lsqr(A, r0[:, c])[0] for c in range(3)])
             sol = (x0 + dx).reshape(num_patches, 4, 4, 3)
             for k in range(num_patches):
@@ -372,12 +469,18 @@ class G3Fitter:
             # whose interiors span ~1.3x+ (import silently drops them and the
             # shell can no longer knit into a solid), so clamp tightly and
             # fall back to the Coons initialization.
+            # The limit is purely relative: the old max(1.25*diag, diag+0.5)
+            # carried an absolute 0.5 (model units) that dominated below
+            # diag = 2 - a quad of diagonal 1 could reach 1.5x, one of 0.2
+            # 3.5x - and switched the clamp off entirely on a part modelled
+            # in metres: the same part reset different patches at different
+            # unit scales.
             n_reset = 0
             for k, p in enumerate(patches):
                 corners = np.array([p[0, 0], p[5, 0], p[5, 5], p[0, 5]])
                 center = corners.mean(axis=0)
                 diag = np.linalg.norm(corners.max(axis=0) - corners.min(axis=0))
-                limit = max(1.25 * diag, diag + 0.5)
+                limit = 1.25 * diag
                 interior = p[1:5, 1:5].reshape(-1, 3)
                 if np.linalg.norm(interior - center, axis=1).max() > limit:
                     p[1:5, 1:5] = initial_interiors[k]

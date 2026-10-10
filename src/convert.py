@@ -213,8 +213,13 @@ def main(argv=None) -> int:
                              "(default 2000; more = finer, slower)")
     parser.add_argument("--continuity", choices=["G0", "G1", "G2", "G3"],
                         default="G1",
-                        help="cross-patch smoothness weight; G0 = best fidelity, "
-                             "G3 = smoothest (default G1)")
+                        help="cross-patch smoothing rows: G0 = none, which is "
+                             "NOT the most faithful on a reference fit (real "
+                             "part: mean deviation 0.0736 mm, 9 reset patches, "
+                             "vs 0.0695 mm, 0 at G1); G1, G2 and G3 add the "
+                             "same third-derivative (C3) rows and give "
+                             "practically the same surface - tangent or "
+                             "curvature continuity is not enforced (default G1)")
     parser.add_argument("--smoothing", type=float, default=0.5,
                         help="cage relaxation weight 0..1 (default 0.5)")
     parser.add_argument("--no-reference-fit", action="store_true",

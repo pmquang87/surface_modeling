@@ -150,8 +150,16 @@ class ConvertNURBSDialog(QDialog):
         self.form = QFormLayout()
         
         self.continuity = QComboBox()
-        self.continuity.addItems(["G0 (Position)", "G1 (Tangent)", "G2 (Curvature)", "G3 (Torsion)"])
+        # every label starts with its level name (main_window parses it)
+        self.continuity.addItems(["G0 (no smoothing rows)", "G1 (C3 smoothing rows)",
+                                  "G2 (same rows as G1)", "G3 (same rows as G1)"])
         self.continuity.setCurrentIndex(2)
+        self.continuity.setToolTip(
+            "G0: each patch is fitted to the surface with no cross-patch rows.\n"
+            "G1, G2, G3: add the same third-derivative (C3) smoothing rows\n"
+            "across shared patch edges and give practically the same surface.\n"
+            "Tangent or curvature continuity is NOT enforced at any level.\n"
+            "Creased edges never get smoothing rows.")
         self.form.addRow("Continuity:", self.continuity)
         
         self.tolerance = QDoubleSpinBox()
