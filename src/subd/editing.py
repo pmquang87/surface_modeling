@@ -15,6 +15,25 @@ def _unit(vec) -> np.ndarray | None:
     return v / length
 
 
+def _valid_indices(indices, count: int) -> list[int]:
+    """`indices` as in-range, non-repeating positions into a list of `count`.
+
+    Negative indices count from the end, as Python's do; out-of-range ones are
+    dropped; a repeat keeps only its first occurrence. Without this, faces[-1]
+    overwrote a face appended a moment earlier and a repeated index was
+    extruded twice, both of which leave holes.
+    """
+    out, seen = [], set()
+    for i in indices:
+        i = int(i)
+        if i < 0:
+            i += count
+        if 0 <= i < count and i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
 def extrude_faces(mesh: HalfEdgeMesh, face_indices: list[int], distance: float = 0.1, direction: np.ndarray = None) -> HalfEdgeMesh:
     """Extrude selected faces along their normals or a given direction.
 
@@ -26,8 +45,7 @@ def extrude_faces(mesh: HalfEdgeMesh, face_indices: list[int], distance: float =
 
     mesh.compute_face_normals()
 
-    for f_idx in face_indices:
-        if f_idx >= len(mesh.faces): continue
+    for f_idx in _valid_indices(face_indices, len(mesh.faces)):
         f = mesh.faces[f_idx]
         f_verts = [v.index for v in mesh.get_face_vertices(f)]
 
@@ -65,8 +83,7 @@ def extrude_edges(mesh: HalfEdgeMesh, edge_indices: list[int], distance: float =
 
     mesh.compute_vertex_normals()
 
-    for e_idx in edge_indices:
-        if e_idx >= len(mesh.edges): continue
+    for e_idx in _valid_indices(edge_indices, len(mesh.edges)):
         e = mesh.edges[e_idx]
         if e.half_edge is None or e.half_edge.prev is None: continue
         # e.half_edge runs v1 -> v2 inside its own face, so that face already
@@ -101,8 +118,7 @@ def inset_faces(mesh: HalfEdgeMesh, face_indices: list[int], inset_amount: float
     verts = [v.position.copy() for v in mesh.vertices]
     faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
     
-    for f_idx in face_indices:
-        if f_idx >= len(mesh.faces): continue
+    for f_idx in _valid_indices(face_indices, len(mesh.faces)):
         f = mesh.faces[f_idx]
         f_verts = [v.index for v in mesh.get_face_vertices(f)]
         
@@ -221,7 +237,7 @@ def insert_edge_loop(mesh: HalfEdgeMesh, edge_index: int, position: float = 0.5)
             he = he.next
             if he == start_he: break
             
-        split_hes = [he for he in f_edges if he.edge.index in ring_edge_indices]
+        split_hes = [he for he in f_edges if he.edge.index in edge_to_new_vert]
         if len(split_hes) == 2 and len(f_edges) == 4:
             idx0 = f_edges.index(split_hes[0])
             he0, he1, he2, he3 = f_edges[idx0], f_edges[(idx0+1)%4], f_edges[(idx0+2)%4], f_edges[(idx0+3)%4]
@@ -234,8 +250,18 @@ def insert_edge_loop(mesh: HalfEdgeMesh, edge_index: int, position: float = 0.5)
             faces.append([v_a, nv0, nv2, v_d])
             faces.append([nv0, v_b, v_c, nv2])
         else:
-            faces.append([he.vertex.index for he in f_edges])
-            
+            # A face the ring ends in (n-gon cap, pole triangle) is not cut, but
+            # it still has to carry the new vertex of every split edge, or the
+            # neighbouring split quad leaves a T-junction crack. he runs
+            # he.prev.vertex -> he.vertex, so the new point goes just before
+            # he.vertex.
+            poly = []
+            for he in f_edges:
+                if he.edge.index in edge_to_new_vert:
+                    poly.append(edge_to_new_vert[he.edge.index])
+                poly.append(he.vertex.index)
+            faces.append(poly)
+
     return HalfEdgeMesh.from_arrays(verts, faces)
 
 
@@ -277,8 +303,20 @@ def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: 
                     found = True
                     break
             if not found: break 
-        return [he.prev.vertex.index for he in loop if he.prev]
+        # Only one simple closed loop can be bridged. Edges left unchained (a
+        # band with two boundary loops), a chain that does not close, or one
+        # that passes a vertex twice (groups touching at a corner) mean the
+        # bridge cannot be built.
+        if (boundary_edges or loop[0].prev is None
+                or loop[-1].vertex is not loop[0].prev.vertex):
+            return []
+        vert_loop = [he.prev.vertex.index for he in loop if he.prev]
+        if len(vert_loop) != len(loop) or len(set(vert_loop)) != len(vert_loop):
+            return []
+        return vert_loop
 
+    face_indices_a = _valid_indices(face_indices_a, len(mesh.faces))
+    face_indices_b = _valid_indices(face_indices_b, len(mesh.faces))
     loop_a = get_boundary_loop(set(face_indices_a))
     loop_b = get_boundary_loop(set(face_indices_b))
 
@@ -324,14 +362,21 @@ def mirror_mesh(mesh: HalfEdgeMesh, axis: str = 'x', merge_distance: float = 0.0
     lands on a face that is already there. Reflections whose vertex set repeats
     a face already in the result are dropped, so mirroring a symmetric mesh is
     an identity instead of a doubled, zero-thickness shell.
+
+    `axis` is 'x', 'y' or 'z' in either case; anything else raises ValueError.
     """
+    # An unknown axis used to fall back to X silently, so 'Y' mirrored across
+    # the wrong plane. Accept either case; refuse anything else.
+    axis_idx = {'x': 0, 'y': 1, 'z': 2}.get(str(axis).lower())
+    if axis_idx is None:
+        raise ValueError(f"mirror_mesh: axis must be 'x', 'y' or 'z', got {axis!r}")
+
     faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
     n_orig = len(mesh.vertices)
     if n_orig == 0:
         return mesh.copy()
 
     positions = np.array([v.position for v in mesh.vertices], dtype=np.float64)
-    axis_idx = {'x': 0, 'y': 1, 'z': 2}.get(axis, 0)
 
     mirrored = positions.copy()
     mirrored[:, axis_idx] *= -1.0
