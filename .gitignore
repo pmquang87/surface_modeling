@@ -55,3 +55,6 @@ htmlcov/
 *.log
 *.tmp
 Power Surfacing Software Functionality Research.txt
+
+# Local agent lessons file (see ~/.claude/MISTAKES.md)
+/PROJECT_MISTAKES.md
