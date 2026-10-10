@@ -218,7 +218,8 @@ def test_m11_measure_step_deep_offset_chain_census_failure_fails_audit(tmp_path)
     assert m["census_faces"] == 6
     assert verdict(m) == (0, [])
 
-    text = open(good, encoding="utf-8").read()
+    with open(good, encoding="utf-8") as fh:
+        text = fh.read()
     marker = "ENDSEC;\nEND-ISO-10303-21;"
     assert text.count(marker) == 1, "unexpected STEP trailer"
     deep = tmp_path / "deep.step"

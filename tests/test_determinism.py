@@ -494,8 +494,10 @@ def test_reproducibility_check_fails_on_a_fastmath_scale_kernel_drift(monkeypatc
 
     ``@njit(fastmath=True)`` reassociates the arithmetic in the two kernels,
     which moves their results by ~1e-13 relative. Perturb the edge kernel by
-    that much on the second run only: the ill-conditioned ``lsqr`` solve in
-    ``fit_surface`` amplifies it, and the two STEP files must come out
+    that much on the second run only: the ill-conditioned least-squares fit
+    in ``fit_surface`` (since bug M1 a direct SuperLU ``splu`` solve of the
+    normal equations, cond(A) ~ 1e4-1e5) amplifies it, and the two STEP files
+    must come out
     different. If this test passes trivially, the reproducibility tests above
     are measuring nothing.
     """
