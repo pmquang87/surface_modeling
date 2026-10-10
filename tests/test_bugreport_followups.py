@@ -13,6 +13,10 @@ test here names its follow-up item and the original bug it mirrors:
   ``step_audit.verdict`` gated the B-Rep volume with ``vol <= 0``, the volume
   budget with ``abs(delta) > tol`` and the shell / solid counts with ``== 0`` /
   ``< 1``; every comparison with NaN is False, so NaN passed all four.
+* F3 (mirrors S:nan_volume, unify's "None, not NaN" report rule) -
+  ``export_step_faceted`` copied a NaN B-Rep volume into
+  ``volume_brep_mm3`` / ``volume_delta_pct`` (and ``measure_shape`` into the
+  embedded audit), so the report was no longer strict JSON.
 
 Test discipline (the repo's vacuous-test rules): each test first asserts that
 the defect / precondition really is in its input, every checker gets an input
@@ -179,3 +183,82 @@ def test_f2_verdict_ne_gates_already_reject_nan():
     assert code == 2 and reasons == ["free edges: nan"], reasons
     code, reasons = verdict(_clean_measurement(expected_faces=6, faces=NAN))
     assert code == 2 and reasons == ["6 faces expected but nan in the file"], reasons
+
+
+# --------------------------------------------------------------------------
+# F3 (mirrors S:nan_volume): the faceted export report must stay strict JSON
+# --------------------------------------------------------------------------
+
+try:
+    import OCP  # noqa: F401
+    HAS_OCP = True
+except ImportError:
+    HAS_OCP = False
+
+needs_ocp = pytest.mark.skipif(not HAS_OCP, reason="cadquery-ocp not installed")
+
+
+def _strict_json(obj):
+    """Serialise as strict JSON (no NaN / Infinity tokens) or raise."""
+    import json
+    return json.dumps(obj, allow_nan=False, default=str)
+
+
+def test_f3_strict_json_checker_rejects_nan():
+    """F3 control: the checker the F3 tests rely on really rejects NaN and
+    accepts None."""
+    with pytest.raises(ValueError):
+        _strict_json({"volume": NAN})
+    with pytest.raises(ValueError):
+        _strict_json({"volume": INF})
+    assert _strict_json({"volume": None}) == '{"volume": null}'
+
+
+@needs_ocp
+@pytest.mark.parametrize("bad", [NAN, INF])
+def test_f3_faceted_report_stores_none_for_a_non_finite_brep_volume(
+        tmp_path, monkeypatch, bad):
+    """F3 (mirrors S:nan_volume / unify's ``volume_rel_delta``): when the
+    volume integrator returns a non-finite value, ``export_step_faceted``
+    must store None (not NaN) in ``volume_brep_mm3`` / ``volume_delta_pct``,
+    in the embedded audit as well, warn about it, and the whole report must
+    serialise as strict JSON. The audit still refuses the file."""
+    import trimesh
+    import src.io.step_audit as step_audit
+    from src.io.faceted_step import export_step_faceted
+
+    box = trimesh.creation.box(extents=(10.0, 20.0, 30.0))
+
+    # positive control: the real integrator gives a finite, exact report
+    good = export_step_faceted(box, str(tmp_path / "good.step"))
+    assert good["ok"] is True and good["audit_reasons"] == [], good
+    assert good["volume_brep_mm3"] == pytest.approx(6000.0, rel=1e-9)
+    assert abs(good["volume_delta_pct"]) < 1e-7
+    _strict_json(good)
+
+    calls = []
+
+    def bad_volume(shape):
+        calls.append(1)
+        return bad
+    monkeypatch.setattr(step_audit, "brep_volume", bad_volume)
+
+    for verify in (False, True):
+        calls.clear()
+        report = export_step_faceted(box, str(tmp_path / f"bad_{verify}.step"),
+                                     verify=verify)
+        # precondition: the injected value reached the exporter
+        assert calls, "the injected integrator was never called"
+        assert report["ok"] is True, report      # a file was still written
+        assert report["volume_mesh_mm3"] == pytest.approx(6000.0, rel=1e-12)
+        assert report["volume_brep_mm3"] is None, report["volume_brep_mm3"]
+        assert report["volume_delta_pct"] is None, report["volume_delta_pct"]
+        assert any("volume" in w and "not finite" in w for w in report["warnings"]), \
+            report["warnings"]
+        if verify:
+            audit = report["audit"]
+            assert audit["brep_volume_mm3"] is None, audit["brep_volume_mm3"]
+            assert audit["volume_delta_pct"] is None, audit["volume_delta_pct"]
+            assert "B-Rep volume not positive: None" in report["audit_reasons"], \
+                report["audit_reasons"]
+        _strict_json(report)

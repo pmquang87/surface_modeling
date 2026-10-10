@@ -250,7 +250,13 @@ def measure_shape(shape: Any, reference_stl: Optional[str] = None,
         logger.error("BRepCheck failed: %s", exc)
         m["brepcheck_valid"] = False
     try:
-        m["brep_volume_mm3"] = brep_volume(shape) if m["faces"] else 0.0
+        vol = brep_volume(shape) if m["faces"] else 0.0
+        if math.isfinite(vol):
+            m["brep_volume_mm3"] = vol
+        else:
+            # None, not NaN: the measurement must stay JSON-serialisable, and
+            # None already means "integration failed" to verdict()
+            logger.error("volume integration returned %r", vol)
     except Exception as exc:
         logger.error("volume integration failed: %s", exc)
 
