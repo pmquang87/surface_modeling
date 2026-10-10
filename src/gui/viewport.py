@@ -20,6 +20,38 @@ except ImportError:
 DEFAULT_SELECTION_MODE = 'face'
 
 
+def point_segment_distance(p, a, b) -> float:
+    """Distance from point ``p`` to the segment ``a``-``b`` (not its line).
+
+    The projection parameter is clamped to [0, 1], so a point beyond an end is
+    measured to that endpoint; a zero-length segment degrades to |p - a|.
+    """
+    p = np.asarray(p, dtype=np.float64)
+    a = np.asarray(a, dtype=np.float64)
+    d = np.asarray(b, dtype=np.float64) - a
+    dd = float(np.dot(d, d))
+    t = 0.0 if dd <= 0.0 else min(max(float(np.dot(p - a, d)) / dd, 0.0), 1.0)
+    return float(np.linalg.norm(p - (a + t * d)))
+
+
+def nearest_edge_index(edges, point):
+    """Index of the edge in ``edges`` nearest to ``point``, or None if empty.
+
+    Nearest by point-to-segment distance. Comparing edge midpoints instead
+    picked the wrong edge whenever a short neighbour's midpoint was closer
+    than the far-away midpoint of the edge actually under the cursor.
+    """
+    closest_edge = None
+    min_dist = float('inf')
+    for e in edges:
+        dist = point_segment_distance(point, e.half_edge.vertex.position,
+                                      e.half_edge.prev.vertex.position)
+        if dist < min_dist:
+            min_dist = dist
+            closest_edge = e.index
+    return closest_edge
+
+
 class SolidWorksStyle(vtk.vtkInteractorStyleRubberBandPick):
     """SolidWorks-like navigation (middle mouse = rotate/pan/dolly).
 
@@ -420,19 +452,8 @@ class MeshViewport(QWidget):
             if cell_id < len(self.current_mesh.faces):
                 face = self.current_mesh.faces[cell_id]
                 edges = self.current_mesh.get_face_edges(face)
-                closest_edge = None
-                min_dist = float('inf')
-                
-                for e in edges:
-                    v1 = e.half_edge.vertex.position
-                    v2 = e.half_edge.prev.vertex.position
-                    # simplified distance to segment (using midpoint)
-                    mid = (v1 + v2) / 2.0
-                    dist = np.linalg.norm(np.array(p3d) - mid)
-                    if dist < min_dist:
-                        min_dist = dist
-                        closest_edge = e.index
-                        
+                closest_edge = nearest_edge_index(edges, p3d)
+
                 if closest_edge is not None:
                     self._apply_selection_modifier([closest_edge])
                     self.edge_selected.emit(closest_edge)
