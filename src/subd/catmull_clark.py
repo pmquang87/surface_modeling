@@ -193,6 +193,119 @@ def _subdivide_once(mesh: HalfEdgeMesh, smooth: bool = True) -> HalfEdgeMesh:
     return new_mesh
 
 
+def subdivide_with_quad_lineage(mesh: HalfEdgeMesh, levels: int
+                                ) -> tuple[HalfEdgeMesh, dict[int, np.ndarray]]:
+    """
+    Subdivide `levels` times and say where each quad's sub-grid went.
+
+    Returns ``(fine, lineage)``. ``fine`` is ``subdivide(mesh, levels)``.
+    ``lineage[face.index]`` is an ``(n, n)`` int array, n = 2**levels + 1, for
+    every face of `mesh` with exactly four vertices: ``fine`` vertex indices
+    laid out on the face's parameter grid, entry ``[i, j]`` at
+    ``(u, v) = (i, j) / 2**levels``. With ``c0..c3 = mesh.get_face_vertices(face)``
+    in their cyclic order, u runs along c0 -> c1 and v along c0 -> c3, so
+    ``[0, 0], [n-1, 0], [n-1, n-1], [0, n-1]`` are c0, c1, c2, c3 (the layout
+    of the converter's dense grids and of ``G3Fitter``'s tensor grid).
+    ``evaluate_limit_surface(fine)[0][lineage[f]]`` is then the limit surface
+    at those dyadic parameters, exactly, creases included.
+
+    The indices follow from how `_subdivide_once` numbers its output: the old
+    vertices first (in list order), then one edge point per edge (list order),
+    then one face point per face (list order); the sub-quad it builds for
+    half-edge h is [h.vertex, point(h.next.edge), point(face), point(h.edge)],
+    which keeps the parent's winding. Each level refines every grid cell
+    (a, b, c, d) into four, and the cell is checked to be a face of the
+    current mesh with exactly that cyclic order before it is refined, so a
+    numbering change in `_subdivide_once` raises instead of silently
+    scrambling the grids. Triangles and n-gons are subdivided as usual (their
+    sub-quads are just not tracked); quads next to them are unaffected.
+
+    Raises ValueError when a cell is not found as such a face (non-manifold
+    or inconsistently wound input).
+    """
+    if levels < 0:
+        raise ValueError("levels must be >= 0")
+    lineage = {}
+    for f in mesh.faces:
+        verts = mesh.get_face_vertices(f)
+        if len(verts) == 4:
+            c0, c1, c2, c3 = (v.index for v in verts)
+            lineage[f.index] = np.array([[c0, c3], [c1, c2]], dtype=np.int64)
+
+    current = mesh
+    for level in range(levels + 1):
+        directed = _directed_half_edges(current)
+        if level == levels:
+            # the last level is not refined, but its cells are checked too
+            for g in lineage.values():
+                for i in range(g.shape[0] - 1):
+                    for j in range(g.shape[1] - 1):
+                        _cell_half_edge(directed, int(g[i, j]), int(g[i + 1, j]),
+                                        int(g[i + 1, j + 1]), int(g[i, j + 1]))
+            break
+
+        n_v = len(current.vertices)
+        n_e = len(current.edges)
+        # the same maps `_subdivide_once` builds: index -> new vertex index
+        v_new = {v.index: p for p, v in enumerate(current.vertices)}
+        e_new = {e.index: n_v + p for p, e in enumerate(current.edges)}
+        f_new = {f.index: n_v + n_e + p for p, f in enumerate(current.faces)}
+
+        refined = {}
+        for fidx, g in lineage.items():
+            m = g.shape[0]
+            r = np.empty((2 * m - 1, 2 * m - 1), dtype=np.int64)
+            for i in range(m):
+                for j in range(m):
+                    r[2 * i, 2 * j] = v_new[int(g[i, j])]
+            for i in range(m - 1):
+                for j in range(m - 1):
+                    he = _cell_half_edge(directed, int(g[i, j]), int(g[i + 1, j]),
+                                         int(g[i + 1, j + 1]), int(g[i, j + 1]))
+                    # he: a -> b, he.next: b -> c, he.next.next: c -> d,
+                    # he.next.next.next: d -> a
+                    r[2 * i + 1, 2 * j + 1] = f_new[he.face.index]
+                    r[2 * i + 1, 2 * j] = e_new[he.edge.index]
+                    r[2 * i + 2, 2 * j + 1] = e_new[he.next.edge.index]
+                    r[2 * i + 1, 2 * j + 2] = e_new[he.next.next.edge.index]
+                    r[2 * i, 2 * j + 1] = e_new[he.next.next.next.edge.index]
+            refined[fidx] = r
+        lineage = refined
+        current = _subdivide_once(current)
+
+    if levels == 0:
+        current = mesh.copy()
+    return current, lineage
+
+
+def _directed_half_edges(mesh: HalfEdgeMesh) -> dict:
+    """(source index, target index) -> half-edge. A key that occurs twice
+    (non-manifold input) maps to None: it cannot name one face."""
+    directed = {}
+    for he in mesh.half_edges:
+        if he.prev is None or he.vertex is None or he.prev.vertex is None:
+            continue
+        key = (he.prev.vertex.index, he.vertex.index)
+        directed[key] = None if key in directed else he
+    return directed
+
+
+def _cell_half_edge(directed: dict, a: int, b: int, c: int, d: int) -> HalfEdge:
+    """The half-edge a -> b of the quad face whose cycle is a, b, c, d."""
+    he = directed.get((a, b))
+    ok = he is not None and he.face is not None
+    walk = he
+    for want in (c, d, a):
+        if not ok:
+            break
+        walk = walk.next
+        ok = walk is not None and walk.vertex is not None and walk.vertex.index == want
+    if not ok or walk.next is not he:
+        raise ValueError(f"quad lineage: cell {(a, b, c, d)} is not a quad "
+                         f"face of the subdivided mesh")
+    return he
+
+
 def evaluate_limit_surface(mesh: HalfEdgeMesh) -> tuple[np.ndarray, np.ndarray]:
     """
     Project every cage vertex onto the Catmull-Clark limit surface.

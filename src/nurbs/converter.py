@@ -10,12 +10,91 @@ class SubDToNURBSConverter:
         self.continuity = continuity
         self.tolerance = tolerance
 
+    # Subdivision levels behind the no-reference dense grids: 2**2 + 1 = 5
+    # exact limit samples per side, resampled to the fitter's 6 (see
+    # _limit_dense_grids for why not 3 levels / 9 samples).
+    dense_grid_levels = 2
+
+    def _limit_dense_grids(self, mesh: HalfEdgeMesh, grid_size: int = 6,
+                           levels: Optional[int] = None) -> Dict[int, np.ndarray]:
+        """Dense samples of the TRUE Catmull-Clark limit surface, per quad.
+
+        Returns ``{face.index: (grid_size, grid_size, 3)}`` for every quad of
+        `mesh`, laid out like the fitter's tensor grid: entry ``[i, j]`` at
+        ``(u, v) = (i, j) / (grid_size - 1)``, u along c0 -> c1, v along
+        c0 -> c3 of ``mesh.get_face_vertices(face)``.
+
+        The mesh is subdivided `levels` times with the repo's own
+        `_subdivide_once` (creases, corners and darts included), and each
+        quad's (2**levels + 1)^2 sub-grid of vertices is found with
+        `subdivide_with_quad_lineage`. The limit positions of those vertices
+        are exact limit points at the dyadic parameters (i, j) / 2**levels of
+        the face; the corner samples are the limit positions of the quad's
+        own cage vertices, so on a closed cage they agree with the patch
+        corners to rounding. (On an
+        open cage `evaluate_limit_surface` keeps boundary vertices where
+        the subdivided mesh has them, which is not where the coarse cage
+        has them; the boundary samples do not enter the fit, whose
+        boundary rows are fixed.)
+
+        When grid_size is not 2**levels + 1 the samples are resampled by
+        tensor Lagrange interpolation of degree 2**levels in u and v. At the
+        default 2 levels that is quartic through 5 x 5 nodes, which is exact
+        wherever the limit is a bicubic polynomial on the face (every face
+        whose 1-ring is regular, i.e. a uniform bicubic B-spline piece, and
+        every planar face) and reproduces the nodes, so the corners stay
+        exact. Faces at an extraordinary vertex are not polynomial there:
+        measured against 3 levels (exact samples at the eighths), the
+        resampling is off by at most 1.2e-3 of the bounding-box diagonal on
+        a unit-cube cage (every face touches four valence-3 vertices, the
+        worst case), 7e-5 on create_sphere, and 0 (to rounding) on
+        create_torus and the fully creased box; the old bump was off by up
+        to 0.1 of the diagonal. 3 levels would avoid the resampling but
+        costs ~5x the subdivision and limit evaluation (5000-quad torus
+        cage: ~21 s vs ~104 s, on a conversion of ~50-120 s) and, at
+        9 x 9, 2.25x the fitter's data equations, while the patch error of
+        this path is dominated by its straight boundary chords anyway.
+
+        Raises (ValueError / anything from the subdivision) when the quad
+        lineage cannot be traced; the caller falls back to the heuristic.
+        """
+        from src.subd.catmull_clark import (subdivide_with_quad_lineage,
+                                            evaluate_limit_surface)
+        if levels is None:
+            levels = self.dense_grid_levels
+        fine, lineage = subdivide_with_quad_lineage(mesh, levels)
+        if not lineage:
+            return {}
+        fine_limit, _ = evaluate_limit_surface(fine)
+        n = 2 ** levels + 1
+        nodes = np.linspace(0.0, 1.0, n)
+        targets = np.linspace(0.0, 1.0, grid_size)
+        if grid_size == n:
+            L = None
+        else:
+            # L[t, a] = a-th Lagrange basis polynomial on `nodes` at target t
+            L = np.ones((grid_size, n))
+            for a in range(n):
+                for b in range(n):
+                    if b != a:
+                        L[:, a] *= (targets - nodes[b]) / (nodes[a] - nodes[b])
+        grids = {}
+        for fidx, idx in lineage.items():
+            g = fine_limit[idx]
+            if L is not None:
+                g = np.einsum('ta,abk,sb->tsk', L, g, L)
+            grids[fidx] = g
+        return grids
+
     def _evaluate_dense_grid(self, mesh: HalfEdgeMesh, face: Any, limit_positions: np.ndarray, grid_size: int = 17) -> np.ndarray:
         """
-        Evaluates the limit surface at a dense grid of points for a given quad face.
-        Here we use a basic approximation: bilinear interpolation of the corners' limit positions,
-        optionally inflated by the face normal to approximate the limit surface curvature.
-        In a full implementation, this would use Stam's exact evaluation or sample a refined mesh.
+        HEURISTIC dense grid for one quad, no longer used by generate_patches
+        (which samples the true limit surface, `_limit_dense_grids`); it is
+        its fallback when the quad lineage cannot be traced.
+        Bilinear interpolation of the corners' limit positions, inflated by
+        the face normal by a fixed bump of 0.025 * |c1 - c0| at the centre.
+        The bump ignores creases and is only a crude stand-in for the limit
+        surface: a fully creased unit box came out with volume 1.0667.
         """
         vertices = mesh.get_face_vertices(face)
         corners = [limit_positions[v.index] for v in vertices]
@@ -62,8 +141,10 @@ class SubDToNURBSConverter:
                          reference_mesh: Optional[HalfEdgeMesh] = None) -> List[Any]:
         """Fit one 6x6 Bezier patch per quad face of `mesh`.
 
-        There is no subdivision step: the cage is fitted at the density it
-        arrives with. (An unused ``subdivision_levels`` argument used to be
+        One patch per cage quad: the cage is fitted at the density it arrives
+        with. (Without a reference mesh the cage is subdivided internally,
+        but only to sample the limit surface for the fit,
+        `_limit_dense_grids`.) (An unused ``subdivision_levels`` argument used to be
         accepted here and in ``convert`` -- it was never read; use
         ``src.subd.catmull_clark.subdivide`` on the cage beforehand if you want
         a denser one.)
@@ -96,6 +177,14 @@ class SubDToNURBSConverter:
         face_to_idx = {f.index: idx for idx, f in enumerate(quad_faces)}
 
         grid_size = 6
+        limit_grids = {}
+        if ref_tm is None and quad_faces:
+            try:
+                limit_grids = self._limit_dense_grids(mesh, grid_size=grid_size)
+            except Exception as e:
+                print(f"NURBS conversion: limit-surface sampling failed ({e}); "
+                      f"using the approximate dense grid")
+                limit_grids = {}
         quad_mesh_data = []
         for face in quad_faces:
             vertices = mesh.get_face_vertices(face)
@@ -117,7 +206,9 @@ class SubDToNURBSConverter:
                 curr = curr.next
 
             if ref_tm is None:
-                dense_points = self._evaluate_dense_grid(mesh, face, limit_positions, grid_size=grid_size)
+                dense_points = limit_grids.get(face.index)
+                if dense_points is None:
+                    dense_points = self._evaluate_dense_grid(mesh, face, limit_positions, grid_size=grid_size)
                 corner_normals = None
             else:
                 dense_points = None  # filled below by batched projection
