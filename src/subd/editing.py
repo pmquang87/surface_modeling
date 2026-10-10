@@ -15,6 +15,25 @@ def _unit(vec) -> np.ndarray | None:
     return v / length
 
 
+def _valid_indices(indices, count: int) -> list[int]:
+    """`indices` as in-range, non-repeating positions into a list of `count`.
+
+    Negative indices count from the end, as Python's do; out-of-range ones are
+    dropped; a repeat keeps only its first occurrence. Without this, faces[-1]
+    overwrote a face appended a moment earlier and a repeated index was
+    extruded twice, both of which leave holes.
+    """
+    out, seen = [], set()
+    for i in indices:
+        i = int(i)
+        if i < 0:
+            i += count
+        if 0 <= i < count and i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
 def extrude_faces(mesh: HalfEdgeMesh, face_indices: list[int], distance: float = 0.1, direction: np.ndarray = None) -> HalfEdgeMesh:
     """Extrude selected faces along their normals or a given direction.
 
@@ -26,8 +45,7 @@ def extrude_faces(mesh: HalfEdgeMesh, face_indices: list[int], distance: float =
 
     mesh.compute_face_normals()
 
-    for f_idx in face_indices:
-        if f_idx >= len(mesh.faces): continue
+    for f_idx in _valid_indices(face_indices, len(mesh.faces)):
         f = mesh.faces[f_idx]
         f_verts = [v.index for v in mesh.get_face_vertices(f)]
 
@@ -65,8 +83,7 @@ def extrude_edges(mesh: HalfEdgeMesh, edge_indices: list[int], distance: float =
 
     mesh.compute_vertex_normals()
 
-    for e_idx in edge_indices:
-        if e_idx >= len(mesh.edges): continue
+    for e_idx in _valid_indices(edge_indices, len(mesh.edges)):
         e = mesh.edges[e_idx]
         if e.half_edge is None or e.half_edge.prev is None: continue
         # e.half_edge runs v1 -> v2 inside its own face, so that face already
@@ -101,8 +118,7 @@ def inset_faces(mesh: HalfEdgeMesh, face_indices: list[int], inset_amount: float
     verts = [v.position.copy() for v in mesh.vertices]
     faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
     
-    for f_idx in face_indices:
-        if f_idx >= len(mesh.faces): continue
+    for f_idx in _valid_indices(face_indices, len(mesh.faces)):
         f = mesh.faces[f_idx]
         f_verts = [v.index for v in mesh.get_face_vertices(f)]
         
@@ -289,6 +305,8 @@ def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: 
             if not found: break 
         return [he.prev.vertex.index for he in loop if he.prev]
 
+    face_indices_a = _valid_indices(face_indices_a, len(mesh.faces))
+    face_indices_b = _valid_indices(face_indices_b, len(mesh.faces))
     loop_a = get_boundary_loop(set(face_indices_a))
     loop_b = get_boundary_loop(set(face_indices_b))
 

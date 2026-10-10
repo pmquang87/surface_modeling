@@ -272,3 +272,73 @@ def test_insert_edge_loop_into_an_ngon_with_two_split_edges():
         assert oc[(ia + 2) % 8] == b
         p = out.vertices[between].position
         assert np.allclose(p, (np.array(verts[a]) + np.array(verts[b])) / 2, atol=1e-12)
+
+
+# --------------------------------------------------------------------------
+# M13 (cand 14, cand 15): negative / repeated / out-of-range face indices
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("op, arg", [(extrude_faces, 0.3), (inset_faces, 0.1)])
+def test_negative_and_repeated_face_indices(op, arg):
+    """M13 (cand 14 extrude_faces, cand 15 inset_faces): -1 means the last face
+    the Python way, a repeated index is processed once, an out-of-range index
+    (either sign) is skipped. Expected: identical to the canonical call and
+    closed (0 bad edges)."""
+    box = create_box()
+    ref_two = op(box, [0, 5], arg)
+    ref_one = op(box, [0], arg)
+    # the canonical calls change the box and stay closed
+    assert len(ref_two.faces) == 6 + 8 and bad_edges(ref_two) == 0
+    assert len(ref_one.faces) == 6 + 4 and bad_edges(ref_one) == 0
+
+    for idx, ref in [([0, -1], ref_two), ([-6, 5], ref_two), ([0, 5, -1, 0], ref_two),
+                     ([0, 0], ref_one), ([0, 6], ref_one), ([0, -7], ref_one)]:
+        out = op(box, idx, arg)
+        assert bad_edges(out) == 0, f"{op.__name__}{idx}: {bad_edges(out)} bad edges"
+        assert open_half_edges(out) == 0
+        assert same_mesh(out, ref), f"{op.__name__}{idx} differs from the canonical call"
+
+
+def test_extrude_edges_repeated_index_counts_once():
+    """M13 sibling (cand 14 pattern) in extrude_edges: a repeated edge index,
+    also via its negative alias, must extrude that edge once. Expected:
+    identical to extruding it once (one strip, 2 new vertices)."""
+    # an open quad: every edge is a boundary edge, the only kind a strip can
+    # be attached to without a third face on it
+    plane = create_plane()
+    assert len(plane.faces) == 1 and len(plane.edges) == 4
+    last = len(plane.edges) - 1
+    ref = extrude_edges(plane, [last], 0.2)
+    assert len(ref.faces) == 2 and len(ref.vertices) == 6
+    # precondition: the one-strip result is a valid manifold strip
+    assert max(directed_counts(ref).values()) == 1
+    for idx in ([last, last], [last, -1], [-1]):
+        out = extrude_edges(plane, idx, 0.2)
+        assert max(directed_counts(out).values()) == 1, idx
+        assert same_mesh(out, ref), idx
+
+
+def _two_boxes():
+    verts, faces = [], []
+    for shift in ([0.0, 0.0, 0.0], [3.0, 0.0, 0.0]):
+        box = create_box()
+        off = len(verts)
+        verts.extend(v.position + np.array(shift) for v in box.vertices)
+        faces.extend([i + off for i in fv] for fv in face_lists(box))
+    return HalfEdgeMesh.from_arrays(verts, faces)
+
+
+def test_bridge_faces_negative_and_out_of_range_indices():
+    """M13 sibling (cand 14 pattern) in bridge_faces: -6 means face 6; it used
+    to be bridged but never deleted (and -1 collides with the 'no twin'
+    sentinel). An out-of-range index used to raise IndexError. Expected: the
+    negative alias gives the canonical bridge; an empty group is a no-op."""
+    mesh = _two_boxes()
+    ref = bridge_faces(mesh, [0], [6])
+    assert len(ref.faces) == 14 and bad_edges(ref) == 0
+    for a, b in [([0], [-6]), ([-12], [6]), ([0, 0], [6, -6])]:
+        out = bridge_faces(mesh, a, b)
+        assert bad_edges(out) == 0, (a, b)
+        assert same_mesh(out, ref), (a, b)
+    out = bridge_faces(mesh, [0], [12])
+    assert same_mesh(out, mesh)
