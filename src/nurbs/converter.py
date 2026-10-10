@@ -49,7 +49,7 @@ class SubDToNURBSConverter:
                 p = (1-u)*(1-v)*c0 + u*(1-v)*c1 + u*v*c2 + (1-u)*v*c3
                 
                 # Add a simple quadratic bump to approximate subdivision limit surface bulging
-                bump = u * (1 - u) * v * (1 - v) * 4.0  # Max 1.0 at center
+                bump = u * (1 - u) * v * (1 - v) * 4.0  # Max 0.25 at center
                 # Scale bump based on the size of the quad
                 side_len = np.linalg.norm(c1 - c0)
                 displacement = normal * (side_len * 0.1) * bump
