@@ -162,3 +162,103 @@ def test_m12_boundary_vertex_with_three_quads_is_irregular():
     assert 4 in irr, "boundary vertex with 3 quads must be irregular"
     assert reg == {0, 1, 2, 3, 5, 6, 7}, f"regular: {sorted(reg)}"
     assert irr == {4}
+
+
+# ---------------------------------------------------------------------------
+# M15 - normals of small triangles
+# ---------------------------------------------------------------------------
+
+def test_m15_halfedge_face_normal_of_small_triangle_is_unit():
+    """M15 (cand 8): a 1e-5 triangle gets the unit normal (0, 0, 1), not 0."""
+    for offset in ([0.0, 0.0, 0.0], [1150.0, -20.0, 37.0]):
+        pts = np.array([[0, 0, 0], [1e-5, 0, 0], [0, 1e-5, 0]]) + offset
+        mesh = HalfEdgeMesh.from_arrays(pts, [[0, 1, 2]])
+        mesh.compute_face_normals()
+        assert np.allclose(mesh.faces[0].normal, [0.0, 0.0, 1.0], atol=1e-6), \
+            f"offset {offset}: {mesh.faces[0].normal}"
+
+
+def test_m15_halfedge_normals_are_scale_invariant_and_degenerate_is_zero():
+    """M15 (cand 8): the same quad scaled by 1e-7..1e7 gives the same unit
+    normal; a collinear (zero-area) face returns the zero vector at any scale."""
+    quad = np.array([[0, 0, 0], [2, 0, 0], [2, 1, 1], [0, 1, 1]], dtype=float)
+    expected = np.array([0.0, -1.0, 1.0]) / np.sqrt(2.0)
+    for s in (1e-7, 1e-5, 1.0, 1e7):
+        mesh = HalfEdgeMesh.from_arrays(quad * s, [[0, 1, 2, 3]])
+        mesh.compute_face_normals()
+        assert np.allclose(mesh.faces[0].normal, expected, atol=1e-9), f"scale {s}"
+
+        line = HalfEdgeMesh.from_arrays(np.array([[0, 0, 0], [1, 1, 1], [2, 2, 2.0]]) * s,
+                                        [[0, 1, 2]])
+        line.compute_face_normals()
+        assert np.array_equal(line.faces[0].normal, np.zeros(3)), f"scale {s}"
+
+
+def test_m15_halfedge_zero_area_face_far_from_origin_is_zero():
+    """M15 (cand 8): with a scale-relative threshold, the rounding of Newell's
+    P + Q sums at |x| ~ 1e3 must not turn an exactly collinear small face into
+    a noise "normal": it returns the zero vector. A valid face of the same size
+    at the same place still gets its unit normal."""
+    from fractions import Fraction
+    p0 = np.array([1150.3, -20.7, 37.1])
+    d = np.array([3.0, -5.0, 7.0]) * 2.0 ** -17          # dyadic: P0 + t*d is exact
+    line = np.array([p0 + t * d for t in range(4)])
+    exact = [[Fraction(x) for x in p] for p in line]
+    for p, q in zip(exact[1:], exact[2:]):                # precondition: exactly collinear
+        a = [p[i] - exact[0][i] for i in range(3)]
+        b = [q[i] - exact[0][i] for i in range(3)]
+        assert [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0]] == [0, 0, 0]
+    mesh = HalfEdgeMesh.from_arrays(line, [[0, 1, 2, 3]])
+    mesh.compute_face_normals()
+    assert np.array_equal(mesh.faces[0].normal, np.zeros(3)), mesh.faces[0].normal
+
+    e = 2.0 ** -17
+    square = p0 + np.array([[0, 0, 0], [e, 0, 0], [e, e, 0], [0, e, 0]])
+    mesh = HalfEdgeMesh.from_arrays(square, [[0, 1, 2, 3]])
+    mesh.compute_face_normals()
+    assert np.allclose(mesh.faces[0].normal, [0.0, 0.0, 1.0], atol=1e-6)
+
+
+def test_m15_expand_selection_by_angle_on_small_flat_strip():
+    """M15 (cand 8): a flat strip of two 1e-5 triangles is one 0-degree region,
+    so a 10-degree flood fill from face 0 must reach face 1; a 90-degree fold
+    of the same size must stop it."""
+    s = 1e-5
+    flat = HalfEdgeMesh.from_arrays(np.array([[0, 0, 0], [s, 0, 0], [s, s, 0], [0, s, 0]]),
+                                    [[0, 1, 2], [0, 2, 3]])
+    assert sorted(flat.expand_selection_by_angle([0], 10.0)) == [0, 1]
+
+    fold = HalfEdgeMesh.from_arrays(np.array([[0, 0, 0], [s, 0, 0], [s / 2, s, 0], [s / 2, 0, s]]),
+                                    [[0, 1, 2], [1, 0, 3]])
+    assert sorted(fold.expand_selection_by_angle([0], 10.0)) == [0]
+
+
+def test_m15_mesh_soa_small_triangle_normals_are_unit():
+    """M15 (cand 7): MeshSOA face and vertex normals of 1e-5 triangles are unit
+    length (0, 0, 1), not the raw cross product (0, 0, 1e-10)."""
+    s = 1e-5
+    soa = MeshSOA(np.array([[0, 0, 0], [s, 0, 0], [s, s, 0], [0, s, 0]]),
+                  np.array([[0, 1, 2], [0, 2, 3]]))
+    fn = soa.compute_face_normals()
+    vn = soa.compute_vertex_normals()
+    assert np.allclose(fn, [[0, 0, 1]] * 2, atol=1e-9), fn
+    assert np.allclose(vn, [[0, 0, 1]] * 4, atol=1e-9), vn
+
+
+def test_m15_mesh_soa_degenerate_faces_and_isolated_vertices_give_zero():
+    """M15 (cand 7): a collinear face gets the zero normal (finite, no NaN) and
+    leaves the normals of the valid neighbours untouched; a vertex that only
+    touches degenerate faces, or none at all, gets the zero vector."""
+    for s in (1e-6, 1.0, 1e6):
+        verts = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0],      # valid, +Z
+                          [2, 0, 0], [3, 0, 0],                 # collinear with 1
+                          [9, 9, 9]], dtype=float) * s          # isolated
+        soa = MeshSOA(verts, np.array([[0, 1, 2], [1, 3, 4]]))
+        fn = soa.compute_face_normals()
+        vn = soa.compute_vertex_normals()
+        assert np.all(np.isfinite(fn)) and np.all(np.isfinite(vn))
+        assert np.allclose(fn[0], [0, 0, 1], atol=1e-9)
+        assert np.array_equal(fn[1], np.zeros(3))
+        assert np.allclose(vn[[0, 1, 2]], [[0, 0, 1]] * 3, atol=1e-9)
+        assert np.array_equal(vn[[3, 4, 5]], np.zeros((3, 3)))

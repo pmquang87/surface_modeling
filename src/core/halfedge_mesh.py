@@ -427,7 +427,10 @@ class HalfEdgeMesh:
                 # corner triangle (verts[0], verts[1], verts[-1]) inverts the
                 # normal whenever that corner is reflex, and ignores warping on
                 # non-planar quads.
+                # Centring first keeps a small face far from the origin from
+                # drowning in the rounding of P + Q.
                 P = np.asarray(verts, dtype=np.float64)
+                P = P - P.mean(axis=0)
                 Q = np.roll(P, -1, axis=0)
                 d = P - Q
                 s = P + Q
@@ -437,7 +440,13 @@ class HalfEdgeMesh:
                     np.dot(d[:, 0], s[:, 1]),
                 ], dtype=np.float64)
                 norm = np.linalg.norm(n)
-                f.normal = n / norm if norm > 1e-8 else np.zeros(3)
+                # |n| is twice the area, so compare it with the squared edge
+                # lengths: an absolute threshold zeroed every valid face with
+                # sub-1e-4 edges (scans in metres). Only a numerically
+                # zero-area face is degenerate, and it gets the zero vector,
+                # which compute_vertex_normals simply skips.
+                scale = np.einsum('ij,ij->', d, d)
+                f.normal = n / norm if norm > 1e-12 * scale else np.zeros(3)
 
     def compute_vertex_normals(self):
         self.compute_face_normals()

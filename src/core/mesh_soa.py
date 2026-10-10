@@ -1,6 +1,13 @@
 import numpy as np
 from typing import Tuple, Optional, Union
 
+
+def _squared_edge_lengths(v0: np.ndarray, v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
+    """(F, 1) sum of the squared edge lengths of each triangle."""
+    return (np.einsum('ij,ij->i', v1 - v0, v1 - v0)
+            + np.einsum('ij,ij->i', v2 - v1, v2 - v1)
+            + np.einsum('ij,ij->i', v0 - v2, v0 - v2))[:, None]
+
 class MeshSOA:
     """
     Structure of Arrays (SoA) data structure for triangle meshes.
@@ -257,9 +264,12 @@ class MeshSOA:
         
         normals = np.cross(v1 - v0, v2 - v0)
         norms = np.linalg.norm(normals, axis=1, keepdims=True)
-        # Avoid division by zero for degenerate triangles
-        norms = np.where(norms < 1e-8, 1.0, norms)
-        return normals / norms
+        # The cross product scales with the squared edge length, so an
+        # absolute threshold left every valid triangle with sub-1e-4 edges
+        # un-normalised. Only a numerically zero-area face is degenerate; it
+        # gets the zero vector.
+        good = norms > 1e-12 * _squared_edge_lengths(v0, v1, v2)
+        return np.divide(normals, norms, out=np.zeros_like(normals), where=good)
 
     def compute_vertex_normals(self) -> np.ndarray:
         """
@@ -278,9 +288,15 @@ class MeshSOA:
         np.add.at(vertex_normals, self.faces[:, 1], cross)
         np.add.at(vertex_normals, self.faces[:, 2], cross)
         
+        # Same scale-relative test as compute_face_normals, against the
+        # squared edge lengths of the incident faces: a vertex touching only
+        # degenerate faces (or none) gets the zero vector.
+        sq = _squared_edge_lengths(v0, v1, v2)[:, 0]
+        scale = sum(np.bincount(self.faces[:, k], weights=sq, minlength=self.V)
+                    for k in range(3))[:, None]
         norms = np.linalg.norm(vertex_normals, axis=1, keepdims=True)
-        norms = np.where(norms < 1e-8, 1.0, norms)
-        return vertex_normals / norms
+        good = norms > 1e-12 * scale
+        return np.divide(vertex_normals, norms, out=np.zeros_like(vertex_normals), where=good)
         
     def is_boundary_vertex(self) -> np.ndarray:
         """
