@@ -110,7 +110,11 @@ class SubDToNURBSConverter:
             he = face.half_edge
             curr = he
             for _ in range(4):
-                if curr.twin and curr.twin.face and curr.twin.face.index in face_to_idx:
+                # A creased edge (crease_weight > 0, fractions included) is an
+                # intended sharp feature: list no neighbour across it, so the
+                # fitter adds no continuity rows there and keeps the crease.
+                sharp = curr.edge is not None and curr.edge.crease_weight > 0
+                if not sharp and curr.twin and curr.twin.face and curr.twin.face.index in face_to_idx:
                     neighbors.append(face_to_idx[curr.twin.face.index])
                 else:
                     neighbors.append(-1)

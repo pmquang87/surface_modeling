@@ -166,8 +166,13 @@ class G3Fitter:
         """
         Fits a completely G3 continuous surface over a network of quad regions.
         Replaces local Coons blending with a Global Sparse Solver (LSPIA).
-        Optimizes interior control points by minimizing projection distance 
+        Optimizes interior control points by minimizing projection distance
         while explicitly solving G3 continuity constraint equations across patch boundaries.
+
+        Adjacency comes only from each quad's ``neighbors`` list: an entry of
+        -1 adds no continuity row across that edge. SubDToNURBSConverter
+        writes -1 across creased cage edges (crease_weight > 0) so a crease
+        stays sharp.
         """
         import scipy.sparse as sp
         import scipy.sparse.linalg as spla
