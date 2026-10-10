@@ -27,10 +27,17 @@ class SubDToNURBSConverter:
         v2 = c3 - c0
         normal = np.cross(v1, v2)
         n_len = np.linalg.norm(normal)
-        if n_len > 1e-6:
+        # Scale-relative degeneracy test, the M15 rule of
+        # HalfEdgeMesh.compute_face_normals: |n| is an area, so compare it with
+        # the squared edge lengths. The old absolute 1e-6 bumped every valid
+        # quad with sub-1e-3 edges in-plane along z. A zero-area quad has no
+        # normal and gets no bump at all.
+        d = np.asarray(corners, dtype=np.float64)
+        d = d - np.roll(d, -1, axis=0)
+        if n_len > 1e-12 * np.einsum('ij,ij->', d, d):
             normal = normal / n_len
         else:
-            normal = np.array([0, 0, 1])
+            normal = np.zeros(3)
             
         grid = np.zeros((grid_size, grid_size, 3))
         u_vals = np.linspace(0, 1, grid_size)
