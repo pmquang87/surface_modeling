@@ -948,7 +948,15 @@ class PowerSurfacingMainWindow(QMainWindow):
             result = remove_sliver_edges(self.current_mesh)
             v = len(result.vertices)
             f = len(result.faces)
-            if v == v_before and f == f_before:
+            # Equal counts do not mean "unchanged": flipping a needle triangle
+            # keeps both counts, so compare positions and connectivity too.
+            unchanged = v == v_before and f == f_before
+            if unchanged:
+                before = self.current_mesh.to_arrays()
+                after = result.to_arrays()
+                unchanged = (np.array_equal(after['vertices'], before['vertices'])
+                             and after['faces'] == before['faces'])
+            if unchanged:
                 self.log("No sliver edges found — mesh unchanged.")
                 self.status_bar.showMessage("No sliver edges found.")
                 return

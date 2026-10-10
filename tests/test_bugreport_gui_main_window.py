@@ -409,3 +409,51 @@ def test_h2_reconvert_after_edit_makes_step_export_work_again(env, monkeypatch, 
     _set_export(monkeypatch, 'STEP', tmp_path / 'out.step')
     win.on_export()
     assert written['step'] == [(second, str(tmp_path / 'out.step'))]
+
+
+# --------------------------------------------------------------------------
+# M3 - sliver removal that only flips edges
+# --------------------------------------------------------------------------
+
+def _needle_mesh():
+    # Triangle (0,1,2) is a needle: height 0.04 against a 2.0 long edge, while
+    # no edge is short; flipping edge 0-1 to 2-3 is the whole cleanup.
+    verts = np.array([[-1, 0, 0], [1, 0, 0], [0, 0.04, 0], [0, -1, 0]], float)
+    return HalfEdgeMesh.from_arrays(verts, [[0, 1, 2], [1, 0, 3]])
+
+
+def _faces(mesh):
+    return mesh.to_arrays()['faces']
+
+
+def test_m3_needle_flip_is_kept(env):
+    """M3 (cand 3): a mesh whose only sliver is a needle triangle is cleaned by
+    an edge flip that keeps vertex and face counts. The flipped mesh must
+    replace current_mesh; it must not be reported as "mesh unchanged"."""
+    win, box, written = env
+    mesh = _needle_mesh()
+    win.current_mesh = mesh
+    assert _faces(mesh) == [[0, 1, 2], [1, 0, 3]]
+
+    win.on_remove_sliver_edges()
+
+    assert win.current_mesh is not mesh
+    assert _faces(win.current_mesh) == [[0, 3, 2], [3, 1, 2]]
+    np.testing.assert_allclose(_positions(win.current_mesh), _positions(mesh), atol=1e-12)
+    assert not any('mesh unchanged' in m for m in win.logs), win.logs
+    assert any('Sliver removal complete' in m for m in win.logs), win.logs
+
+
+def test_m3_clean_mesh_is_still_reported_unchanged(env):
+    """M3 control: a clean triangle mesh (trimesh box) comes back identical,
+    so the handler must keep the original object and say "mesh unchanged"."""
+    win, box, written = env
+    tm = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    mesh = HalfEdgeMesh.from_trimesh(tm)
+    win.current_mesh = mesh
+
+    win.on_remove_sliver_edges()
+
+    assert win.current_mesh is mesh
+    assert len(mesh.faces) == 12 and len(mesh.vertices) == 8
+    assert any('mesh unchanged' in m for m in win.logs), win.logs
