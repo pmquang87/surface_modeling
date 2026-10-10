@@ -342,3 +342,76 @@ def test_bridge_faces_negative_and_out_of_range_indices():
         assert same_mesh(out, ref), (a, b)
     out = bridge_faces(mesh, [0], [12])
     assert same_mesh(out, mesh)
+
+
+# --------------------------------------------------------------------------
+# M14 (cand 17): bridge_faces with a boundary that is not one simple loop
+# --------------------------------------------------------------------------
+
+def _boundary_cycles(mesh, group):
+    """Number of closed cycles the group's boundary half-edges form (independent)."""
+    group = set(group)
+    d = {}
+    for fi in group:
+        fv = [v.index for v in mesh.get_face_vertices(mesh.faces[fi])]
+        for i in range(len(fv)):
+            d[(fv[i], fv[(i + 1) % len(fv)])] = fi
+    bnd = [k for k in d if (k[1], k[0]) not in d]
+    nxt = {a: b for a, b in bnd}
+    seen, cycles = set(), 0
+    for a, _ in bnd:
+        if a in seen:
+            continue
+        cycles += 1
+        while a not in seen:
+            seen.add(a)
+            a = nxt[a]
+    return len(bnd), cycles
+
+
+def test_bridge_faces_refuses_groups_with_two_boundary_loops():
+    """M14 (cand 17): each group is a band around the torus tube, whose boundary
+    is two separate 4-edge loops. Expected: the mesh is returned untouched,
+    as the docstring promises for a bridge that cannot be built."""
+    t = create_torus(major_segments=8, minor_segments=4)
+    a, b = [0, 1, 2, 3], [16, 17, 18, 19]
+    assert _boundary_cycles(t, a) == (8, 2)
+    assert _boundary_cycles(t, b) == (8, 2)
+    assert bad_edges(t) == 0
+
+    out = bridge_faces(t, a, b)
+
+    assert same_mesh(out, t), (f"{len(t.faces)} faces in, {len(out.faces)} out, "
+                               f"{bad_edges(out)} bad edges")
+    assert bad_edges(out) == 0
+
+    # positive control: two single-loop groups are still bridged
+    mesh = _two_boxes()
+    assert _boundary_cycles(mesh, [0]) == (4, 1)
+    out = bridge_faces(mesh, [0], [6])
+    assert len(out.faces) == 14 and bad_edges(out) == 0
+
+
+def test_bridge_faces_refuses_a_figure_eight_boundary():
+    """M14 (cand 17): two quads touching at one corner have a boundary that
+    chains into one 8-edge circuit through the pinch vertex twice. It is not a
+    simple loop and bridging it gives a non-manifold result. Expected: the mesh
+    is returned untouched."""
+    verts, faces = [], []
+    for z in (0.0, 1.0):
+        off = len(verts)
+        verts.extend([x, y, z] for y in range(4) for x in range(4))
+        faces.extend([off + 4 * j + i, off + 4 * j + i + 1,
+                      off + 4 * (j + 1) + i + 1, off + 4 * (j + 1) + i]
+                     for j in range(3) for i in range(3))
+    m = HalfEdgeMesh.from_arrays(verts, faces)
+    b = [9, 10, 11]           # bottom row of the upper grid: one 8-vertex loop
+    assert _boundary_cycles(m, b) == (8, 1)
+    # cells (1,1)+(2,2) share only vertex 10, cells (0,0)+(1,1) only vertex 5.
+    # Which one the old greedy chaining walked as a full 8-circuit depends on
+    # half-edge order: (1,1)+(2,2) did (and was bridged), (0,0)+(1,1) did not.
+    for a, pinch in [([4, 8], 10), ([0, 4], 5)]:
+        assert _boundary_cycles(m, a)[0] == 8
+        assert set(face_lists(m)[a[0]]) & set(face_lists(m)[a[1]]) == {pinch}
+        out = bridge_faces(m, a, b)
+        assert same_mesh(out, m), f"{a}: {len(m.faces)} faces in, {len(out.faces)} out"

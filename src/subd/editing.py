@@ -303,7 +303,17 @@ def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: 
                     found = True
                     break
             if not found: break 
-        return [he.prev.vertex.index for he in loop if he.prev]
+        # Only one simple closed loop can be bridged. Edges left unchained (a
+        # band with two boundary loops), a chain that does not close, or one
+        # that passes a vertex twice (groups touching at a corner) mean the
+        # bridge cannot be built.
+        if (boundary_edges or loop[0].prev is None
+                or loop[-1].vertex is not loop[0].prev.vertex):
+            return []
+        vert_loop = [he.prev.vertex.index for he in loop if he.prev]
+        if len(vert_loop) != len(loop) or len(set(vert_loop)) != len(vert_loop):
+            return []
+        return vert_loop
 
     face_indices_a = _valid_indices(face_indices_a, len(mesh.faces))
     face_indices_b = _valid_indices(face_indices_b, len(mesh.faces))
