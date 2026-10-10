@@ -317,6 +317,9 @@ def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: 
 
     face_indices_a = _valid_indices(face_indices_a, len(mesh.faces))
     face_indices_b = _valid_indices(face_indices_b, len(mesh.faces))
+    # A face in both groups would be deleted once but bridged from twice.
+    if set(face_indices_a) & set(face_indices_b):
+        return mesh.copy()
     loop_a = get_boundary_loop(set(face_indices_a))
     loop_b = get_boundary_loop(set(face_indices_b))
 
@@ -340,14 +343,33 @@ def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: 
 
     loop_b_aligned = loop_b[best_shift:] + loop_b[:best_shift]
 
+    # A side quad that walks a directed edge some face already walks makes the
+    # result non-manifold with holes. This also catches a side quad landing on
+    # a face we keep (opposite faces of a box: the four side quads ARE the four
+    # walls): wound the same way it repeats all four of the wall's edges, wound
+    # the other way its neighbouring side quad repeats a wall edge. Check every
+    # side quad as add_face will build it before committing to the bridge.
+    used = {(fv[i], fv[(i + 1) % len(fv)]) for fv in faces for i in range(len(fv))}
+    new_faces = []
     for i in range(n):
         v1 = loop_a[i]
         v2 = loop_a[(i + 1) % n]
         v3 = loop_b_aligned[(i + 1) % n]
         v4 = loop_b_aligned[i]
-        faces.append([v1, v2, v3, v4])
+        quad = [v1, v2, v3, v4]
+        # add_face drops repeated consecutive corners (groups sharing an edge
+        # or a corner); a quad left with < 3 corners is not built at all.
+        poly = [v for k, v in enumerate(quad) if v != quad[k - 1]]
+        if len(poly) < 3:
+            continue
+        for k in range(len(poly)):
+            e = (poly[k], poly[(k + 1) % len(poly)])
+            if e in used:
+                return mesh.copy()
+            used.add(e)
+        new_faces.append(quad)
 
-    return HalfEdgeMesh.from_arrays(verts, faces)
+    return HalfEdgeMesh.from_arrays(verts, faces + new_faces)
 
 
 def mirror_mesh(mesh: HalfEdgeMesh, axis: str = 'x', merge_distance: float = 0.001) -> HalfEdgeMesh:
