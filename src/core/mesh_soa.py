@@ -96,7 +96,13 @@ class MeshSOA:
         order = np.argsort(edge_indices)
         sorted_edges = edge_indices[order]
         
-        is_duplicate = sorted_edges[:-1] == sorted_edges[1:]
+        # Pair only edges shared by exactly two half-edges. On a non-manifold
+        # edge (3+ faces) consecutive pairs overlap and the later assignment
+        # overwrites the earlier one (a.twin = b while b.twin = c), so those
+        # half-edges all stay unpaired (-1) and twin(twin(h)) == h holds.
+        edge_count = np.bincount(edge_indices, minlength=self.E)
+        is_duplicate = ((sorted_edges[:-1] == sorted_edges[1:])
+                        & (edge_count[sorted_edges[:-1]] == 2))
         dup_indices = np.where(is_duplicate)[0]
         
         h1 = order[dup_indices]

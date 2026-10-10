@@ -262,3 +262,32 @@ def test_m15_mesh_soa_degenerate_faces_and_isolated_vertices_give_zero():
         assert np.array_equal(fn[1], np.zeros(3))
         assert np.allclose(vn[[0, 1, 2]], [[0, 0, 1]] * 3, atol=1e-9)
         assert np.array_equal(vn[[3, 4, 5]], np.zeros((3, 3)))
+
+
+# ---------------------------------------------------------------------------
+# M16 - MeshSOA twins on non-manifold edges
+# ---------------------------------------------------------------------------
+
+def test_m16_mesh_soa_twins_are_symmetric_on_non_manifold_edge():
+    """M16 (cand 9): three faces on edge 0-1 (plus a manifold edge 1-2 shared
+    by faces 0 and 3): twin(twin(h)) == h everywhere, the three half-edges of
+    the non-manifold edge stay unpaired, and the manifold edge is paired."""
+    verts = np.random.default_rng(0).normal(size=(6, 3))
+    faces = np.array([[0, 1, 2], [1, 0, 3], [1, 0, 4], [2, 1, 5]])
+    soa = MeshSOA(verts, faces)
+    v_from = soa.faces.ravel()
+    on_01 = [h for h in range(soa.H) if {v_from[h], soa.he_vertex[h]} == {0, 1}]
+    on_12 = [h for h in range(soa.H) if {v_from[h], soa.he_vertex[h]} == {1, 2}]
+    assert len(on_01) == 3 and len(on_12) == 2      # precondition: the fin exists
+
+    paired = np.where(soa.he_twin != -1)[0]
+    for h in paired:
+        assert soa.he_twin[soa.he_twin[h]] == h, \
+            f"he{h}.twin = {soa.he_twin[h]} but he{soa.he_twin[h]}.twin = {soa.he_twin[soa.he_twin[h]]}"
+    assert all(soa.he_twin[h] == -1 for h in on_01)
+    assert soa.he_twin[on_12[0]] == on_12[1] and soa.he_twin[on_12[1]] == on_12[0]
+    assert sorted(paired.tolist()) == sorted(on_12)
+    # adjacency built from the twins is now symmetric too
+    ff = soa.get_face_face_adjacency()
+    assert ff[0].tolist().count(3) == 1 and ff[3].tolist().count(0) == 1
+    assert ff[1].tolist().count(-1) == 3 and ff[2].tolist().count(-1) == 3
