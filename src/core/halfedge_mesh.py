@@ -189,7 +189,22 @@ class HalfEdgeMesh:
         return [he.face for he in self.get_vertex_fan(vertex) if he.face is not None]
 
     def get_vertex_neighbors(self, vertex: Vertex) -> List[Vertex]:
-        return [he.vertex for he in self.get_vertex_fan(vertex) if he.vertex is not None]
+        """
+        Neighbouring vertices in ring order.
+
+        Each outgoing spoke gives one neighbour, but an open fan has one more
+        edge than spokes: the incoming boundary half-edge in front of fan[0]
+        starts at a vertex no spoke points to. It is prepended, so that
+        consecutive neighbours always share a face with `vertex`.
+        """
+        fan = self.get_vertex_fan(vertex)
+        neighbors = [he.vertex for he in fan if he.vertex is not None]
+        if fan and fan[0].prev is not None and fan[0].prev.twin is None:
+            incoming = fan[0].prev
+            start = incoming.prev.vertex if incoming.prev is not None else None
+            if start is not None and start is not vertex and start not in neighbors:
+                neighbors.insert(0, start)
+        return neighbors
 
     def get_edge_faces(self, edge: Edge) -> Tuple[Optional[Face], Optional[Face]]:
         if edge.half_edge is None:
