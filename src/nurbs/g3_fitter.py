@@ -320,25 +320,50 @@ class G3Fitter:
             initial_interiors = [p[1:5, 1:5].copy() for p in patches]
 
             A = sp.csr_matrix((data, (rows, cols)), shape=(eq_idx, num_vars))
+            b = np.column_stack([bx, by, bz])
 
-            x = spla.lsqr(A, np.array(bx))[0]
-            y = spla.lsqr(A, np.array(by))[0]
-            z = spla.lsqr(A, np.array(bz))[0]
-
-            # Only overwrite variables that appeared in at least one equation;
-            # lsqr returns the least-norm value 0 for untouched variables,
-            # which would collapse unconstrained patches to the origin.
-            used = np.zeros(num_vars, dtype=bool)
-            used[np.asarray(cols, dtype=np.int64)] = True
-
+            # Solve for the CHANGE dx from the Coons interior x0 (var_idx
+            # order is p[1:5, 1:5] row-major), not for the interior itself.
+            # lsqr on the absolute coordinates stopped on tests relative to
+            # |b| and |x|, which grow with the part's distance from the
+            # origin: an exactly representable plane came back bent at
+            # offset 10 and "diverged" at offset 500, and on a 2876-quad
+            # QuadWrapper cage the objective ended 2.3x above its optimum.
+            # The start residual r0 = b - A x0 does not depend on where the
+            # part sits.
+            x0 = np.array([p[1:5, 1:5].reshape(16, 3) for p in patches]).reshape(num_vars, 3)
+            r0 = b - A @ x0
+            dx = None
+            if all(q.get('dense_points') is not None and q['dense_points'].shape[0] >= 6
+                   for q in quad_mesh):
+                # >= 4 interior sample rows/columns give every patch a
+                # full-rank data block, so A^T A is SPD: factor it once for
+                # x, y and z, then refine twice (corrected semi-normal
+                # equations) to win back the digits the normal equations lose
+                # at cond(A) ~ 1e5. On that cage this is exact (objective
+                # within 1e-13 of the optimum) and ~3x faster than lsqr even
+                # at its loose default tolerance, which still ends 1e-4 above
+                # the optimum and whose stopping iteration - and so the
+                # result - shifts with rounding, i.e. with the part's position.
+                At = A.T.tocsr()
+                try:
+                    lu = spla.splu((At @ A).tocsc())
+                    dx = lu.solve(At @ r0)
+                    for _ in range(2):
+                        dx = dx + lu.solve(At @ (r0 - A @ dx))
+                except (RuntimeError, MemoryError):  # singular / too large
+                    dx = None
+                if dx is not None and not np.all(np.isfinite(dx)):
+                    dx = None
+            if dx is None:
+                # Rank deficient (a patch without dense samples): lsqr's
+                # minimum-norm answer is the smallest change from Coons, not
+                # the point nearest the origin, and a variable that is in no
+                # equation keeps x0 exactly.
+                dx = np.column_stack([spla.lsqr(A, r0[:, c])[0] for c in range(3)])
+            sol = (x0 + dx).reshape(num_patches, 4, 4, 3)
             for k in range(num_patches):
-                for i in range(1, 5):
-                    for j in range(1, 5):
-                        var_idx = k * 16 + (i-1) * 4 + (j-1)
-                        if used[var_idx]:
-                            patches[k][i, j, 0] = x[var_idx]
-                            patches[k][i, j, 1] = y[var_idx]
-                            patches[k][i, j, 2] = z[var_idx]
+                patches[k][1:5, 1:5] = sol[k]
 
             # Sanity clamp: the solve refines the Coons interior; if it
             # diverged (conflicting equations at degenerate geometry), the
