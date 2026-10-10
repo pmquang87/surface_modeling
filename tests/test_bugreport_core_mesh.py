@@ -291,3 +291,40 @@ def test_m16_mesh_soa_twins_are_symmetric_on_non_manifold_edge():
     ff = soa.get_face_face_adjacency()
     assert ff[0].tolist().count(3) == 1 and ff[3].tolist().count(0) == 1
     assert ff[1].tolist().count(-1) == 3 and ff[2].tolist().count(-1) == 3
+
+
+# ---------------------------------------------------------------------------
+# L2a / L2b
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", [[0, 1, 5], [0, 1, -1]])
+def test_l2a_add_face_with_bad_index_leaves_mesh_untouched(bad):
+    """L2a (cand 10): add_face with a vertex index outside 0..V-1 raises
+    IndexError and builds nothing, so the mesh stays usable."""
+    mesh = HalfEdgeMesh.from_arrays(np.eye(3), [[0, 1, 2]])
+    before = (len(mesh.faces), len(mesh.half_edges), len(mesh.edges), dict(mesh._he_dict))
+    assert before[:3] == (1, 3, 3)
+    with pytest.raises(IndexError):
+        mesh.add_face(bad)
+    assert (len(mesh.faces), len(mesh.half_edges), len(mesh.edges)) == before[:3]
+    assert mesh._he_dict == before[3]
+    assert all(he.vertex is not None for he in mesh.half_edges)
+    assert mesh.to_arrays()['faces'] == [[0, 1, 2]]
+    assert mesh.vertices[2].half_edge.face is mesh.faces[0]
+
+    mesh.add_vertex([1.0, 1.0, 1.0])
+    assert mesh.add_face([2, 1, 3]) is not None     # a valid face is still accepted
+    assert mesh.to_arrays()['faces'] == [[0, 1, 2], [2, 1, 3]]
+
+
+def test_l2b_mesh_soa_from_empty_halfedge_mesh():
+    """L2b (cand 31): an empty HalfEdgeMesh gives (0, 3) vertices and empty
+    (0, 3) normals; a one-triangle mesh still gives (3, 3)."""
+    soa = MeshSOA.from_halfedge_mesh(HalfEdgeMesh())
+    assert soa.vertices.shape == (0, 3)
+    assert soa.compute_face_normals().shape == (0, 3)
+    assert soa.compute_vertex_normals().shape == (0, 3)
+
+    tri = MeshSOA.from_halfedge_mesh(HalfEdgeMesh.from_arrays(np.eye(3), [[0, 1, 2]]))
+    assert tri.vertices.shape == (3, 3)
+    assert np.allclose(tri.compute_face_normals(), [np.ones(3) / np.sqrt(3.0)])

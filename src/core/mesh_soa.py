@@ -45,8 +45,9 @@ class MeshSOA:
         Creates a MeshSOA from a HalfEdgeMesh. 
         Triangulates polygons using simple fan triangulation if necessary.
         """
-        vertices = np.array([v.position for v in mesh.vertices], dtype=np.float64)
-        
+        # reshape: an empty mesh would otherwise give shape (0,), not (0, 3)
+        vertices = np.array([v.position for v in mesh.vertices], dtype=np.float64).reshape(-1, 3)
+
         faces_list = []
         for f in mesh.faces:
             v_idx = [v.index for v in mesh.get_face_vertices(f)]

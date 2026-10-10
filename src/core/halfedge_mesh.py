@@ -61,6 +61,16 @@ class HalfEdgeMesh:
         return v
 
     def add_face(self, vertex_indices: List[int]) -> Optional[Face]:
+        # Validate before building anything: a bad index used to raise only
+        # after the Face and its half-edges were appended, leaving a partial
+        # face (vertex None) that broke every later traversal. A negative
+        # index would silently alias another vertex under a different key.
+        n_verts = len(self.vertices)
+        for v_idx in vertex_indices:
+            if not 0 <= v_idx < n_verts:
+                raise IndexError(f"add_face: vertex index {v_idx} out of range "
+                                 f"for a mesh with {n_verts} vertices")
+
         # A repeated consecutive index would build a half-edge from a vertex to
         # itself: it becomes its own twin and never gets an Edge record.
         indices = []
