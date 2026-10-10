@@ -554,29 +554,64 @@ def set_edge_weight(mesh: HalfEdgeMesh, edge_indices: list[int], weight: float) 
 
 
 def edge_slide(mesh: HalfEdgeMesh, vertex_indices: list[int], amount: float) -> HalfEdgeMesh:
-    """Slide selected vertices along their adjacent edges."""
+    """Slide selected vertices along their adjacent edges.
+
+    Each vertex moves by `amount` along the mean of its unit edge vectors (a
+    negative amount moves against it). A boundary vertex stays on the
+    outline: it slides along whichever of its boundary edges that move
+    favours, by at most the edge's length, and stays put when the move
+    favours none of them - a vertex on a straight boundary, or a corner whose
+    only edges are its two boundary edges (their mean is the bisector).
+    Following the mean direction there dented the outline into the mesh.
+    Indices are normalised like the other editing ops: negative ones count
+    from the end, out-of-range ones are skipped, a repeat slides once.
+    """
     verts = [v.position.copy() for v in mesh.vertices]
     faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
-    
-    for v_idx in vertex_indices:
-        if v_idx >= len(mesh.vertices): continue
+
+    # an edge that only one face uses is on the boundary
+    edge_use = {}
+    for poly in faces:
+        for a, b in zip(poly, poly[1:] + poly[:1]):
+            key = (min(a, b), max(a, b))
+            edge_use[key] = edge_use.get(key, 0) + 1
+
+    for v_idx in _valid_indices(vertex_indices, len(mesh.vertices)):
         v = mesh.vertices[v_idx]
         neighbors = mesh.get_vertex_neighbors(v)
         if not neighbors: continue
-        
-        # Calculate average edge vector away from vertex
+
+        # Calculate average edge vector away from vertex. Only an exactly
+        # zero-length edge is skipped: an absolute 1e-6 cut-off skipped every
+        # edge of a sub-micron cage, so nothing there could slide.
         avg_vec = np.zeros(3)
+        boundary = []
         for n in neighbors:
             vec = n.position - v.position
             length = np.linalg.norm(vec)
-            if length > 1e-6:
+            if length > 0.0:
                 avg_vec += (vec / length)
-                
+                if edge_use.get((min(v_idx, n.index), max(v_idx, n.index))) == 1:
+                    boundary.append((vec / length, length))
+
         avg_vec /= len(neighbors)
         avg_len = np.linalg.norm(avg_vec)
-        if avg_len > 1e-6:
-            verts[v_idx] += (avg_vec / avg_len) * amount
-            
+        if avg_len <= 1e-6:
+            continue
+        move = (avg_vec / avg_len) * amount
+        if not boundary:
+            verts[v_idx] += move
+            continue
+
+        along = [float(np.dot(move, u)) for u, _ in boundary]
+        best = int(np.argmax(along))
+        tol = 1e-9 * abs(amount)
+        if along[best] <= tol or any(a >= along[best] - tol
+                                     for k, a in enumerate(along) if k != best):
+            continue  # no boundary direction is favoured
+        u, length = boundary[best]
+        verts[v_idx] += u * min(abs(amount), length)
+
     return HalfEdgeMesh.from_arrays(verts, faces)
 
 
