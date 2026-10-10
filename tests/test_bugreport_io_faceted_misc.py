@@ -9,7 +9,11 @@ Covered here:
 * M21 (cand 26) - ``import_step`` failed under the nested ``OCP.OCP.*``
   package layout when cadquery is absent: ``TopAbs_REVERSED`` was imported
   from the flat ``OCP.TopAbs`` after the fallback block had already chosen
-  the nested layout.
+  the nested layout. Round 4 found that no OCP release ships ``OCP.OCP``
+  without the flat ``OCP.<Module>`` wrappers (see tests/test_ocp_layout.py),
+  so the fallback was removed: the test now pins one flat read path that
+  keeps the reversed-face winding fix, and a clear RuntimeError (no
+  half-working second path) when the flat names are missing.
 * M19 (cand 32) - ``FeatureTree.get_current_mesh`` / ``rebuild`` skipped a last
   feature that evaluated to ``None`` and reported the previous feature's mesh.
 * S:nan_volume (report "unverified suspicions") - a NaN volume slipped through
@@ -86,7 +90,7 @@ def test_m10_closed_surface_body_is_not_counted_as_open_shell(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# M21: import_step under the nested OCP.OCP.* layout
+# M21: import_step reads through the flat OCP names only
 # --------------------------------------------------------------------------
 
 #: Every flat OCP module on import_step's read path.
@@ -129,16 +133,19 @@ def _install_nested_only_layout(monkeypatch):
 
 
 @needs_ocp
-def test_m21_import_step_works_with_nested_ocp_layout(tmp_path, monkeypatch):
-    """M21 (cand 26): with only ``OCP.OCP.*`` importable and no cadquery,
-    ``import_step`` must read the STEP through the nested-layout fallback and
-    give the same outward-wound 6000 mm3 box as the flat layout does."""
+def test_m21_import_step_has_one_flat_ocp_path(tmp_path, monkeypatch):
+    """M21 (cand 26), revised in round 4: ``import_step`` reads through the
+    flat ``OCP.<Module>`` names only. On the real layout it gives the
+    outward-wound 6000 mm3 box (the TopAbs_REVERSED winding fix); with the
+    flat names hidden it raises the documented RuntimeError instead of
+    running a second, nested-layout code path that no release needs."""
     from src.io.importers import import_step
 
     path = tmp_path / "box.step"
     _write_box_step(path)
 
-    # positive control: the real (flat) layout
+    # the real (flat) layout: a box whose reversed faces were not flipped
+    # would not enclose +6000
     flat = import_step(str(path))
     flat_vol, flat_closed = _mesh_volume(flat)
     assert flat_closed and flat_vol == pytest.approx(6000.0, rel=1e-9)
@@ -157,16 +164,9 @@ def test_m21_import_step_works_with_nested_ocp_layout(tmp_path, monkeypatch):
     from OCP.OCP.STEPControl import STEPControl_Reader as nested_reader
     assert nested_reader is not None
 
-    nested = import_step(str(path))       # used to raise RuntimeError
-    nested_vol, nested_closed = _mesh_volume(nested)
-    assert nested["shape"] is not None
-    assert len(nested["faces"]) == 12 and len(nested["vertices"]) == 8
-    assert nested_closed
-    # the TopAbs_REVERSED winding fix is applied on this path too: a box whose
-    # reversed faces were not flipped would not enclose +6000
-    assert nested_vol == pytest.approx(6000.0, rel=1e-9)
-    assert np.allclose(np.sort(nested["vertices"], axis=0),
-                       np.sort(flat["vertices"], axis=0))
+    # before round 4 this returned a mesh through the OCP.OCP fallback
+    with pytest.raises(RuntimeError, match="STEP support is unavailable"):
+        import_step(str(path))
 
 
 # --------------------------------------------------------------------------
