@@ -252,3 +252,121 @@ def test_m19_controls_non_empty_disabled_and_following_feature():
     assert calls == [("B", ("A",))]
     assert tree.get_current_mesh() is None
 
+
+# --------------------------------------------------------------------------
+# NaN volumes in the faceted unify gate and the simplifier
+# --------------------------------------------------------------------------
+
+def test_nan_volume_is_rejected_by_unify_verdict():
+    """S:nan_volume: ``unify_verdict`` must reject a NaN (or otherwise
+    non-finite) volume on either side and say why; a finite equal volume is
+    still accepted (positive control)."""
+    from src.io.faceted_step import unify_verdict
+
+    nan = float("nan")
+    # positive control
+    ok, reason, rel = unify_verdict(12, 6, 1000.0, 1000.0, 1e-6)
+    assert ok is True and reason is None and rel == 0.0
+    # precondition: the old gate really lets NaN through (NaN > tol is False)
+    assert not (nan > 1e-6)
+
+    for before, after in ((1000.0, nan), (nan, 1000.0), (0.0, nan),
+                          (math.inf, 1000.0), (1000.0, math.inf)):
+        ok, reason, _ = unify_verdict(12, 6, before, after, 1e-6)
+        assert ok is False, (before, after)
+        assert "volume" in reason, reason
+    ok, reason, _ = unify_verdict(12, 6, 1000.0, nan, 1e-6)
+    assert "finite" in reason, reason
+
+
+@needs_ocp
+def test_nan_volume_merge_is_discarded_in_the_exporter(tmp_path, monkeypatch):
+    """S:nan_volume: when the volume integrator returns NaN for the merged
+    body, ``export_step_faceted`` must keep the faceted body (12 faces),
+    record the rejection, and keep the report JSON-safe (no NaN delta)."""
+    import json
+    import src.io.step_audit as step_audit
+    from src.io.faceted_step import export_step_faceted
+
+    box = _box()
+    good = export_step_faceted(box, str(tmp_path / "good.step"), verify=False)
+    assert good["faces"] == 6 and good["bodies"][0]["unify"]["applied"] is True
+
+    real = step_audit.brep_volume
+    seen = []
+
+    def nan_after_merge(shape):
+        seen.append(1)
+        # call 1 is volume_before of the merge, call 2 volume_after
+        return float("nan") if len(seen) == 2 else real(shape)
+    monkeypatch.setattr(step_audit, "brep_volume", nan_after_merge)
+
+    report = export_step_faceted(box, str(tmp_path / "nan.step"), verify=False)
+    assert len(seen) >= 2, "the injected integrator was never called"
+    unify = report["bodies"][0]["unify"]
+    assert unify["applied"] is False, unify
+    assert "finite" in (unify["rejected"] or ""), unify
+    assert unify["volume_rel_delta"] is None
+    assert report["faces"] == 12
+    assert report["solids"] == 1 and report["ok"] is True
+    json.dumps(report["bodies"], allow_nan=False)
+
+
+def _faceted_box_shape(a=10.0):
+    """12-triangle OCC box solid built from the faceted exporter's own path."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
+    from src.io.faceted_step import _build_direct, _shell_from_faces
+    m = trimesh.creation.box(extents=(a, a, a))
+    shell = _shell_from_faces(_build_direct(np.asarray(m.vertices, dtype=np.float64),
+                                            np.asarray(m.faces, dtype=np.int64)))
+    return BRepBuilderAPI_MakeSolid(shell).Solid()
+
+
+@needs_ocp
+@pytest.mark.parametrize("which,value", [("after", float("nan")),
+                                         ("before", float("nan")),
+                                         ("before", math.inf)])
+def test_nan_volume_is_rejected_by_the_simplifier(monkeypatch, which, value):
+    """S:nan_volume: ``NURBSSimplifier.simplify`` must keep the original shape
+    when either measured volume is not finite and say so in the report; the
+    same harness with real volumes accepts the merge (positive control)."""
+    import src.io.step_audit as step_audit
+    from src.nurbs.simplifier import NURBSSimplifier
+
+    box = _faceted_box_shape()
+
+    # positive control through the same code path
+    ok = NURBSSimplifier()
+    merged = ok.simplify(box)
+    assert ok.last_report["accepted"] is True, ok.last_report
+    assert merged is not box
+
+    real = step_audit.brep_volume
+    calls = []
+
+    def injected(shape):
+        calls.append(1)
+        idx = 1 if which == "before" else 2
+        return value if len(calls) == idx else real(shape)
+    monkeypatch.setattr(step_audit, "brep_volume", injected)
+
+    simp = NURBSSimplifier()
+    out = simp.simplify(box)
+    rep = simp.last_report
+    assert len(calls) == 2, "both volumes must have been measured"
+    # precondition: the injected value really reached the report
+    key = "volume_before" if which == "before" else "volume_after"
+    assert not math.isfinite(rep[key]), rep
+    assert out is box, "a shape with a non-finite volume was accepted"
+    assert rep["accepted"] is False, rep
+    assert "finite" in (rep["reason"] or ""), rep
+
+
+def test_nondegenerate_mask_rejects_nan_triangles():
+    """S:nan_volume (area gate check): the faceted exporter's degenerate
+    triangle gate is written as ``>=`` and so already rejects NaN; a clean
+    triangle passes (positive control)."""
+    from src.io.faceted_step import _nondegenerate_mask
+    v = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [np.nan, 0, 0]], dtype=float)
+    f = np.array([[0, 1, 2], [3, 1, 2]], dtype=np.int64)
+    assert _nondegenerate_mask(v, f).tolist() == [True, False]

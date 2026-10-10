@@ -210,7 +210,11 @@ class NURBSSimplifier:
         report["volume_rel_delta"] = (dv / abs(v0)) if v0 else None
 
         reason = None
-        if dv > floor:
+        if not (math.isfinite(v0) and math.isfinite(v1)):
+            # NaN compares False with everything, so "dv > floor" alone would
+            # accept a failed integration
+            reason = f"volume is not finite ({v0!r} -> {v1!r})"
+        elif not dv <= floor:
             reason = (f"volume moved by {dv:.6g} "
                       f"({report['volume_rel_delta']:.3g} relative, "
                       f"budget {VOLUME_REL_BUDGET:g})"

@@ -233,12 +233,18 @@ def unify_verdict(faces_before: int, faces_after: int, volume_before: float,
     over the wrong wire and the volume changes, or the merge splits a face
     instead of joining it and the count goes UP. Either one means the faceted
     body was the better answer.
+
+    A non-finite volume on either side is rejected: every comparison with NaN
+    is False, so a ``rel > tol`` gate would wave a failed integration through.
     """
+    if not (math.isfinite(volume_before) and math.isfinite(volume_after)):
+        return (False, f"volume is not finite ({volume_before!r} -> "
+                       f"{volume_after!r})", float("nan"))
     if volume_before:
         rel = abs(volume_after - volume_before) / abs(volume_before)
     else:
         rel = abs(volume_after)
-    if rel > volume_tol_rel:
+    if not rel <= volume_tol_rel:
         return (False, f"volume moved by {rel:.3g} relative "
                        f"(budget {volume_tol_rel:g})", rel)
     if faces_after > faces_before:
@@ -282,7 +288,8 @@ def _unify_same_domain(shape: Any, angle_deg: float, volume_tol_rel: float,
         accepted, reason, rel = unify_verdict(
             info["faces_before"], faces_after, volume_before, volume_after,
             volume_tol_rel)
-        info["volume_rel_delta"] = float(rel)
+        # None, not NaN, when unmeasurable: the report must stay valid JSON
+        info["volume_rel_delta"] = float(rel) if math.isfinite(rel) else None
         info["faces_after"] = faces_after
         if not accepted:
             info["rejected"] = reason
