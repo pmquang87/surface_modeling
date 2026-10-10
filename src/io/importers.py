@@ -45,7 +45,7 @@ def import_step(filepath: str) -> Dict[str, Any]:
             from OCP.STEPControl import STEPControl_Reader
             from OCP.BRepMesh import BRepMesh_IncrementalMesh
             from OCP.TopExp import TopExp_Explorer
-            from OCP.TopAbs import TopAbs_FACE
+            from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
             from OCP.BRep import BRep_Tool
             from OCP.TopLoc import TopLoc_Location
             from OCP.TopoDS import TopoDS
@@ -54,7 +54,7 @@ def import_step(filepath: str) -> Dict[str, Any]:
             from OCP.OCP.STEPControl import STEPControl_Reader
             from OCP.OCP.BRepMesh import BRepMesh_IncrementalMesh
             from OCP.OCP.TopExp import TopExp_Explorer
-            from OCP.OCP.TopAbs import TopAbs_FACE
+            from OCP.OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
             from OCP.OCP.BRep import BRep_Tool
             from OCP.OCP.TopLoc import TopLoc_Location
             from OCP.OCP.TopoDS import TopoDS
@@ -88,8 +88,6 @@ def import_step(filepath: str) -> Dict[str, Any]:
         mesh_algo = BRepMesh_IncrementalMesh(shape, 0.1)
         if not mesh_algo.IsDone():
             logger.warning("BRepMesh_IncrementalMesh failed to generate a mesh.")
-        
-        from OCP.TopAbs import TopAbs_REVERSED
 
         explorer = TopExp_Explorer(shape, TopAbs_FACE)
         vertices = []
