@@ -18,8 +18,9 @@ one boundary edge by accident.) The rule is now explicit:
   a sub-micron cage - the M15 pattern).
 
 Test discipline: preconditions are asserted (the vertex really is on the
-boundary, the defect input really moves it off the outline under the old
-rule), and the outline checker has inputs it must accept and reject.
+boundary; on the jittered grid the boundary vertices really move, and an
+inline copy of the old mean-direction rule really takes them off the
+outline), and the outline checker has inputs it must accept and reject.
 """
 import os
 import sys
@@ -169,3 +170,127 @@ def test_indices_are_normalised():
                           _pos(edge_slide(g, [8], 0.25), 8))
     untouched = edge_slide(g, [-10, 9, 100], 0.25)
     assert all(np.array_equal(_pos(untouched, i), pts[i]) for i in range(9))
+
+
+def _jittered_grid(nx=5, ny=4, seed=7, scale=1.0):
+    """An open quad grid with seeded in-plane jitter, so boundary vertices
+    have asymmetric edges and really slide."""
+    rng = np.random.default_rng(seed)
+    pts = np.array([[x, y, 0.0] for y in range(ny) for x in range(nx)], dtype=float)
+    pts[:, :2] += rng.uniform(-0.25, 0.25, size=(len(pts), 2))
+    faces = [[y * nx + x, y * nx + x + 1, (y + 1) * nx + x + 1, (y + 1) * nx + x]
+             for y in range(ny - 1) for x in range(nx - 1)]
+    return HalfEdgeMesh.from_arrays(pts * scale, faces), pts * scale, faces
+
+
+def _old_rule(mesh, v_idx, amount):
+    """The pre-H4-follow-up rule, inline: move along the unit mean of the
+    unit edge vectors, boundary or not."""
+    v = mesh.vertices[v_idx]
+    units = [(n.position - v.position) / np.linalg.norm(n.position - v.position)
+             for n in mesh.get_vertex_neighbors(v)]
+    mean = np.sum(units, axis=0) / len(units)
+    return v.position + mean / np.linalg.norm(mean) * amount
+
+
+def _oracle(mesh, v_idx, amount):
+    """Independent statement of the documented rule for a boundary vertex:
+    (position, chosen neighbour or None)."""
+    v = mesh.vertices[v_idx]
+    units = [(n.position - v.position) / np.linalg.norm(n.position - v.position)
+             for n in mesh.get_vertex_neighbors(v)]
+    mean = np.sum(units, axis=0) / len(units)
+    move = mean / np.linalg.norm(mean) * amount
+    cands = []
+    for n in _boundary_neighbours(mesh, v_idx):
+        e = mesh.vertices[n].position - v.position
+        cands.append((float(np.dot(move, e / np.linalg.norm(e))), n, np.linalg.norm(e)))
+    cands.sort(key=lambda c: -c[0])
+    tol = 1e-9 * abs(amount)
+    if cands[0][0] <= tol or (len(cands) > 1 and cands[1][0] >= cands[0][0] - tol):
+        return v.position.copy(), None
+    _, n, length = cands[0]
+    if abs(amount) >= length:
+        return mesh.vertices[n].position.copy(), n
+    e = mesh.vertices[n].position - v.position
+    return v.position + e / length * abs(amount), n
+
+
+def _boundary_ring(nx=5, ny=4):
+    return [i for i in range(nx * ny)
+            if i % nx in (0, nx - 1) or i // nx in (0, ny - 1)]
+
+
+@pytest.mark.parametrize("amount", [0.15, -0.15, 0.4, 50.0])
+def test_jittered_boundary_vertices_slide_along_the_favoured_edge(amount):
+    """On a jittered grid most boundary vertices really move; each lands on
+    one of its own boundary edges - the one the move favours - by `amount`,
+    or exactly on that neighbour when the edge is shorter."""
+    m, _, _ = _jittered_grid()
+    ring = _boundary_ring()
+    assert all(len(_boundary_neighbours(m, i)) == 2 for i in ring)   # precondition
+    old_off = sum(not _on_outline(m, i, _old_rule(m, i, amount)) for i in ring)
+    assert old_off >= len(ring) - 2, old_off        # the old rule really leaves it
+    moved = 0
+    for i in ring:
+        expected, n = _oracle(m, i, amount)
+        got = _pos(edge_slide(m, [i], amount), i)
+        assert _on_outline(m, i, got), (i, got)
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-12)
+        if n is not None:
+            moved += 1
+            if abs(amount) >= np.linalg.norm(m.vertices[n].position - m.vertices[i].position):
+                assert np.array_equal(got, _pos(m, n))   # exact end stop
+    # bracket: at least half the ring slid (a negative amount points the
+    # move away from both boundary edges at the corners, so fewer move then)
+    assert moved >= len(ring) // 2, moved
+
+
+def test_all_boundary_vertices_at_once_match_one_at_a_time():
+    """Moves use the original positions, so sliding the whole ring at once
+    gives each vertex the same place as sliding it alone."""
+    m, _, _ = _jittered_grid()
+    ring = _boundary_ring()
+    together = edge_slide(m, ring, 0.2)
+    for i in ring:
+        assert np.array_equal(_pos(together, i), _pos(edge_slide(m, [i], 0.2), i))
+
+
+@pytest.mark.parametrize("scale", [1e-7, 1e3])
+def test_jittered_boundary_slide_is_scale_invariant(scale):
+    """Boundary slides scale with the cage (the old 1e-6 edge cut-off froze
+    the whole sub-micron ring)."""
+    ref, _, _ = _jittered_grid()
+    big, _, _ = _jittered_grid(scale=scale)
+    ring = _boundary_ring()
+    for i in ring:
+        a = _pos(edge_slide(ref, [i], 0.15), i)
+        b = _pos(edge_slide(big, [i], 0.15 * scale), i) / scale
+        np.testing.assert_allclose(b, a, rtol=1e-9, atol=1e-12)
+    assert sum(not np.array_equal(_pos(edge_slide(ref, [i], 0.15), i), _pos(ref, i))
+               for i in ring) >= len(ring) - 4          # precondition: they move
+
+
+def test_clamped_slide_lands_exactly_on_the_neighbour():
+    """A slide longer than the edge stops exactly on the neighbour, not an
+    ulp off it (an ulp-short edge then steered the neighbour's next slide)."""
+    pts = [[0, 0, 0], [2.3943513636620226, -0.027479281000940815, 0],
+           [-1, 0, 0], [0.5, 1, 0], [1.5, 1, 0]]
+    m = HalfEdgeMesh.from_arrays(pts, [[0, 1, 4, 3], [2, 0, 3]])
+    out = edge_slide(m, [0], 100.0)
+    assert np.array_equal(_pos(out, 0), _pos(m, 1)), _pos(out, 0) - _pos(m, 1)
+
+
+def test_pinched_vertex_keeps_to_its_boundary_edges():
+    """A closed cone fan around vertex 0 plus a flap triangle that touches it
+    only at vertex 0: get_vertex_neighbors walks one fan, but the vertex's
+    boundary edges are the flap's 0-6 and 0-7. It must stay on them (here:
+    stay put, the move points away from both), whichever fan is walked."""
+    ring = [[np.cos(a), np.sin(a), -1.0] for a in np.linspace(0, 2 * np.pi, 6)[:-1]]
+    pts = [[0, 0, 0]] + ring + [[0.3, 0.1, 1.0], [-0.2, 0.3, 1.0]]
+    fan = [[0, k, k % 5 + 1] for k in range(1, 6)]
+    for faces in (fan + [[0, 6, 7]], [[0, 6, 7]] + fan):
+        m = HalfEdgeMesh.from_arrays(pts, faces)
+        assert _boundary_neighbours(m, 0) == [6, 7]          # precondition
+        out = edge_slide(m, [0], 0.3)
+        assert _on_outline(m, 0, _pos(out, 0)), _pos(out, 0)

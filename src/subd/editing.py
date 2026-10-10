@@ -558,13 +558,17 @@ def edge_slide(mesh: HalfEdgeMesh, vertex_indices: list[int], amount: float) -> 
 
     Each vertex moves by `amount` along the mean of its unit edge vectors (a
     negative amount moves against it). A boundary vertex stays on the
-    outline: it slides along whichever of its boundary edges that move
-    favours, by at most the edge's length, and stays put when the move
-    favours none of them - a vertex on a straight boundary, or a corner whose
-    only edges are its two boundary edges (their mean is the bisector).
-    Following the mean direction there dented the outline into the mesh.
-    Indices are normalised like the other editing ops: negative ones count
-    from the end, out-of-range ones are skipped, a repeat slides once.
+    outline: it slides by `amount` along whichever of its boundary edges
+    that move favours, stopping exactly on the neighbour when the edge is
+    shorter, and stays put when the move favours none of them (a tie within
+    1e-9 relative) - e.g. a vertex on a symmetric straight boundary, or a
+    corner whose only edges are its two boundary edges (their mean is the
+    bisector). Following the mean direction there dented the outline into
+    the mesh. Boundary edges are read from the faces, so a pinched vertex
+    also sees those of the fan get_vertex_neighbors does not walk. All moves
+    use the original positions. Indices are normalised like the other
+    editing ops: negative ones count from the end, out-of-range ones are
+    skipped, a repeat slides once.
     """
     verts = [v.position.copy() for v in mesh.vertices]
     faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
@@ -575,6 +579,11 @@ def edge_slide(mesh: HalfEdgeMesh, vertex_indices: list[int], amount: float) -> 
         for a, b in zip(poly, poly[1:] + poly[:1]):
             key = (min(a, b), max(a, b))
             edge_use[key] = edge_use.get(key, 0) + 1
+    boundary_nbrs = {}
+    for (a, b), count in edge_use.items():
+        if count == 1 and a != b:
+            boundary_nbrs.setdefault(a, []).append(b)
+            boundary_nbrs.setdefault(b, []).append(a)
 
     for v_idx in _valid_indices(vertex_indices, len(mesh.vertices)):
         v = mesh.vertices[v_idx]
@@ -585,32 +594,41 @@ def edge_slide(mesh: HalfEdgeMesh, vertex_indices: list[int], amount: float) -> 
         # zero-length edge is skipped: an absolute 1e-6 cut-off skipped every
         # edge of a sub-micron cage, so nothing there could slide.
         avg_vec = np.zeros(3)
-        boundary = []
         for n in neighbors:
             vec = n.position - v.position
             length = np.linalg.norm(vec)
             if length > 0.0:
                 avg_vec += (vec / length)
-                if edge_use.get((min(v_idx, n.index), max(v_idx, n.index))) == 1:
-                    boundary.append((vec / length, length))
 
         avg_vec /= len(neighbors)
         avg_len = np.linalg.norm(avg_vec)
         if avg_len <= 1e-6:
             continue
         move = (avg_vec / avg_len) * amount
+
+        boundary = []
+        for n_idx in sorted(boundary_nbrs.get(v_idx, ())):
+            vec = mesh.vertices[n_idx].position - v.position
+            length = np.linalg.norm(vec)
+            if length > 0.0:
+                boundary.append((vec / length, length, n_idx))
         if not boundary:
             verts[v_idx] += move
             continue
 
-        along = [float(np.dot(move, u)) for u, _ in boundary]
+        along = [float(np.dot(move, u)) for u, _, _ in boundary]
         best = int(np.argmax(along))
         tol = 1e-9 * abs(amount)
         if along[best] <= tol or any(a >= along[best] - tol
                                      for k, a in enumerate(along) if k != best):
             continue  # no boundary direction is favoured
-        u, length = boundary[best]
-        verts[v_idx] += u * min(abs(amount), length)
+        u, length, n_idx = boundary[best]
+        if abs(amount) >= length:
+            # end stop exactly on the neighbour: u * length lands an ulp off
+            # it, and that ulp-short edge would steer the next slide
+            verts[v_idx] = mesh.vertices[n_idx].position.copy()
+        else:
+            verts[v_idx] += u * abs(amount)
 
     return HalfEdgeMesh.from_arrays(verts, faces)
 
