@@ -31,11 +31,19 @@ class SubDToNURBSConverter:
         are exact limit points at the dyadic parameters (i, j) / 2**levels of
         the face; the corner samples are the limit positions of the quad's
         own cage vertices, so on a closed cage they agree with the patch
-        corners to rounding. (On an
-        open cage `evaluate_limit_surface` keeps boundary vertices where
-        the subdivided mesh has them, which is not where the coarse cage
-        has them; the boundary samples do not enter the fit, whose
-        boundary rows are fixed.)
+        corners to rounding. On an open cage `evaluate_limit_surface`
+        keeps boundary vertices where the subdivided mesh has them, which
+        is neither their limit nor where the coarse cage has them. The
+        boundary samples themselves have no effect on the fit (its boundary
+        rows are fixed), but they are nodes of the resampling below, so
+        they do shift the interior 6 x 6 samples: measured in review, by up
+        to 2.6e-4 of the bounding-box diagonal on an open grid and 9.2e-5
+        on an open cylinder.
+
+        Used by both no-reference paths: the GUI "Convert to NURBS" for
+        SubD modelling and the convert CLI's ``--no-reference-fit``
+        (measured in review on an icosphere STL: mean deviation 0.280 ->
+        0.228 mm).
 
         When grid_size is not 2**levels + 1 the samples are resampled by
         tensor Lagrange interpolation of degree 2**levels in u and v. At the
@@ -45,11 +53,14 @@ class SubDToNURBSConverter:
         every planar face) and reproduces the nodes, so the corners stay
         exact. Faces at an extraordinary vertex are not polynomial there:
         measured against 3 levels (exact samples at the eighths), the
-        resampling is off by at most 1.2e-3 of the bounding-box diagonal on
-        a unit-cube cage (every face touches four valence-3 vertices, the
-        worst case), 7e-5 on create_sphere, and 0 (to rounding) on
-        create_torus and the fully creased box; the old bump was off by up
-        to 0.1 of the diagonal. 3 levels would avoid the resampling but
+        resampling error grows with the valence and runs from 0 (to
+        rounding: create_torus, the fully creased box) through 7e-5 of the
+        bounding-box diagonal (create_sphere), 1.1e-3 to 1.2e-3 (unit-cube
+        cages, four valence-3 vertices per face), 1.6e-3 (a valence-8 cap) and 1.7e-3
+        (an open grid, mostly tangential: its normal part is <= 8.5e-4) up
+        to 4.4e-3 at a valence-48 pole (2.0e-3 on the interior targets
+        alone); the last three were measured in review. The old bump was
+        off by up to 0.1 of the diagonal. 3 levels would avoid the resampling but
         costs ~5x the subdivision and limit evaluation (5000-quad torus
         cage: ~21 s vs ~104 s, on a conversion of ~50-120 s) and, at
         9 x 9, 2.25x the fitter's data equations, while the patch error of

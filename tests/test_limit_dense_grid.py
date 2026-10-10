@@ -1,7 +1,8 @@
 """R4: the no-reference NURBS conversion samples the TRUE limit surface.
 
 ``SubDToNURBSConverter.generate_patches`` without a reference mesh (the GUI
-"Convert to NURBS" path for SubD modelling) took its corners from
+"Convert to NURBS" path for SubD modelling, and the convert CLI's
+``--no-reference-fit``) took its corners from
 ``evaluate_limit_surface`` (crease-aware), but the dense data grid from
 ``_evaluate_dense_grid``: bilinear interpolation of the corner limit positions
 plus a bump of 0.025 * |c1 - c0| along the face normal at the centre. The bump
