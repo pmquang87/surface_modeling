@@ -444,12 +444,17 @@ def _base_converter_class():
 
 
 @pytest.mark.parametrize("continuity", ["G0", "G2"])
-def test_reference_path_is_bit_identical_to_base(monkeypatch, continuity):
+def test_reference_path_fitter_input_is_bit_identical_to_base(monkeypatch, continuity):
     """R4: with a reference mesh the dense samples come from projecting onto
-    it, as before. Expected: patches bit-identical to 1f93473's converter
-    (its source, run against the same fitter), and the limit sampling is
-    never called. Control: without the reference mesh the two converters do
-    differ, so the comparison can fail."""
+    it, as before. Expected: the FITTER INPUT of that path - each quad's
+    corners, dense samples and corner normals - is bit-identical to
+    1f93473's converter (its source, captured at G3Fitter.fit_surface), and
+    the limit sampling is never called. The fitted patches themselves are
+    not compared: later work changed the reference fit on purpose (control-
+    net fairing; no continuity rows across creased edges), and pinning them
+    to 1f93473 failed on exactly that. Control: without the reference mesh
+    the two converters' dense samples do differ, so the comparison can fail."""
+    from src.nurbs import g3_fitter
     Base = _base_converter_class()
     cage = create_box(subdivisions=1)
     for e in cage.edges[:6]:
@@ -460,18 +465,33 @@ def test_reference_path_is_bit_identical_to_base(monkeypatch, continuity):
     orig = SubDToNURBSConverter._limit_dense_grids
     monkeypatch.setattr(SubDToNURBSConverter, "_limit_dense_grids",
                         lambda self, *a, **k: calls.append(1) or orig(self, *a, **k))
-    new = SubDToNURBSConverter(continuity=continuity).generate_patches(
-        cage.copy(), reference_mesh=target)
-    old = Base(continuity=continuity).generate_patches(cage.copy(), reference_mesh=target)
+    seen = []
+    orig_fit = g3_fitter.G3Fitter.fit_surface
+
+    def spy(self, quad_mesh):
+        seen.append([{k: q[k] for k in ("corners", "dense_points", "corner_normals")}
+                     for q in quad_mesh])
+        return orig_fit(self, quad_mesh)
+
+    monkeypatch.setattr(g3_fitter.G3Fitter, "fit_surface", spy)
+
+    SubDToNURBSConverter(continuity=continuity).generate_patches(cage.copy(), reference_mesh=target)
+    Base(continuity=continuity).generate_patches(cage.copy(), reference_mesh=target)
     assert calls == []
+    new, old = seen
     assert len(new) == len(old) == len(cage.faces)
     for a, b in zip(new, old):
-        assert np.array_equal(a, b)
+        assert np.array_equal(np.asarray(a["corners"]), np.asarray(b["corners"]))
+        assert np.array_equal(a["dense_points"], b["dense_points"])
+        assert np.array_equal(np.asarray(a["corner_normals"]), np.asarray(b["corner_normals"]))
 
-    new_free = SubDToNURBSConverter(continuity=continuity).generate_patches(cage.copy())
-    old_free = Base(continuity=continuity).generate_patches(cage.copy())
+    seen.clear()
+    SubDToNURBSConverter(continuity=continuity).generate_patches(cage.copy())
+    Base(continuity=continuity).generate_patches(cage.copy())
     assert calls == [1]
-    assert max(np.abs(a - b).max() for a, b in zip(new_free, old_free)) > 1e-3
+    new_free, old_free = seen
+    assert max(np.abs(a["dense_points"] - b["dense_points"]).max()
+               for a, b in zip(new_free, old_free)) > 1e-3
 
 
 # --------------------------------------------------------------------------
