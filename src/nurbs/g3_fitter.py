@@ -1,6 +1,10 @@
 """
-G3 Continuous B-Spline Fitter
-Generates Degree 5 (6x6 control points) B-spline patches from quad regions.
+Degree-5 Bezier patch fitter for quad cages (6x6 control points per quad).
+
+The "G3" in the names is historical: neighbouring patches share their
+boundary curves (G0), and the optional cross-patch rows match only the third
+cross-boundary derivative - tangent (G1) and curvature (G2) continuity are
+not enforced. See G3Fitter.fit_surface for the equations.
 
 Pure numpy on purpose. The two kernels below used to carry
 ``@njit(fastmath=True, nogil=True)`` behind a silent
@@ -36,11 +40,11 @@ def _numba_compute_edge_control_points(p_start, p_end, d1_start, d1_end, d2):
     edge_pts[0] = p_start
     edge_pts[5] = p_end
 
-    # 1st derivative (G1) — independent end tangents
+    # end tangents (1st derivative of the boundary curve), independent
     edge_pts[1] = edge_pts[0] + d1_start / 5.0
     edge_pts[4] = edge_pts[5] - d1_end / 5.0
 
-    # 2nd derivative (G2)
+    # 2nd derivative of the boundary curve, one value for both ends
     edge_pts[2] = 2 * edge_pts[1] - edge_pts[0] + d2 / 20.0
     edge_pts[3] = 2 * edge_pts[4] - edge_pts[5] + d2 / 20.0
     return edge_pts
@@ -146,8 +150,8 @@ def _generate_single_patch(quad_data):
 class G3Fitter:
     def __init__(self, continuity_weight: float = 1000.0, fairing_weight: float = 0.0):
         """
-        Initialize the G3 Fitter for Degree 5 B-spline patches.
-        A degree 5 Bezier/B-spline patch requires a 6x6 grid of control points.
+        Fitter for degree-5 Bezier patches (a 6x6 grid of control points
+        per quad).
 
         continuity_weight: weight of the cross-boundary rows relative to the
         surface data rows (weight 1). 0 disables them. The rows match the
@@ -156,8 +160,9 @@ class G3Fitter:
 
         fairing_weight: weight of the control-net fairing rows (see
         fit_surface), dimensionless like continuity_weight. 0 (the default
-        here) gives the bare least-squares system; SubDToNURBSConverter uses
-        0.01 for every continuity level.
+        here) gives the bare least-squares system. SubDToNURBSConverter uses
+        0.01 at every continuity level when it fits a reference mesh and 0
+        without one; the value is tuned for its 6x6 sample grid.
         """
         self.degree = 5
         self.num_ctrl_pts = 6
@@ -202,10 +207,18 @@ class G3Fitter:
         the exact SuperLU solve (bug M1) removed that, and the clamp below
         had to reset 570 of 2152 patches at G0 and 44 at G1 on a real
         topology-optimisation part, and SolidWorks 2025 dropped one face of
-        its STEP (all 2152 import with fairing). The alternating mode has second differences
-        four times its amplitude while smooth bulges have small ones, so a
-        small weight (0.01) suppresses the runaway and keeps the fit: on that
-        part 0 resets and audit deviation mean 0.069 mm instead of 0.074.
+        its STEP (all 2152 import with fairing). The alternating mode has
+        second differences four times its amplitude while smooth bulges have
+        small ones, so a small weight (0.01) suppresses the runaway and keeps
+        the fit: on that part 0 resets and audit deviation mean 0.069 mm
+        instead of 0.074. Fairing is a bias, though: on clean samples it only
+        pulls curved patches flatter, which is why the converter uses it on
+        the (noisy) reference fit only.
+        The weight is tuned for the converter's 6x6 sample grid: the data
+        rows grow with the sample count while the 32 fairing rows per patch
+        do not, so the same weight is weaker on denser grids (max pole
+        change faired vs bare on a curved 5x4 grid: 4.4e-2 / 1.9e-2 /
+        8.4e-3 at 6 / 11 / 21 samples per side).
         The rows are homogeneous in the coordinates and their coefficients
         sum to zero, so the faired result moves with a rigid translation and
         scales with a uniform scaling of the input, like the data rows.
@@ -436,10 +449,14 @@ class G3Fitter:
                 if dx is not None and not np.all(np.isfinite(dx)):
                     dx = None
             if dx is None:
-                # Rank deficient (a patch without dense samples): lsqr's
-                # minimum-norm answer is the smallest change from Coons, not
-                # the point nearest the origin, and a variable that is in no
-                # equation keeps x0 exactly.
+                # A patch without dense samples: lsqr's minimum-norm answer is
+                # the smallest change from Coons, not the point nearest the
+                # origin. Without fairing the system is rank deficient and a
+                # variable that is in no equation keeps x0 exactly; with
+                # fairing every interior pole is in a fairing row, so a
+                # sample-less patch is determined by its fairing and
+                # continuity rows and does move off Coons wherever its Coons
+                # net has non-zero second differences.
                 dx = np.column_stack([spla.lsqr(A, r0[:, c])[0] for c in range(3)])
             sol = (x0 + dx).reshape(num_patches, 4, 4, 3)
             for k in range(num_patches):

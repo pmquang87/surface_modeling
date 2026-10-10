@@ -11,7 +11,9 @@ the G1 STEP.
 ``G3Fitter(fairing_weight=lam)`` adds, per patch, every second difference of
 the control net along u and v that touches an interior pole,
 ``lam * (P[i-1,j] - 2 P[i,j] + P[i+1,j]) = 0`` (and along j), and
-``SubDToNURBSConverter`` uses ``lam = 0.01`` for every continuity level.
+``SubDToNURBSConverter`` uses ``lam = 0.01`` at every continuity level when
+it fits a reference mesh (noisy projected samples) and 0 without one (clean
+limit-surface samples, where fairing would only cost fidelity).
 
 This file also pins the honest meaning of the levels: G0 adds no cross-patch
 row, G1, G2 and G3 add the same third-derivative rows (weights 5/20/50 that
@@ -187,26 +189,33 @@ def test_fairing_keeps_a_noisy_fit_bounded(level, amp, bare_weight):
     assert np.abs(patches[:, 1:5, 1:5] - coons).max() > 0.05
 
 
-def test_converter_fairs_every_level():
-    """fairing_weight 0.01 reaches the fitter at G0, G1, G2 and G3."""
+def test_converter_fairs_the_reference_fit_only():
+    """fairing_weight 0.01 reaches the fitter at G0, G1, G2 and G3 when a
+    reference mesh is fitted, 0.0 on the no-reference (SubD limit) path.
+    On 0447191 the no-reference path was faired too."""
     from src.subd.primitives import create_box
-    seen = []
+    seen = {'ref': [], 'noref': []}
+    current = []
 
     class Recording(G3Fitter):
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
-            seen.append(self.fairing_weight)
+            seen[current[-1]].append(self.fairing_weight)
 
     orig = g3.G3Fitter
     g3.G3Fitter = Recording
     try:
         for level in ('G0', 'G1', 'G2', 'G3'):
             with contextlib.redirect_stdout(io.StringIO()):
+                current.append('ref')
                 SubDToNURBSConverter(continuity=level).generate_patches(
                     create_box(), reference_mesh=create_box())
+                current.append('noref')
+                SubDToNURBSConverter(continuity=level).generate_patches(create_box())
     finally:
         g3.G3Fitter = orig
-    assert seen == [FAIR] * 4, seen
+    assert seen['ref'] == [FAIR] * 4, seen
+    assert seen['noref'] == [0.0] * 4, seen
 
 
 # ------------------------------------------------ exactness and invariance

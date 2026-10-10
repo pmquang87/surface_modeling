@@ -95,11 +95,18 @@ class SubDToNURBSConverter:
         # continuity is not enforced: hard C1 rows cost 24 % (mean) to 37 %
         # (p95) more audit deviation on that part and are left as a possible
         # later opt-in. The names stay accepted (scripts pass --continuity G1).
-        # fairing_weight 0.01, every level: damps the alternating pole modes
-        # the 6x6-sample fit cannot see (G3Fitter.fit_surface docstring).
+        # Fairing (G3Fitter.fit_surface docstring) only on the reference fit,
+        # at every level: projected scan/STL samples are noisy, and 0.01
+        # damps the pole oscillations the 6x6-sample fit cannot see (real
+        # part: 44 -> 0 Coons resets, SolidWorks-validated). Without a
+        # reference the samples are clean limit-surface points, nothing runs
+        # away, and fairing only costs fidelity (mean interior error vs the
+        # limit surface +3 % on create_torus up to +21..25 % on create_box /
+        # create_cylinder, measured on the exact-limit dense grid), so it is
+        # off there.
         continuity_weights = {'G0': 0.0, 'G1': 5.0, 'G2': 20.0, 'G3': 50.0}
         fitter = G3Fitter(continuity_weight=continuity_weights.get(self.continuity, 20.0),
-                          fairing_weight=0.01)
+                          fairing_weight=0.01 if ref_tm is not None else 0.0)
 
         quad_faces = [f for f in mesh.faces if len(mesh.get_face_vertices(f)) == 4]
         face_to_idx = {f.index: idx for idx, f in enumerate(quad_faces)}
