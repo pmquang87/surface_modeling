@@ -35,9 +35,12 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
       2. exact unsigned distance (chunked closest-point queries) only inside
          ``exact_band`` -- the region whose values marching cubes will read,
       3. sign from a voxel flood fill: cells the surface crosses are walls,
-         the component reachable from the padded corner is outside, enclosed
-         components are inside. Near-surface cells sign by the nearest
-         sample's normal. This stays correct at thin features where pure
+         the component reachable from the padded corner is outside, and each
+         enclosed component is signed as a whole by a vote of its cells'
+         exact nearest-triangle sides -- enclosed is not the same as inside
+         (the void of a hollow solid, a cavity behind a vent narrower than
+         the wall cells). Near-surface cells sign by the exact nearest
+         triangle's normal. This stays correct at thin features where pure
          normal-based signing is ambiguous.
 
     Args:
@@ -119,11 +122,15 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
             exact_tri[s:s + chunk] = tri
         d_est[refine_mask] = exact
 
+    def _exact_side():
+        """(p - closest) . normal of the exact nearest triangle, per refined
+        point: positive on its +normal side."""
+        normals = tmesh.face_normals[exact_tri]
+        return np.einsum('ij,ij->i', refine_pts - exact_closest, normals)
+
     def _exact_normal_sign():
         """Sign for the refined points from the exact nearest triangle."""
-        normals = tmesh.face_normals[exact_tri]
-        side = np.einsum('ij,ij->i', refine_pts - exact_closest, normals)
-        return np.where(side < 0.0, -1.0, 1.0)
+        return np.where(_exact_side() < 0.0, -1.0, 1.0)
 
     if open_surface:
         # Sheets have no enclosure: sign by the nearest facet's normal —
@@ -141,20 +148,43 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
     # 3. Sign by voxel flood fill.
     d_grid = d_est.reshape((nx, ny, nz))
     wall = d_grid < (voxel_size * 0.87 + sampling_err)  # cells the surface crosses
-    labels, _ = ndimage.label(~wall)
+    labels, n_labels = ndimage.label(~wall)
     outside_label = labels[0, 0, 0]  # padded corner is always outside
     if outside_label == 0:
         raise RuntimeError(
             "SDF sign classification failed: the padded grid corner lies in a "
             "surface-crossing cell; increase resolution or padding.")
-    sign_flat = np.where(labels == outside_label, 1.0, -1.0).ravel()
+
+    # Enclosed is not inside: the void of a hollow solid, or a cavity behind a
+    # vent narrower than the wall cells, is sealed off by wall cells yet is
+    # air. The surface never passes between two face-adjacent non-wall cells
+    # (a crossing would put one of them within half a voxel of it), so each
+    # component lies on ONE side of the surface: sign it by a vote of its
+    # refined cells' exact nearest-triangle sides -- the crease-robust test
+    # the wall cells use below -- each weighted by the cosine between
+    # (p - closest) and the normal, so near-ties at edges and vertices count
+    # for little and a few flipped triangles cannot outvote the rest. A
+    # component touching the grid border is outside; one without votes stays
+    # inside.
+    labels_flat = labels.ravel()
+    comp_sign = np.full(n_labels + 1, -1.0)
+    if len(refine_pts):
+        side = _exact_side()
+        cosine = side / np.maximum(exact, 1e-300)
+        votes = np.bincount(labels_flat[refine_mask], weights=cosine,
+                            minlength=n_labels + 1)
+        comp_sign[votes > 0.0] = 1.0
+    comp_sign[labels[[0, -1]]] = 1.0
+    comp_sign[labels[:, [0, -1]]] = 1.0
+    comp_sign[labels[:, :, [0, -1]]] = 1.0
+    sign_flat = comp_sign[labels_flat]
 
     # Near-surface (wall) cells: enclosure says nothing — they ARE the wall.
     # Sign them from the exact nearest triangle; every wall cell lies inside
     # the refine band (wall threshold < refine threshold for any band >= 0).
     if len(refine_pts):
         wall_flat = wall.ravel()
-        exact_sign = _exact_normal_sign()
+        exact_sign = np.where(side < 0.0, -1.0, 1.0)
         wall_in_refine = wall_flat[refine_mask]
         refined_sign_full = sign_flat[refine_mask]
         refined_sign_full[wall_in_refine] = exact_sign[wall_in_refine]
