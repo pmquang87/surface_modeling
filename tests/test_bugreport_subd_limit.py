@@ -4,14 +4,20 @@ automated bug hunt on commit 4e2241347de43175401df20c6722f38fa70820b4.
 Covers:
   H1 (cand 2)   the OpenCL limit kernel `compute_limit_surface` used the
                 one-step vertex-point rule instead of the limit position
+  H5 (cand 11)  catmull_clark.evaluate_limit_surface ignored crease weights
+  cand 12       _subdivide_once gave a dart (an interior vertex with exactly one
+                creased edge) the corner rule and pinned it in place; the
+                standard dart rule is the smooth vertex rule
 
 pyopencl is not installed here, so the H1 tests stub ONLY pyopencl: the stub's
 Program compiles the kernel source string OpenCLSubdivider hands it (the
 repo's own CL_KERNEL_SOURCE) with gcc behind a small C shim and runs every
 work item on the CPU. They skip cleanly when gcc is missing.
 
-Limit positions are checked against the closed-form bicubic B-spline stencil
-and against the CPU path, catmull_clark.evaluate_limit_surface.
+Limit positions are checked against independent authorities: the closed-form
+bicubic B-spline / cubic B-spline stencils where they apply, and otherwise the
+subdivision itself (the original vertex i keeps index i through every pass of
+_subdivide_once, so its position after k passes converges to its limit).
 """
 import ctypes
 import hashlib
@@ -398,3 +404,193 @@ def test_h1_fixtures_cover_interior_valences_3_to_6():
     assert {3, 4, 5, 6} <= seen, f"interior valences covered: {sorted(seen)}"
     grid = H1_MESHES['bent_grid']()
     assert any(grid.is_boundary_vertex(v) for v in grid.vertices)
+
+
+# ---------------------------------------------------------------------------
+# H5 (cand 11): the limit must honour crease weights
+# ---------------------------------------------------------------------------
+
+def test_h5_fully_creased_box_keeps_its_corners():
+    """H5 (cand 11): every corner of create_box() with all crease weights 1.0
+    has three sharp edges, so _subdivide_once pins it (corner rule) and its
+    limit is the cage corner itself, e.g. (-0.5, -0.5, -0.5); the smooth
+    stencil gave (-0.25, -0.25, -0.25)."""
+    box = creased_box(all_edges=1.0)
+    cage = np.array([v.position for v in box.vertices])
+    # Precondition, straight from the subdivision: the corners never move.
+    for level in deep_positions(box, 3):
+        assert np.array_equal(level, cage), "the corner rule no longer pins the corners"
+
+    limit, normals = evaluate_limit_surface(box)
+    assert np.allclose(limit[0], [-0.5, -0.5, -0.5], atol=1e-12), f"corner 0 limit {limit[0]}"
+    assert np.allclose(limit, cage, atol=1e-12), \
+        f"largest corner error {np.abs(limit - cage).max():.3e}"
+    assert np.allclose(np.linalg.norm(normals, axis=1), 1.0)
+
+    # Control: without the creases the same corners do move inwards.
+    smooth, _ = evaluate_limit_surface(create_box())
+    assert np.allclose(smooth[0], [-0.25, -0.25, -0.25], atol=1e-12)
+
+
+def test_h5_creased_loop_follows_the_cubic_bspline_limit():
+    """H5 (cand 11): a vertex with exactly two sharp edges follows the crease
+    curve, a uniform cubic B-spline, so its limit is (a + 4 P + b) / 6 with a, b
+    its crease neighbours. Vertices without any creased edge keep the smooth
+    limit. Checked on a jittered box with the back loop creased."""
+    box = creased_box(BACK_LOOP, 1.0, seed=3)
+    limit, _ = evaluate_limit_surface(box)
+
+    for v_idx in range(4):
+        crease = [e for e in incident_edges(box, v_idx) if e.crease_weight > 0]
+        assert len(crease) == 2
+        a, b = (box.vertices[other_end(e, v_idx)].position for e in crease)
+        expected = (a + 4.0 * box.vertices[v_idx].position + b) / 6.0
+        assert np.allclose(limit[v_idx], expected, atol=1e-12), \
+            f"crease vertex {v_idx}: {limit[v_idx]} != B-spline limit {expected}"
+        # the smooth stencil is far from it, so the check above is not vacuous
+        assert np.linalg.norm(smooth_limit(box, v_idx) - expected) > 0.05
+
+    for v_idx in range(4, 8):
+        assert all(e.crease_weight == 0 for e in incident_edges(box, v_idx))
+        assert np.allclose(limit[v_idx], smooth_limit(box, v_idx), atol=1e-12)
+
+
+def test_h5_three_crease_corner_next_to_crease_vertices():
+    """H5 (cand 11): two creased loops joined by one creased edge. Vertices 0
+    and 4 have three sharp edges and stay in place; the other six have two and
+    take the cubic B-spline limit along their own loop."""
+    box = creased_box(BACK_LOOP + FRONT_LOOP + [(0, 4)], 1.0, seed=5)
+    limit, _ = evaluate_limit_surface(box)
+    for v_idx in range(8):
+        P = box.vertices[v_idx].position
+        crease = [e for e in incident_edges(box, v_idx) if e.crease_weight > 0]
+        if v_idx in (0, 4):
+            assert len(crease) == 3
+            assert np.allclose(limit[v_idx], P, atol=1e-12), f"corner {v_idx} moved"
+        else:
+            assert len(crease) == 2
+            a, b = (box.vertices[other_end(e, v_idx)].position for e in crease)
+            assert np.allclose(limit[v_idx], (a + 4.0 * P + b) / 6.0, atol=1e-12), \
+                f"crease vertex {v_idx}: {limit[v_idx]}"
+
+
+H5_CONFIGS = {
+    'smooth': lambda: creased_box(seed=11),
+    'all_sharp': lambda: creased_box(all_edges=1.0, seed=11),
+    'loop': lambda: creased_box(BACK_LOOP, 1.0, seed=11),
+    'mixed_corner': lambda: creased_box(BACK_LOOP + FRONT_LOOP + [(0, 4)], 1.0, seed=11),
+    'dart': lambda: creased_box([(0, 1)], 1.0, seed=11),
+    'all_half': lambda: creased_box(all_edges=0.5, seed=11),
+    'mixed_weights': lambda: _mixed_weight_box(),
+}
+
+
+def _mixed_weight_box():
+    box = creased_box(BACK_LOOP, 1.0, seed=11)
+    edge_between(box, 0, 4).crease_weight = 0.3     # fractional, 3-crease vertex 0
+    edge_between(box, 2, 6).crease_weight = 2.5     # > 1 acts as fully sharp
+    edge_between(box, 5, 6).crease_weight = 0.7     # fractional dart at 5
+    return box
+
+
+@pytest.mark.parametrize('name', sorted(H5_CONFIGS))
+def test_h5_limit_is_invariant_under_subdivision(name):
+    """H5 (cand 11): the limit of vertex i must not depend on how often the
+    cage was refined: L(M)[i] == L(subdivide(M))[i]. Any stencil that is not
+    the true limit of _subdivide_once's rules (the smooth stencil on a creased
+    vertex included) drifts here."""
+    mesh = H5_CONFIGS[name]()
+    nv = len(mesh.vertices)
+    fine = subdivide(mesh, 1)
+    assert len(fine.vertices) == nv + len(mesh.edges) + len(mesh.faces)
+    here, _ = evaluate_limit_surface(mesh)
+    finer, _ = evaluate_limit_surface(fine)
+    finest, _ = evaluate_limit_surface(subdivide(fine, 1))
+    drift = max(np.abs(here - finer[:nv]).max(), np.abs(here - finest[:nv]).max())
+    assert drift < 1e-12, f"{name}: limit drifted by {drift:.3e} under refinement"
+
+
+@pytest.mark.parametrize('name', sorted(H5_CONFIGS))
+def test_h5_limit_matches_deep_subdivision(name):
+    """H5 (cand 11): the reported limit is where the subdivision really goes.
+    The residual |P_k - L| after k passes must shrink geometrically towards
+    zero; a wrong limit leaves it on a plateau."""
+    mesh = H5_CONFIGS[name]()
+    limit, _ = evaluate_limit_surface(mesh)
+    levels = deep_positions(mesh, 6)
+    errors = [float(np.abs(p - limit).max()) for p in levels]
+    for a, b in zip(errors[1:], errors[2:]):
+        assert b <= 0.6 * a + 1e-13, f"{name}: residual stopped shrinking: {errors}"
+    assert errors[-1] < 1e-3, f"{name}: residual did not vanish: {errors}"
+
+
+def test_h5_sharpness_above_one_is_the_same_as_one():
+    """H5 (cand 11): _subdivide_once clips every weight to [0, 1] and passes it
+    on unchanged, so 2.5 is as sharp as 1.0 for ever; the limit must agree."""
+    a = creased_box(BACK_LOOP, 1.0, seed=2)
+    b = creased_box(BACK_LOOP, 2.5, seed=2)
+    assert np.allclose(np.array([v.position for v in subdivide(a, 2).vertices]),
+                       np.array([v.position for v in subdivide(b, 2).vertices]))
+    la, _ = evaluate_limit_surface(a)
+    lb, _ = evaluate_limit_surface(b)
+    assert np.allclose(la, lb, atol=1e-12)
+    # and the weight is not ignored altogether
+    smooth, _ = evaluate_limit_surface(creased_box(seed=2))
+    assert np.abs(la - smooth).max() > 0.05
+
+
+# ---------------------------------------------------------------------------
+# cand 12: a dart vertex uses the smooth vertex rule
+# ---------------------------------------------------------------------------
+
+def test_cand12_dart_vertex_uses_the_smooth_rule():
+    """cand 12: an interior vertex with exactly one creased edge (a dart)
+    takes the smooth vertex rule (Hoppe et al. 1994; DeRose, Kass & Truong
+    1998), so the crease fades out at its end instead of pinning a cone point
+    into the surface. The creased edge itself keeps its sharp edge rule, and
+    two- and three-crease vertices keep the crease and corner rules."""
+    box = creased_box([(0, 1)], 1.0, seed=4)
+    for v_idx in (0, 1):
+        assert sum(e.crease_weight > 0 for e in incident_edges(box, v_idx)) == 1
+        assert not box.is_boundary_vertex(box.vertices[v_idx])
+    out = subdivide(box, 1)
+
+    for v_idx in (0, 1):
+        P = box.vertices[v_idx].position
+        expected = smooth_vertex_rule(box, v_idx)
+        assert np.linalg.norm(expected - P) > 0.1     # the rules really differ
+        assert np.allclose(out.vertices[v_idx].position, expected, atol=1e-12), (
+            f"dart {v_idx} at {out.vertices[v_idx].position}, smooth rule gives "
+            f"{expected}, cage {P}")
+
+    # the creased edge is still subdivided at its midpoint
+    e = edge_between(box, 0, 1)
+    mid = (box.vertices[0].position + box.vertices[1].position) / 2.0
+    assert np.allclose(out.vertices[len(box.vertices) + e.index].position, mid, atol=1e-12)
+
+    # fractional dart: still the smooth rule, the weight does not blend a pin in
+    half = creased_box([(0, 1)], 0.5, seed=4)
+    out_half = subdivide(half, 1)
+    assert np.allclose(out_half.vertices[0].position, smooth_vertex_rule(half, 0), atol=1e-12)
+
+    # controls: crease and corner rules untouched
+    loop = creased_box(BACK_LOOP + [(0, 4)], 1.0, seed=4)
+    out_loop = subdivide(loop, 1)
+    assert np.allclose(out_loop.vertices[0].position, loop.vertices[0].position, atol=1e-12)
+    P, a, b = (loop.vertices[i].position for i in (1, 0, 2))
+    assert np.allclose(out_loop.vertices[1].position, (6.0 * P + a + b) / 8.0, atol=1e-12)
+
+
+def test_cand12_boundary_vertex_with_one_crease_keeps_the_corner_rule():
+    """cand 12 scope: a boundary vertex with one creased interior edge already
+    has three sharp edges (two boundary edges + the crease), so the corner rule
+    is the standard one there and must not change."""
+    plane = create_plane(subdivisions_x=2, subdivisions_y=2)
+    # vertex 1 sits on the boundary; its edge to the centre vertex 4 is interior
+    v = plane.vertices[1]
+    assert plane.is_boundary_vertex(v) and not plane.is_boundary_vertex(plane.vertices[4])
+    e = edge_between(plane, 1, 4)
+    assert not plane.is_boundary_edge(e)
+    e.crease_weight = 1.0
+    out = subdivide(plane, 1)
+    assert np.allclose(out.vertices[1].position, v.position, atol=1e-12)
