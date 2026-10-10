@@ -56,11 +56,16 @@ class _Progress:
         self("WARNING: " + msg)
 
 
+@contextlib.contextmanager
 def _library_output_to_stderr(quiet: bool):
     """Library modules still ``print()`` progress; keep stdout for RESULT."""
     if quiet:
-        return contextlib.redirect_stdout(open(os.devnull, "w"))
-    return contextlib.redirect_stdout(sys.stderr)
+        # close the sink afterwards: an unclosed devnull leaked per quiet run
+        with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink):
+            yield
+    else:
+        with contextlib.redirect_stdout(sys.stderr):
+            yield
 
 
 def convert(input_path: str, output_path: str, target_faces: int = 2000,

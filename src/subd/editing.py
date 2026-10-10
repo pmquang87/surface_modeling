@@ -268,10 +268,22 @@ def insert_edge_loop(mesh: HalfEdgeMesh, edge_index: int, position: float = 0.5)
 def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: list[int]) -> HalfEdgeMesh:
     """Delete both face groups and connect their boundary edges with new quad faces.
 
-    If the two groups do not present matching boundary loops there is nothing to
-    bridge, and the mesh is returned untouched. Deleting the faces first — as the
-    old code did — punched two permanent holes in the model whenever the bridge
-    could not be built.
+    If the bridge cannot be built cleanly, the mesh is returned untouched (a
+    copy). Deleting the faces first — as the old code did — punched two
+    permanent holes in the model whenever the bridge could not be built. The
+    request is refused when:
+
+    * the two groups do not present matching simple boundary loops;
+    * the groups overlap (share a face, also through index aliases such as -1);
+    * a new side quad would walk a directed edge that a kept face or another
+      side quad already walks (e.g. opposite faces of a box, whose side quads
+      would land on the existing walls);
+    * a vertex of either loop would end up non-manifold: two or more separate
+      face fans (groups touching at a single corner give a bow-tie vertex and
+      back-to-back side triangles), or no face at all (groups sharing a chain
+      of boundary edges collapse it, orphaning its inner vertices and leaving
+      zero-area or folded side faces). Vertices inside a group, off both
+      loops, are dropped from the surface as usual.
     """
     verts = [v.position.copy() for v in mesh.vertices]
 
@@ -317,6 +329,9 @@ def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: 
 
     face_indices_a = _valid_indices(face_indices_a, len(mesh.faces))
     face_indices_b = _valid_indices(face_indices_b, len(mesh.faces))
+    # A face in both groups would be deleted once but bridged from twice.
+    if set(face_indices_a) & set(face_indices_b):
+        return mesh.copy()
     loop_a = get_boundary_loop(set(face_indices_a))
     loop_b = get_boundary_loop(set(face_indices_b))
 
@@ -340,14 +355,77 @@ def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: 
 
     loop_b_aligned = loop_b[best_shift:] + loop_b[:best_shift]
 
+    # A side quad that walks a directed edge some face already walks makes the
+    # result non-manifold with holes. This also catches a side quad landing on
+    # a face we keep (opposite faces of a box: the four side quads ARE the four
+    # walls): wound the same way it repeats all four of the wall's edges, wound
+    # the other way its neighbouring side quad repeats a wall edge. Check every
+    # side quad as add_face will build it before committing to the bridge.
+    used = {(fv[i], fv[(i + 1) % len(fv)]) for fv in faces for i in range(len(fv))}
+    new_faces, new_polys = [], []
     for i in range(n):
         v1 = loop_a[i]
         v2 = loop_a[(i + 1) % n]
         v3 = loop_b_aligned[(i + 1) % n]
         v4 = loop_b_aligned[i]
-        faces.append([v1, v2, v3, v4])
+        quad = [v1, v2, v3, v4]
+        # add_face drops repeated consecutive corners (groups sharing an edge
+        # or a corner); a quad left with < 3 corners is not built at all.
+        poly = [v for k, v in enumerate(quad) if v != quad[k - 1]]
+        if len(poly) < 3:
+            continue
+        for k in range(len(poly)):
+            e = (poly[k], poly[(k + 1) % len(poly)])
+            if e in used:
+                return mesh.copy()
+            used.add(e)
+        new_faces.append(quad)
+        new_polys.append(poly)
 
-    return HalfEdgeMesh.from_arrays(verts, faces)
+    # Groups touching at a single corner pass the edge check but pinch the
+    # result: the shared vertex keeps two separate face fans (a bow-tie), and
+    # the collapsed side triangles lie back-to-back on the kept faces. A loop
+    # vertex must end up with exactly one fan. None means it was orphaned:
+    # groups sharing a chain of boundary edges collapse the chain, and the
+    # side faces built around it are folded or of zero area.
+    fans = _fan_counts(faces + new_polys, set(loop_a) | set(loop_b))
+    if any(c != 1 for c in fans.values()):
+        return mesh.copy()
+
+    return HalfEdgeMesh.from_arrays(verts, faces + new_faces)
+
+
+def _fan_counts(faces: list[list[int]], vertex_ids) -> dict[int, int]:
+    """Number of separate face fans around each vertex in ``vertex_ids``.
+
+    Two faces at a vertex are in the same fan when they share an edge out of
+    that vertex. A manifold vertex has one fan; a bow-tie (pinched) vertex has
+    two or more; an unused vertex has none.
+    """
+    corners = {v: [] for v in vertex_ids}
+    for fv in faces:
+        for k, v in enumerate(fv):
+            if v in corners:
+                corners[v].append((fv[k - 1], fv[(k + 1) % len(fv)]))
+    counts = {}
+    for v, cs in corners.items():
+        parent = list(range(len(cs)))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        first_at = {}
+        for i, (prev_v, next_v) in enumerate(cs):
+            for u in (prev_v, next_v):
+                if u in first_at:
+                    parent[find(i)] = find(first_at[u])
+                else:
+                    first_at[u] = i
+        counts[v] = len({find(i) for i in range(len(cs))})
+    return counts
 
 
 def mirror_mesh(mesh: HalfEdgeMesh, axis: str = 'x', merge_distance: float = 0.001) -> HalfEdgeMesh:

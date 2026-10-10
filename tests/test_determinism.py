@@ -8,8 +8,9 @@ except ImportError: <no-op decorator>``.  numba is not in
 ``requirements.txt`` but *is* installed on the maintainer's machine, so the
 documented install and the maintainer's runs executed different arithmetic:
 ``fastmath`` reassociates the Coons blend, the two kernels drift by ~1e-13,
-and the ill-conditioned ``lsqr`` solve downstream amplifies that to ~0.35 mm
-on interior control points.  Two people running the same command on the same
+and the ill-conditioned least-squares solve downstream (``lsqr`` then, a
+SuperLU ``splu`` solve since bug M1) amplifies that to ~0.35 mm on interior
+control points.  Two people running the same command on the same
 STL got STEP files that differ in the third decimal of the reported
 deviation.
 
@@ -466,8 +467,10 @@ def test_convert_twice_in_one_process_differs_only_in_the_occ_product_counter(ca
             print(f"[determinism] in-process run 1: {t1 - t0:.2f} s, "
                   f"run 2: {t2 - t1:.2f} s")
 
-        a = canonical_step_text(open(out1, encoding="utf-8").read()).splitlines()
-        b = canonical_step_text(open(out2, encoding="utf-8").read()).splitlines()
+        with open(out1, encoding="utf-8") as fh:
+            a = canonical_step_text(fh.read()).splitlines()
+        with open(out2, encoding="utf-8") as fh:
+            b = canonical_step_text(fh.read()).splitlines()
         assert len(a) == len(b), (
             f"line counts differ: {len(a)} vs {len(b)} - that is a real "
             "geometry/topology drift, not the PRODUCT counter")
@@ -494,8 +497,10 @@ def test_reproducibility_check_fails_on_a_fastmath_scale_kernel_drift(monkeypatc
 
     ``@njit(fastmath=True)`` reassociates the arithmetic in the two kernels,
     which moves their results by ~1e-13 relative. Perturb the edge kernel by
-    that much on the second run only: the ill-conditioned ``lsqr`` solve in
-    ``fit_surface`` amplifies it, and the two STEP files must come out
+    that much on the second run only: the ill-conditioned least-squares fit
+    in ``fit_surface`` (since bug M1 a direct SuperLU ``splu`` solve of the
+    normal equations, cond(A) ~ 1e4-1e5) amplifies it, and the two STEP files
+    must come out
     different. If this test passes trivially, the reproducibility tests above
     are measuring nothing.
     """
@@ -529,8 +534,10 @@ def test_reproducibility_check_fails_on_a_fastmath_scale_kernel_drift(monkeypatc
         # precondition: the patched kernel really was the one in use
         assert state["calls"] > 100, f"kernel called only {state['calls']} times"
 
-        a = canonical_step_text(open(outs[0], encoding="utf-8").read()).splitlines()
-        b = canonical_step_text(open(outs[1], encoding="utf-8").read()).splitlines()
+        with open(outs[0], encoding="utf-8") as fh:
+            a = canonical_step_text(fh.read()).splitlines()
+        with open(outs[1], encoding="utf-8") as fh:
+            b = canonical_step_text(fh.read()).splitlines()
         differing = [(i, x, y) for i, (x, y) in enumerate(zip(a, b)) if x != y]
         offending = _offending(differing)
         with capsys.disabled():
@@ -631,7 +638,8 @@ def test_g3_fitter_has_no_numba_dependency():
         "numba / njit is back in src/nurbs/g3_fitter.py. It makes the "
         "maintainer's runs differ from a clean `pip install -r "
         "requirements.txt` (numba is not in it), and fastmath moves interior "
-        "control points by ~0.35 mm through the lsqr solve. (Any decorator "
+        "control points by ~0.35 mm through the ill-conditioned fit "
+        "(measured with the old lsqr solve). (Any decorator "
         "counts - see _numba_offenders.) Offenders: " + repr(offenders)
     )
 
