@@ -262,6 +262,14 @@ class PowerSurfacingMainWindow(QMainWindow):
         """Public method to log a message to the GUI log panel."""
         print(message)  # goes through LogStream → _append_log
 
+    def _has_mesh(self):
+        """True when there is a mesh with at least one face to work on.
+
+        File > New leaves an empty HalfEdgeMesh, which is truthy, so the tools
+        must not test the object itself.
+        """
+        return self.current_mesh is not None and len(self.current_mesh.faces) > 0
+
     @staticmethod
     def _mesh_geometry_key(mesh):
         """Digest of what a B-rep built from `mesh` depends on: vertex
@@ -693,7 +701,7 @@ class PowerSurfacingMainWindow(QMainWindow):
             self.status_bar.showMessage(f"Error loading reference: {e}")
 
     def on_export(self):
-        if not self.current_mesh:
+        if not self._has_mesh():
             QMessageBox.warning(self, "Export", "No mesh to export.")
             return
         dlg = ExportDialog(self)
@@ -780,7 +788,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                 QMessageBox.warning(self, "Error", "Backend modules (primitives) not available.")
 
     def on_subdivide(self):
-        if not self.current_mesh:
+        if not self._has_mesh():
             QMessageBox.information(self, "Subdivide", "No mesh loaded. Load or create a mesh first.")
             return
         dlg = SubdivideDialog(self)
@@ -805,7 +813,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                 QMessageBox.warning(self, "Error", "Subdivision backend not available.")
 
     def on_shell(self):
-        if not self.current_mesh:
+        if not self._has_mesh():
             QMessageBox.information(self, "Shell/Thicken", "No mesh loaded.")
             return
         dlg = ShellThickenDialog(self)
@@ -829,7 +837,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                 QMessageBox.warning(self, "Error", "Shell/Thicken backend not available.")
 
     def on_convert_nurbs(self):
-        if not self.current_mesh:
+        if not self._has_mesh():
             QMessageBox.information(self, "NURBS", "No mesh loaded.")
             return
         dlg = ConvertNURBSDialog(self)
@@ -886,7 +894,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                 QMessageBox.warning(self, "Error", "NURBS converter not available.")
 
     def on_quad_wrap(self):
-        if not self.current_mesh:
+        if not self._has_mesh():
             QMessageBox.information(self, "Quad Wrap", "No mesh loaded.")
             return
         dlg = QuadWrapDialog(self)
@@ -939,7 +947,7 @@ class PowerSurfacingMainWindow(QMainWindow):
         return sorted(vert_set)
 
     def on_remove_sliver_edges(self):
-        if not self.current_mesh:
+        if not self._has_mesh():
             QMessageBox.information(self, "Remove Sliver Edges", "No mesh loaded.")
             return
         if not remove_sliver_edges:
@@ -976,7 +984,7 @@ class PowerSurfacingMainWindow(QMainWindow):
             self.log(f"ERROR: Sliver removal failed: {e}")
 
     def on_shrink_wrap(self):
-        if not self.current_mesh:
+        if not self._has_mesh():
             QMessageBox.information(self, "Shrink Wrap", "No mesh loaded.")
             return
 

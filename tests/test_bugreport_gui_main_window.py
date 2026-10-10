@@ -485,3 +485,68 @@ def test_m20_zero_patch_conversion_drops_the_old_shape(env, monkeypatch, tmp_pat
     assert written['step'] == []
     warnings = box.texts('warning')
     assert len(warnings) == 1 and 'Convert to NURBS' in warnings[0], box.shown
+
+
+# --------------------------------------------------------------------------
+# Suspicion on_new - the empty mesh passes the "No mesh loaded" guards
+# --------------------------------------------------------------------------
+
+def test_on_new_then_obj_export_writes_no_empty_file(env, monkeypatch, tmp_path):
+    """Suspicion S:on_new: after File > New the mesh is empty. Export OBJ must
+    say "No mesh to export." and write no file (it used to write a 0-byte
+    .obj and log "Exported to")."""
+    win, box, written = env
+    from src.io.exporters import export_obj as real_export_obj
+    monkeypatch.setattr(mw, 'export_obj', real_export_obj)
+    win.on_new()
+    assert isinstance(win.current_mesh, HalfEdgeMesh)
+    assert len(win.current_mesh.faces) == 0 and len(win.current_mesh.vertices) == 0
+
+    out = tmp_path / 'empty.obj'
+    _set_export(monkeypatch, 'OBJ', out)
+    win.on_export()
+    assert not out.exists(), "an empty OBJ file was written"
+    assert box.texts('warning') == ['No mesh to export.'], box.shown
+
+
+def test_on_new_then_obj_export_control_with_a_real_mesh(env, monkeypatch, tmp_path):
+    """S:on_new control: with a real mesh the same OBJ export path writes a
+    file with 8 vertices and 6 faces."""
+    win, box, written = env
+    from src.io.exporters import export_obj as real_export_obj
+    monkeypatch.setattr(mw, 'export_obj', real_export_obj)
+    win.current_mesh = _box_mesh()
+    out = tmp_path / 'box.obj'
+    _set_export(monkeypatch, 'OBJ', out)
+    win.on_export()
+    lines = out.read_text().splitlines()
+    assert sum(l.startswith('v ') for l in lines) == 8
+    assert sum(l.startswith('f ') for l in lines) == 6
+
+
+@pytest.mark.parametrize('handler,title', [
+    ('on_subdivide', 'Subdivide'),
+    ('on_shell', 'Shell/Thicken'),
+    ('on_convert_nurbs', 'NURBS'),
+    ('on_quad_wrap', 'Quad Wrap'),
+    ('on_remove_sliver_edges', 'Remove Sliver Edges'),
+    ('on_shrink_wrap', 'Shrink Wrap'),
+])
+def test_on_new_mesh_is_treated_as_no_mesh_by_every_tool(env, monkeypatch, handler, title):
+    """S:on_new: every tool guarded by "No mesh loaded" must stop on the empty
+    mesh left by File > New, before opening its dialog or calling a backend."""
+    win, box, written = env
+
+    def no_dialog(*a, **k):
+        raise AssertionError(f"{handler} opened a dialog on an empty mesh")
+    for name in ('SubdivideDialog', 'ShellThickenDialog', 'ConvertNURBSDialog',
+                 'QuadWrapDialog', 'ShrinkWrapDialog'):
+        monkeypatch.setattr(mw, name, no_dialog)
+    monkeypatch.setattr(mw, 'remove_sliver_edges', no_dialog)
+
+    win.on_new()
+    assert len(win.current_mesh.faces) == 0
+    getattr(win, handler)()
+    infos = [(t, x) for k, t, x in box.shown if k == 'information']
+    assert len(infos) == 1 and infos[0][0] == title, box.shown
+    assert 'No mesh loaded' in infos[0][1]
