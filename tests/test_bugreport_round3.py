@@ -494,3 +494,26 @@ def test_r2_side_quad_on_an_existing_reversed_wall_is_refused():
     walled = HalfEdgeMesh.from_arrays(pts, [[0, 1, 2, 3], [7, 6, 5, 4], [4, 5, 1, 0]])
     out = bridge_faces(walled, [0], [1])
     assert _same(out, walled), _faces(out)
+
+
+def test_r3_quiet_redirect_closes_its_devnull_sink():
+    """R3c (test hygiene, found while closing the determinism test's files):
+    ``convert._library_output_to_stderr(quiet=True)`` redirected stdout into
+    ``open(os.devnull, "w")`` and never closed it, so every quiet conversion
+    leaked a file handle (ResourceWarning under ``python -X dev``). Expected:
+    the sink is closed when the block ends, and the non-quiet branch still
+    sends library output to stderr."""
+    from src import convert as convert_mod
+
+    before = sys.stdout
+    with convert_mod._library_output_to_stderr(True):
+        sink = sys.stdout
+        # precondition: inside the block stdout really is the devnull sink
+        assert sink is not before and getattr(sink, "name", None) == os.devnull
+        assert not sink.closed
+    assert sys.stdout is before
+    assert sink.closed, "the devnull sink was left open"
+
+    with convert_mod._library_output_to_stderr(False):
+        assert sys.stdout is sys.stderr
+    assert sys.stdout is before
