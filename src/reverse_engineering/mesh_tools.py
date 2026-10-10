@@ -596,7 +596,10 @@ def collapse_short_edges(t_mesh: 'trimesh.Trimesh',
     faces. Anything else pinches the surface into non-manifold junk,
     boundary edges or loose scraps, which later surface as free edges in the
     sewn B-Rep. Link-violating short edges are left alone (the cage-level
-    edge stretcher deals with them geometrically).
+    edge stretcher deals with them geometrically). On an open mesh an
+    interior edge whose two endpoints both lie on the boundary is left
+    alone as well: it passes the link condition, but merging it pinches the
+    boundary into a bowtie vertex.
     """
     threshold = None
     for _ in range(max_rounds):
@@ -626,6 +629,11 @@ def collapse_short_edges(t_mesh: 'trimesh.Trimesh',
                 key = (u, v) if u < v else (v, u)
                 edge_apex.setdefault(key, set()).add(w)
 
+        on_boundary = set()
+        for key, apexes in edge_apex.items():
+            if len(apexes) == 1:
+                on_boundary.update(key)
+
         used = set()
         remap = np.arange(len(verts))
         n_collapsed = 0
@@ -639,6 +647,11 @@ def collapse_short_edges(t_mesh: 'trimesh.Trimesh',
                 continue  # non-manifold edge: not ours to fix
             if (adj[a] & adj[b]) != apexes:
                 continue  # link condition: the collapse would pinch
+            if len(apexes) == 2 and a in on_boundary and b in on_boundary:
+                # interior edge spanning two boundary vertices: it passes
+                # the link condition, but the merge pinches the boundary
+                # into a bowtie vertex
+                continue
             # lock the whole 1-ring: a second collapse inside it this round
             # would invalidate the adjacency the link check was made with
             used.update((a, b))

@@ -270,3 +270,38 @@ def test_m5_public_decimation_keeps_boundary_manifold():
     assert _bowtie_vertices(out_F) == set(), out_F
     assert np.all(_signed_areas_z(out_V, out_F) > 0)
     assert any(np.allclose(p, [2, 1, 0], atol=1e-12) for p in out_V)
+
+
+# --------------------------------------------------------------------------
+# S:collapse_short_edges_pinch
+# --------------------------------------------------------------------------
+
+def test_collapse_short_edges_does_not_pinch_open_boundary():
+    """Suspicion (same pinch as M5 in collapse_short_edges): the only short
+    edge (rel_threshold 0.3 -> threshold 0.323) is the interior edge 1-4
+    joining two boundary vertices. It must be left alone: 4 faces, 6
+    vertices, no bowtie. The buggy code merged it into [[3,1,0],[1,4,2]]."""
+    V, F = _pinch_strip()
+    tm = trimesh.Trimesh(V, F, process=False)
+    lens = np.sort(tm.edges_unique_length)
+    thr = 0.3 * float(np.median(lens))
+    assert np.sum(lens < thr) == 1        # exactly one short edge (1-4)
+
+    out = collapse_short_edges(tm, rel_threshold=0.3)
+    assert len(out.faces) == 4
+    assert len(out.vertices) == 6
+    assert _bowtie_vertices(out.faces.tolist()) == set()
+
+
+def test_collapse_short_edges_still_collapses_short_boundary_edge():
+    """Companion to the pinch test: a short BOUNDARY edge (0-1, 0.1 long)
+    is still collapsed -- 4 faces -> 3, 6 vertices -> 5, manifold."""
+    V, F = _pinch_strip(short_interior=False)
+    tm = trimesh.Trimesh(V, F, process=False)
+    lens = np.sort(tm.edges_unique_length)
+    assert np.sum(lens < 0.3 * float(np.median(lens))) == 1
+
+    out = collapse_short_edges(tm, rel_threshold=0.3)
+    assert len(out.faces) == 3
+    assert len(out.vertices) == 5
+    assert _bowtie_vertices(out.faces.tolist()) == set()
