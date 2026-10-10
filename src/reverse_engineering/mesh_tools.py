@@ -907,8 +907,11 @@ def compute_mesh_quality(mesh: HalfEdgeMesh) -> dict:
         'min_area', 'max_area',
         'watertight': bool,
         'manifold': bool,
-        'boundary_edges': int,
+        'boundary_edges': int  (undirected edges with exactly one face; an
+            edge whose two faces run the same way counts as interior here --
+            that winding defect shows up in 'manifold'),
         'non_manifold_edges': int  (undirected edges shared by >2 faces)
+    ``edge_count`` also counts undirected edges, each once.
     """
     t_mesh = mesh.to_trimesh()
 
