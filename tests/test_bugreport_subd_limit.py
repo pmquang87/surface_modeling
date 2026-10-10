@@ -10,6 +10,9 @@ Covers:
                 standard dart rule is the smooth vertex rule
   S:isolated    identify_regular_regions called a vertex without faces
                 "regular" (flagged by the core-mesh fixes, M12 follow-up)
+  M15 (cand 8)  the limit normals (_normals_from_positions) used the same
+                absolute 1e-12 degeneracy threshold as the core normals and
+                left the normals of a small cage unnormalised (review repair)
 
 pyopencl is not installed here, so the H1 tests stub ONLY pyopencl: the stub's
 Program compiles the kernel source string OpenCLSubdivider hands it (the
@@ -616,3 +619,58 @@ def test_isolated_vertex_is_not_a_regular_vertex():
     assert lone.index in {v.index for v in irregular}
     # the 16 vertices of the quad grid are still all regular
     assert len(regular) == 16
+
+
+# ---------------------------------------------------------------------------
+# M15 (cand 8), limit-normal path: scale-relative degeneracy test
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("s", [1e-7, 1e-6, 1.0, 1e6])
+def test_m15_limit_normals_of_a_scaled_box_are_unit(s):
+    """M15 (cand 8), review repair: evaluate_limit_surface's normals must not
+    depend on the size of the cage. A box centred on the origin has, by its
+    symmetry, the limit normal sign(P)/sqrt(3) at every corner P. With the
+    absolute threshold `lengths > 1e-12` a box of side 1e-6 returned the raw
+    area-weighted sum (|n| = 8.66e-13) instead of a unit vector."""
+    box = create_box(s, s, s)
+    cage = np.array([v.position for v in box.vertices])
+    # precondition: the cage really has side s and is centred on the origin
+    assert len(cage) == 8
+    assert np.allclose(np.abs(cage), s / 2, rtol=1e-12, atol=0.0)
+    expected = np.sign(cage) / np.sqrt(3.0)
+
+    _, normals = evaluate_limit_surface(box)
+    assert normals.shape == (8, 3)
+    assert np.allclose(np.linalg.norm(normals, axis=1), 1.0, rtol=0, atol=1e-9), \
+        np.linalg.norm(normals, axis=1)
+    assert np.allclose(normals, expected, rtol=0, atol=1e-9), normals
+    # the checker must reject inward normals
+    assert not np.allclose(-normals, expected, rtol=0, atol=1e-9)
+
+
+def test_m15_limit_normal_of_a_zero_area_face_far_from_origin_is_zero():
+    """M15 (cand 8), review repair: a scale-relative threshold must not turn
+    the rounding of Newell's P + Q sums at |x| ~ 1e3 into a "normal". An
+    exactly collinear quad (all four vertices are boundary vertices, so the
+    limit positions are the cage positions bit for bit) gets exactly zero
+    normals; a valid square of the same size at the same place gets (0, 0, 1)."""
+    from fractions import Fraction
+    p0 = np.array([1150.3, -20.7, 37.1])
+    d = np.array([3.0, -5.0, 7.0]) * 2.0 ** -17          # dyadic: P0 + t*d is exact
+    line = np.array([p0 + t * d for t in range(4)])
+    exact = [[Fraction(x) for x in p] for p in line]
+    for p, q in zip(exact[1:], exact[2:]):                # precondition: exactly collinear
+        a = [p[i] - exact[0][i] for i in range(3)]
+        b = [q[i] - exact[0][i] for i in range(3)]
+        assert [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0]] == [0, 0, 0]
+    mesh = HalfEdgeMesh.from_arrays(line, [[0, 1, 2, 3]])
+    positions, normals = evaluate_limit_surface(mesh)
+    assert np.array_equal(positions, line)                # precondition: limit == cage
+    assert np.array_equal(normals, np.zeros((4, 3))), normals
+
+    e = 2.0 ** -17
+    square = p0 + np.array([[0, 0, 0], [e, 0, 0], [e, e, 0], [0, e, 0]])
+    mesh = HalfEdgeMesh.from_arrays(square, [[0, 1, 2, 3]])
+    _, normals = evaluate_limit_surface(mesh)
+    assert np.allclose(normals, [[0.0, 0.0, 1.0]] * 4, rtol=0, atol=1e-6), normals

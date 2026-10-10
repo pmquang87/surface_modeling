@@ -369,6 +369,8 @@ def _normals_from_positions(mesh: HalfEdgeMesh, positions: np.ndarray) -> np.nda
     not disturb whatever the caller had stored there.
     """
     normals = np.zeros((len(mesh.vertices), 3))
+    # sum of the squared edge lengths of the faces around each vertex
+    scale = np.zeros(len(mesh.vertices))
 
     for f in mesh.faces:
         fv = [v.index for v in mesh.get_face_vertices(f)]
@@ -376,7 +378,10 @@ def _normals_from_positions(mesh: HalfEdgeMesh, positions: np.ndarray) -> np.nda
             continue
         # Newell's method: robust for non-planar and non-convex polygons, and
         # its magnitude is twice the projected area, giving the area weighting.
+        # Centring first keeps a small face far from the origin from drowning
+        # in the rounding of P + Q.
         Pp = positions[fv]
+        Pp = Pp - Pp.mean(axis=0)
         Q = np.roll(Pp, -1, axis=0)
         d = Pp - Q
         s = Pp + Q
@@ -385,11 +390,16 @@ def _normals_from_positions(mesh: HalfEdgeMesh, positions: np.ndarray) -> np.nda
             np.dot(d[:, 2], s[:, 0]),
             np.dot(d[:, 0], s[:, 1]),
         ])
+        sq = np.einsum('ij,ij->', d, d)
         for idx in fv:
             normals[idx] += fn
+            scale[idx] += sq
 
+    # Degenerate means numerically zero area, judged against the squared edge
+    # lengths (an absolute threshold left the normals of a cage below ~1e-6
+    # unnormalised). Those vertices keep the zero vector.
     lengths = np.linalg.norm(normals, axis=1)
-    good = lengths > 1e-12
+    good = lengths > 1e-12 * scale
     normals[good] /= lengths[good][:, None]
     return normals
 
