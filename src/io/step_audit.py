@@ -271,7 +271,7 @@ def measure_shape(shape: Any, reference_stl: Optional[str] = None,
         if m["bbox_step"] is not None:
             m["bbox_max_diff_mm"] = float(np.abs(
                 np.asarray(m["bbox_step"]) - ref.bounds).max())
-        if len(points):
+        if len(points) and deviation_samples > 0:   # 0 samples = not measured
             rng = np.random.default_rng(seed)
             k = min(deviation_samples, len(points))
             sample = points[rng.choice(len(points), k, replace=False)]
