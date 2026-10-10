@@ -803,7 +803,9 @@ def export_step_faceted(mesh, filepath, *, schema: str = "AP214IS",
         report["bodies"] = [{k: v for k, v in b.items() if k != "shape"}
                             for b in bodies]
         report["solids"] = sum(1 for b in bodies if b["solid"])
-        report["open_shells"] = sum(1 for b in bodies if not b["solid"])
+        # closure, not solidity: with make_solids=False a closed shell is a
+        # closed surface body, not damage
+        report["open_shells"] = sum(1 for b in bodies if not b["closed"])
 
         pre = _premeasure(shape)
         report["faces"] = pre["faces"]
