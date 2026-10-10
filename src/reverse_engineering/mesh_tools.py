@@ -331,8 +331,14 @@ def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
 
     Collapses are additionally guarded by:
       * the link condition (the common neighbourhood of the two endpoints must
-        be exactly the vertices opposite the shared faces) which is what keeps
-        the result manifold and fold-free, and
+        be exactly the vertices opposite the shared faces), which keeps the
+        result manifold on closed surfaces,
+      * a boundary rule: an interior edge whose two endpoints both lie on the
+        boundary is never collapsed -- it passes the link condition, but
+        merging its endpoints pinches the boundary into a bowtie vertex,
+      * a fold check: the collapse moves v2 onto v1, and it is refused if any
+        surviving face around v2 would flip (or lose) its normal -- the link
+        condition is purely topological and cannot see that, and
       * a floor of three incident faces on every frozen vertex, so a frozen
         vertex can never be stranded without a face and dropped later as
         unreferenced.
@@ -358,6 +364,46 @@ def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
 
     def edge_key(a, b):
         return (a, b) if a < b else (b, a)
+
+    # Boundary vertices: endpoints of edges with exactly one face. A collapse
+    # that passes the guards below cannot turn an interior vertex into a
+    # boundary one, except the survivor inheriting the removed vertex's
+    # boundary status, which is tracked at the collapse.
+    edge_count: Dict[tuple, int] = {}
+    for f in faces:
+        for i in range(3):
+            k = edge_key(int(f[i]), int(f[(i + 1) % 3]))
+            edge_count[k] = edge_count.get(k, 0) + 1
+    on_boundary = set()
+    for (a, b), c in edge_count.items():
+        if c == 1:
+            on_boundary.update((a, b))
+
+    # plain-float copy for the per-collapse fold check: numpy call overhead
+    # on 3-vectors would dominate the whole pass
+    pos = verts.tolist()
+
+    def _normal(a, b, c):
+        (ax, ay, az), (bx, by, bz), (cx, cy, cz) = pos[a], pos[b], pos[c]
+        ux, uy, uz = bx - ax, by - ay, bz - az
+        wx, wy, wz = cx - ax, cy - ay, cz - az
+        return (uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx)
+
+    def _folds(v1, v2, shared):
+        # v2 moves onto v1: does any surviving face of v2 flip its normal?
+        # (a zero-area result counts as a fold -- it would be dropped later
+        # and leave a hole)
+        for fi in vertex_faces[v2]:
+            if not face_active[fi] or fi in shared:
+                continue
+            a, b, c = (int(x) for x in faces[fi])
+            n_old = _normal(a, b, c)
+            n_new = _normal(v1 if a == v2 else a, v1 if b == v2 else b,
+                            v1 if c == v2 else c)
+            if (n_old[0] * n_new[0] + n_old[1] * n_new[1]
+                    + n_old[2] * n_new[2]) <= 0.0:
+                return True
+        return False
 
     heap = []
     seen = set()
@@ -394,6 +440,11 @@ def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
         if (adj[v1] & adj[v2]) != apex:
             continue
 
+        # an interior edge spanning two boundary vertices: collapsing it
+        # pinches the boundary into a vertex shared by two separate fans
+        if len(shared) == 2 and v1 in on_boundary and v2 in on_boundary:
+            continue
+
         # frozen vertices must keep at least three live faces
         bad = False
         for fi in shared:
@@ -407,6 +458,11 @@ def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
             if bad:
                 break
         if bad:
+            continue
+
+        # the link condition is purely topological: also refuse a collapse
+        # that folds a surviving face over
+        if _folds(v1, v2, shared):
             continue
 
         # perform the collapse: v2 -> v1
@@ -428,6 +484,9 @@ def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
         adj[v2] = set()
         adj[v1].discard(v1)
         alive[v2] = False
+        if v2 in on_boundary:
+            on_boundary.discard(v2)
+            on_boundary.add(v1)
 
         if v1 not in frozen_set:
             for w in adj[v1]:
