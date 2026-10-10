@@ -17,6 +17,10 @@ test here names its follow-up item and the original bug it mirrors:
   ``export_step_faceted`` copied a NaN B-Rep volume into
   ``volume_brep_mm3`` / ``volume_delta_pct`` (and ``measure_shape`` into the
   embedded audit), so the report was no longer strict JSON.
+* F4 (mirrors M11, cand 24) - ``step_audit`` failed the audit for a census
+  with ``surfaces_consistent=False`` but passed one with
+  ``curves_consistent=False``, the EDGE_CURVE half of the same invariant,
+  which ``compare_expect`` already rejects.
 
 Test discipline (the repo's vacuous-test rules): each test first asserts that
 the defect / precondition really is in its input, every checker gets an input
@@ -262,3 +266,80 @@ def test_f3_faceted_report_stores_none_for_a_non_finite_brep_volume(
             assert "B-Rep volume not positive: None" in report["audit_reasons"], \
                 report["audit_reasons"]
         _strict_json(report)
+
+
+# --------------------------------------------------------------------------
+# F4 (mirrors M11): an inconsistent curve census must not pass the audit
+# --------------------------------------------------------------------------
+
+def _good_census(faces=6):
+    return {"ok": True, "input": "x.step", "faces": faces, "edges": 12,
+            "surfaces": {"plane": faces, "cylinder": 0, "cone": 0, "sphere": 0,
+                         "torus": 0, "bspline": 0, "other": 0},
+            "curves": {"line": 12, "circle": 0, "bspline": 0, "other": 0},
+            "surfaces_consistent": True, "curves_consistent": True,
+            "cylinder_radii": [], "cylinder_radii_unique": []}
+
+
+def test_f4_verdict_flags_inconsistent_curves_like_surfaces():
+    """F4 (mirrors M11, cand 24): ``curves_consistent=False`` is the
+    EDGE_CURVE twin of ``surfaces_consistent`` (step_census docstring, items 2
+    and 9): an argument list did not parse, so the census is not a
+    trustworthy witness and the audit must say so, as it does for faces."""
+    from src.io import step_census
+    from src.io.step_audit import verdict
+
+    # positive control: a consistent census that agrees with OCP passes clean
+    assert verdict(_clean_measurement(census=_good_census(), census_faces=6)) == (0, [])
+    # the surface twin is already rejected (M11) - the reference behaviour
+    code, reasons = verdict(_clean_measurement(
+        census=dict(_good_census(), surfaces_consistent=False), census_faces=6))
+    assert code == 2 and len(reasons) == 1 and "surfaces_consistent" in reasons[0]
+    # precondition: compare_expect already treats the curve flag as a failure
+    assert step_census.compare_expect({"faces": 6},
+                                      dict(_good_census(), curves_consistent=False))
+
+    code, reasons = verdict(_clean_measurement(
+        census=dict(_good_census(), curves_consistent=False), census_faces=6))
+    assert code == 2, reasons
+    assert reasons == ["text census failed: an EDGE_CURVE has no curve bucket "
+                       "(curves_consistent)"], reasons
+
+
+@needs_ocp
+def test_f4_measure_step_carries_the_curve_flag_after_the_census_is_popped(
+        tmp_path, monkeypatch):
+    """F4, real route: ``measure_step`` sets the flat ``census_error`` that
+    survives convert.py / faceted_step.py popping the census dict; a census
+    with ``curves_consistent=False`` must reach ``verdict`` through it."""
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from src.io import step_audit, step_census
+    from src.io.exporters import export_step
+    from src.io.step_audit import verdict
+
+    step = str(tmp_path / "box.step")
+    export_step(BRepPrimAPI_MakeBox(10.0, 20.0, 30.0).Shape(), step)
+
+    # positive control: the intact file audits clean with the census as witness
+    m = step_audit.measure_step(step, expected_faces=6)
+    assert m["census"]["curves_consistent"] is True and m["census_faces"] == 6
+    m.pop("census")
+    assert verdict(m) == (0, [])
+
+    real = step_census.census_path
+
+    def broken_curves(path):
+        c = real(path)
+        assert c["ok"] is True and c["edges"] == 12   # precondition: real census
+        c["curves"]["line"] -= 1                      # one EDGE_CURVE "dropped"
+        c["curves_consistent"] = False
+        return c
+    monkeypatch.setattr(step_census, "census_path", broken_curves)
+
+    m = step_audit.measure_step(step, expected_faces=6)
+    assert m["census_faces"] == 6, "precondition: the face witness still agrees"
+    m.pop("census")
+    code, reasons = verdict(m)
+    assert code == 2, reasons
+    assert reasons == ["text census failed: an EDGE_CURVE has no curve bucket "
+                       "(curves_consistent)"], reasons

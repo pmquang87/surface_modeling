@@ -138,9 +138,10 @@ def _census_problem(census: Optional[Dict[str, Any]]) -> Optional[str]:
     """Why the census cannot serve as a witness, or None when it can.
 
     ``None`` (the census module is not installed) is not a problem: the
-    census is optional. A census that ran and failed, or whose faces did not
-    all land in a surface bucket, is - otherwise the audit would pass with its
-    second witness silently gone (step_census docstring, item 8).
+    census is optional. A census that ran and failed, or whose faces or edges
+    did not all land in a surface / curve bucket, is - otherwise the audit
+    would pass with its second witness silently gone (step_census docstring,
+    items 2, 8 and 9).
     """
     if not isinstance(census, dict):
         return None
@@ -148,6 +149,8 @@ def _census_problem(census: Optional[Dict[str, Any]]) -> Optional[str]:
         return str(census.get("error") or "census failed")
     if census.get("surfaces_consistent") is False:
         return "an ADVANCED_FACE has no surface bucket (surfaces_consistent)"
+    if census.get("curves_consistent") is False:
+        return "an EDGE_CURVE has no curve bucket (curves_consistent)"
     return None
 
 
