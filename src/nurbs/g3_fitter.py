@@ -372,12 +372,18 @@ class G3Fitter:
             # whose interiors span ~1.3x+ (import silently drops them and the
             # shell can no longer knit into a solid), so clamp tightly and
             # fall back to the Coons initialization.
+            # The limit is purely relative: the old max(1.25*diag, diag+0.5)
+            # carried an absolute 0.5 (model units) that dominated below
+            # diag = 2 - a quad of diagonal 1 could reach 1.5x, one of 0.2
+            # 3.5x - and switched the clamp off entirely on a part modelled
+            # in metres: the same part reset different patches at different
+            # unit scales.
             n_reset = 0
             for k, p in enumerate(patches):
                 corners = np.array([p[0, 0], p[5, 0], p[5, 5], p[0, 5]])
                 center = corners.mean(axis=0)
                 diag = np.linalg.norm(corners.max(axis=0) - corners.min(axis=0))
-                limit = max(1.25 * diag, diag + 0.5)
+                limit = 1.25 * diag
                 interior = p[1:5, 1:5].reshape(-1, 3)
                 if np.linalg.norm(interior - center, axis=1).max() > limit:
                     p[1:5, 1:5] = initial_interiors[k]
