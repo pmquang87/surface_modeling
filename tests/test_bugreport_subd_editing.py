@@ -415,3 +415,31 @@ def test_bridge_faces_refuses_a_figure_eight_boundary():
         assert set(face_lists(m)[a[0]]) & set(face_lists(m)[a[1]]) == {pinch}
         out = bridge_faces(m, a, b)
         assert same_mesh(out, m), f"{a}: {len(m.faces)} faces in, {len(out.faces)} out"
+
+
+# --------------------------------------------------------------------------
+# suspicion: mirror_mesh with an unrecognised axis
+# --------------------------------------------------------------------------
+
+def _offset_box(shift):
+    box = create_box()
+    return HalfEdgeMesh.from_arrays([v.position + np.array(shift) for v in box.vertices],
+                                    face_lists(box))
+
+
+def test_mirror_mesh_axis_is_case_insensitive_and_validated():
+    """S:mirror_axis: 'Y' must mirror across the XZ plane exactly like 'y', and
+    an unknown axis must raise ValueError instead of mirroring across X."""
+    box = _offset_box([5.0, 7.0, 11.0])
+    for lo, up, k in [('x', 'X', 0), ('y', 'Y', 1), ('z', 'Z', 2)]:
+        ref = mirror_mesh(box, lo)
+        pts = np.array([v.position for v in ref.vertices])
+        # precondition: the lowercase call reflects along axis k only
+        assert len(ref.vertices) == 16
+        assert sorted(set(np.round(pts[:, k], 9))) == sorted(
+            {-5.5, -4.5, 4.5, 5.5} if k == 0 else
+            {-7.5, -6.5, 6.5, 7.5} if k == 1 else {-11.5, -10.5, 10.5, 11.5})
+        assert same_mesh(mirror_mesh(box, up), ref), f"axis {up!r} != {lo!r}"
+    for bad in ('w', '', 'xy'):
+        with pytest.raises(ValueError):
+            mirror_mesh(box, bad)

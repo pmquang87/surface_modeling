@@ -362,14 +362,21 @@ def mirror_mesh(mesh: HalfEdgeMesh, axis: str = 'x', merge_distance: float = 0.0
     lands on a face that is already there. Reflections whose vertex set repeats
     a face already in the result are dropped, so mirroring a symmetric mesh is
     an identity instead of a doubled, zero-thickness shell.
+
+    `axis` is 'x', 'y' or 'z' in either case; anything else raises ValueError.
     """
+    # An unknown axis used to fall back to X silently, so 'Y' mirrored across
+    # the wrong plane. Accept either case; refuse anything else.
+    axis_idx = {'x': 0, 'y': 1, 'z': 2}.get(str(axis).lower())
+    if axis_idx is None:
+        raise ValueError(f"mirror_mesh: axis must be 'x', 'y' or 'z', got {axis!r}")
+
     faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
     n_orig = len(mesh.vertices)
     if n_orig == 0:
         return mesh.copy()
 
     positions = np.array([v.position for v in mesh.vertices], dtype=np.float64)
-    axis_idx = {'x': 0, 'y': 1, 'z': 2}.get(axis, 0)
 
     mirrored = positions.copy()
     mirrored[:, axis_idx] *= -1.0
