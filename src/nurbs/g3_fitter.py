@@ -144,17 +144,25 @@ def _generate_single_patch(quad_data):
 
 
 class G3Fitter:
-    def __init__(self, continuity_weight: float = 1000.0):
+    def __init__(self, continuity_weight: float = 1000.0, fairing_weight: float = 0.0):
         """
         Initialize the G3 Fitter for Degree 5 B-spline patches.
         A degree 5 Bezier/B-spline patch requires a 6x6 grid of control points.
 
-        continuity_weight: weight of the cross-boundary smoothness equations
-        relative to the surface data equations (weight 1). 0 disables them.
+        continuity_weight: weight of the cross-boundary rows relative to the
+        surface data rows (weight 1). 0 disables them. The rows match the
+        THIRD cross-boundary derivative only (see fit_surface); tangent (C1)
+        and curvature (C2) matching are not enforced.
+
+        fairing_weight: weight of the control-net fairing rows (see
+        fit_surface), dimensionless like continuity_weight. 0 (the default
+        here) gives the bare least-squares system; SubDToNURBSConverter uses
+        0.01 for every continuity level.
         """
         self.degree = 5
         self.num_ctrl_pts = 6
         self.continuity_weight = continuity_weight
+        self.fairing_weight = fairing_weight
 
     def generate_patch(self, corners, derivatives=None):
         """
@@ -164,10 +172,43 @@ class G3Fitter:
 
     def fit_surface(self, quad_mesh):
         """
-        Fits a completely G3 continuous surface over a network of quad regions.
-        Replaces local Coons blending with a Global Sparse Solver (LSPIA).
-        Optimizes interior control points by minimizing projection distance
-        while explicitly solving G3 continuity constraint equations across patch boundaries.
+        Fit the 16 interior control points of every patch in one global
+        least-squares solve. Boundary control rows stay fixed (corners plus
+        tangent-plane chords), so neighbouring patches always share their
+        boundary curve (G0). Three kinds of rows:
+
+        * data rows (weight 1): the patch evaluated at the parameters of its
+          ``dense_points`` samples equals the samples;
+        * continuity rows (``continuity_weight``): per shared edge and per
+          interior boundary column, 3P1 - 3P2 + P3 + 3Q1 - 3Q2 + Q3 = 2P0
+          (P_m / Q_m the m-th poles inward on either side, P0 = Q0 on the
+          curve), i.e. the THIRD cross-boundary derivatives match (C3).
+          Tangent (C1) and second-derivative (C2) matching are NOT enforced,
+          so the result is not G1 in general. The exact solve treats any
+          weight of order 1 or more like a hard constraint, which is why the
+          converter's G1, G2 and G3 (weights 5, 20, 50) give practically the
+          same surface;
+        * fairing rows (``fairing_weight``): every second difference of the
+          control net along u and along v that involves an interior pole,
+          P[i-1,j] - 2 P[i,j] + P[i+1,j] = 0 and P[i,j-1] - 2 P[i,j] +
+          P[i,j+1] = 0 - a discrete bending energy of the control polygon
+          (no twist term). It vanishes on any bilinear net, so planes and
+          ruled bilinear patches stay exact.
+
+        Why fairing: with 6x6 samples per patch the data rows are badly
+        conditioned (sigma_min ~1.5e-3: an alternating pole pattern barely
+        moves the surface), so sample noise blows up into oscillating
+        interiors. lsqr's early stop used to damp those modes implicitly;
+        the exact SuperLU solve (bug M1) removed that, and the clamp below
+        had to reset 570 of 2152 patches at G0 and 44 at G1 on a real
+        topology-optimisation part, and SolidWorks 2025 dropped one face of
+        its STEP (all 2152 import with fairing). The alternating mode has second differences
+        four times its amplitude while smooth bulges have small ones, so a
+        small weight (0.01) suppresses the runaway and keeps the fit: on that
+        part 0 resets and audit deviation mean 0.069 mm instead of 0.074.
+        The rows are homogeneous in the coordinates and their coefficients
+        sum to zero, so the faired result moves with a rigid translation and
+        scales with a uniform scaling of the input, like the data rows.
 
         Adjacency comes only from each quad's ``neighbors`` list: an entry of
         -1 adds no continuity row across that edge. SubDToNURBSConverter
@@ -234,7 +275,13 @@ class G3Fitter:
                                 
                         eq_idx += 1
                         
-        # 2. G3 Continuity Constraints
+        # 2. Cross-boundary continuity rows. Despite the name G3, this is the
+        # third-derivative match (C3) alone: with P_m / Q_m listed inward from
+        # the shared curve on both sides, -Delta^3 P_0 = Delta^3 Q_0. Tangent
+        # (C1: P1 + Q1 = 2 P0) and C2 rows are not added - measured in
+        # 2026-10, hard C1 rows on the 2152-quad real part cost 24 % mean /
+        # 37 % p95 audit deviation (irregular cage, fixed tangent-plane
+        # boundary curves) and are left as a possible later opt-in.
         weight_g3 = self.continuity_weight
         
         def get_inward(patch_idx, edge_id, idx):
@@ -319,6 +366,34 @@ class G3Fitter:
                                 cols.append(var_idx)
                                 data.append(coeff * weight_g3)
                                 
+                            eq_idx += 1
+
+        # 3. Control-net fairing rows (see the docstring): every second
+        # difference along u or v whose three poles include an interior one,
+        # weight fairing_weight; the fixed boundary poles go to the right side.
+        lam = float(self.fairing_weight)
+        if lam > 0:
+            for k in range(num_patches):
+                for axis in (0, 1):
+                    for a in range(1, 5):
+                        for c in range(6):
+                            if axis == 0:
+                                pts = [(a - 1, c), (a, c), (a + 1, c)]
+                            else:
+                                pts = [(c, a - 1), (c, a), (c, a + 1)]
+                            if not any(1 <= i <= 4 and 1 <= j <= 4 for i, j in pts):
+                                continue
+                            rhs = np.zeros(3)
+                            for (i, j), cf in zip(pts, (1.0, -2.0, 1.0)):
+                                if 1 <= i <= 4 and 1 <= j <= 4:
+                                    rows.append(eq_idx)
+                                    cols.append(k * 16 + (i - 1) * 4 + (j - 1))
+                                    data.append(cf * lam)
+                                else:
+                                    rhs -= cf * lam * patches[k][i, j]
+                            bx.append(rhs[0])
+                            by.append(rhs[1])
+                            bz.append(rhs[2])
                             eq_idx += 1
 
         if len(data) > 0:

@@ -845,14 +845,9 @@ class PowerSurfacingMainWindow(QMainWindow):
             if SubDToNURBSConverter:
                 try:
                     # SubDToNURBSConverter expects the continuity as a 'G0'..'G3'
-                    # string, not an int.
-                    continuity_map = {
-                        'G0 (Position)': 'G0',
-                        'G1 (Tangent)': 'G1',
-                        'G2 (Curvature)': 'G2',
-                        'G3 (Torsion)': 'G3',
-                    }
-                    continuity = continuity_map.get(dlg.continuity.currentText(), 'G2')
+                    # string, not an int; every combo label starts with it.
+                    label = dlg.continuity.currentText().split()
+                    continuity = label[0] if label and label[0] in ('G0', 'G1', 'G2', 'G3') else 'G2'
                     tolerance = dlg.tolerance.value()
                     simplify = dlg.simplify.isChecked()
                     reference = getattr(self.viewport, 'reference_mesh', None)

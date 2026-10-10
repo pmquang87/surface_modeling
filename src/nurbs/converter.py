@@ -86,11 +86,20 @@ class SubDToNURBSConverter:
             mesh.compute_vertex_normals()
 
         from src.nurbs.g3_fitter import G3Fitter
-        # Map the requested continuity level onto the fitter's soft-constraint
-        # weight; data equations have weight 1, so values far above ~50 make
-        # the solver satisfy smoothness identities while ignoring the surface.
+        # Continuity level -> weight of the fitter's cross-patch rows (data
+        # rows have weight 1). G0 adds none. G1, G2 and G3 all add the SAME
+        # rows - a third-derivative (C3) match per shared boundary column -
+        # and the exact solve treats any weight of order 1 or more alike, so
+        # they give practically the same surface (max interior difference
+        # 1.3e-4 mm on a 2152-quad part). Tangent (C1) or curvature (C2)
+        # continuity is not enforced: hard C1 rows cost 24 % (mean) to 37 %
+        # (p95) more audit deviation on that part and are left as a possible
+        # later opt-in. The names stay accepted (scripts pass --continuity G1).
+        # fairing_weight 0.01, every level: damps the alternating pole modes
+        # the 6x6-sample fit cannot see (G3Fitter.fit_surface docstring).
         continuity_weights = {'G0': 0.0, 'G1': 5.0, 'G2': 20.0, 'G3': 50.0}
-        fitter = G3Fitter(continuity_weight=continuity_weights.get(self.continuity, 20.0))
+        fitter = G3Fitter(continuity_weight=continuity_weights.get(self.continuity, 20.0),
+                          fairing_weight=0.01)
 
         quad_faces = [f for f in mesh.faces if len(mesh.get_face_vertices(f)) == 4]
         face_to_idx = {f.index: idx for idx, f in enumerate(quad_faces)}
