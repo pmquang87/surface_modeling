@@ -4,6 +4,8 @@ commit 4e2241347de43175401df20c6722f38fa70820b4 (bug-report.md).
 Covered:
   M4  (cand 5)  _decimate_with_frozen folded triangles over (link condition
                 is purely topological, nothing checked the face normals).
+                Planar cases plus curved ones (spheres, a sharp wedge),
+                where a sign-only check still let faces turn on edge.
   M5  (cand 20) _decimate_with_frozen pinched an open boundary into a bowtie
                 vertex by collapsing an interior edge joining two boundary
                 vertices.
@@ -87,8 +89,28 @@ def _bowtie_vertices(faces):
     return bad
 
 
+def _radial_cos(verts, faces):
+    """cos(angle) between each face normal and the direction from the origin
+    to the face centroid -- 1 for a face of a centred sphere facing out, -1
+    for one flipped inward, 0 for one standing on its edge. A zero-area face
+    gives nan."""
+    P = np.asarray(verts, dtype=np.float64)
+    F = np.asarray(faces, dtype=np.int64)
+    n = np.cross(P[F[:, 1]] - P[F[:, 0]], P[F[:, 2]] - P[F[:, 0]])
+    c = P[F].mean(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (np.einsum("ij,ij->i", n, c)
+                / (np.linalg.norm(n, axis=1) * np.linalg.norm(c, axis=1)))
+
+
 def test_checkers_say_no_to_known_bad_input():
     """The checkers must flag the outputs the report gives for M4 and M5."""
+    # an inward-facing and an edge-on face of a sphere-like patch
+    V = [[0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 0, 0]]
+    assert _radial_cos(V, [[0, 1, 2]])[0] > 0.5
+    assert _radial_cos(V, [[0, 2, 1]])[0] < -0.5
+    # face through the origin's direction: normal is tangent (cos 0)
+    assert abs(_radial_cos([[1, 0, 0], [2, 0, 0], [1, 0, 1]], [[0, 1, 2]])[0]) < 1e-12
     # M5's reported output: two triangles meeting only at vertex 1
     assert _bowtie_vertices([[0, 3, 1], [1, 5, 2]]) == {1}
     assert _bowtie_vertices([[0, 1, 2], [0, 2, 3]]) == set()
@@ -158,6 +180,114 @@ def test_m4_direct_collapse_rejects_fold_and_takes_the_safe_edge():
                 (4, 1, 0): 0.5 * np.sin(np.radians(177.0))}
     for f, a in zip(new_faces, areas):
         assert a == pytest.approx(expected[tuple(f)], abs=1e-4)
+
+
+def _jittered_ico3():
+    rng = np.random.default_rng(0)
+    s = trimesh.creation.icosphere(subdivisions=3)
+    V = np.asarray(s.vertices) * (1 + rng.uniform(-0.02, 0.02, (len(s.vertices), 1)))
+    F = np.asarray(s.faces).tolist()
+    return V, F
+
+
+def _assert_closed_outward(V, F, n_faces, cos_min=0.5):
+    assert len(F) == n_faces
+    cos = _radial_cos(V, F)
+    assert np.all(np.isfinite(cos)), "zero-area face in the output"
+    # 0 would be a face standing on its edge, < 0 one flipped inward; the
+    # fixed pass keeps every face within ~60 deg of radial here
+    assert cos.min() > cos_min, (
+        f"{np.sum(cos <= cos_min)} face(s) folded or on edge, min cos {cos.min():.3f}")
+    tm = trimesh.Trimesh(np.asarray(V), np.asarray(F), process=False)
+    assert tm.is_watertight
+    assert tm.is_winding_consistent
+
+
+def test_m4_curved_surface_decimation_keeps_faces_outward():
+    """M4 (cand 5), curved input: on a 2%-jittered icosphere(3) with every
+    20th vertex frozen, decimation 1280 -> 256 faces must leave every face
+    facing outward (cos(normal, centroid direction) > 0) and the surface
+    closed. A check that only rejects a sign flip against the CURRENT normal
+    let faces turn ~90 deg per collapse and keep drifting: the first fix gave
+    5 inward faces here, min cos -0.998."""
+    V, F = _jittered_ico3()
+    frozen = set(range(0, len(V), 20))
+    # precondition: the input is a closed, cleanly outward sphere
+    assert len(F) == 1280 and len(frozen) == 33
+    assert _radial_cos(V, F).min() > 0.9
+    _assert_closed_outward(V, F, 1280)
+
+    out = _decimate_with_frozen(V.copy(), [list(f) for f in F], frozen, 256)
+    _assert_closed_outward(V, out, 256)
+    # the frozen vertices are all still used
+    assert frozen <= {int(v) for f in out for v in f}
+
+    # same through the public entry point
+    res = decimate_mesh(HalfEdgeMesh.from_arrays(V, F), target_faces=256,
+                        frozen_vertices=sorted(frozen))
+    res_V = np.array([v.position for v in res.vertices])
+    _assert_closed_outward(res_V, _face_lists(res), 256)
+
+
+def test_m4_clean_sphere_halved_has_no_edge_on_faces():
+    """M4 (cand 5), curved input: a clean icosphere(3) halved (frozen={0},
+    1280 -> 640) must not contain a face whose plane passes through the
+    centre (|det(a,b,c)| ~ 0, a face turned 90 deg). The first fix left 45
+    of them; every face must also still face outward."""
+    s = trimesh.creation.icosphere(subdivisions=3)
+    V = np.asarray(s.vertices)
+    F = np.asarray(s.faces).tolist()
+    P = V[np.asarray(F)]
+    assert np.abs(np.linalg.det(P)).min() > 1e-3      # precondition
+    out = _decimate_with_frozen(V.copy(), [list(f) for f in F], {0}, 640)
+    _assert_closed_outward(V, out, 640)
+    det = np.linalg.det(V[np.asarray(out)])
+    assert np.abs(det).min() > 1e-9, f"{np.sum(np.abs(det) < 1e-9)} edge-on face(s)"
+
+
+def _wedge(deg=20.0, subdiv=3):
+    """Closed triangular prism whose long edge has a sharp 'deg' crease."""
+    th = np.radians(deg)
+    P = np.array([[0, 0, 0], [1, 0, 0], [np.cos(th), np.sin(th), 0],
+                  [0, 0, 2], [1, 0, 2], [np.cos(th), np.sin(th), 2]])
+    w = trimesh.Trimesh(P, [[0, 2, 1], [3, 4, 5], [0, 1, 4], [0, 4, 3],
+                            [1, 2, 5], [1, 5, 4], [2, 0, 3], [2, 3, 5]],
+                        process=False)
+    w.fix_normals()
+    for _ in range(subdiv):
+        w = w.subdivide()
+    return w
+
+
+def test_m4_fold_check_still_decimates_along_a_sharp_crease():
+    """M4 (cand 5) companion: the fold check compares a face with the input
+    vertex normals, but at a sharp crease the INPUT faces already lean more
+    than acos(0.3) ~ 72.5 deg from the vertex normal. The floor there must
+    drop to the input's own lean, or the pass stalls: a 20-deg wedge
+    (512 faces, frozen={0}) must still reach 102 faces, closed, with the
+    volume kept to 2% and no dihedral sharper than the input's 160 deg."""
+    w = _wedge()
+    V, F = np.asarray(w.vertices), w.faces.tolist()
+    assert len(F) == 512 and w.is_watertight and w.is_winding_consistent
+    # precondition: some input face leans past acos(0.3) from an area-weighted
+    # vertex normal at one of its corners
+    fn = np.cross(V[w.faces[:, 1]] - V[w.faces[:, 0]], V[w.faces[:, 2]] - V[w.faces[:, 0]])
+    vn = np.zeros_like(V)
+    for k in range(3):
+        np.add.at(vn, w.faces[:, k], fn)
+    vn /= np.linalg.norm(vn, axis=1)[:, None]
+    fu = fn / np.linalg.norm(fn, axis=1)[:, None]
+    lean = min(float(fu[i] @ vn[x]) for i, f in enumerate(w.faces) for x in f)
+    assert lean < 0.3
+    in_dih = float(np.degrees(w.face_adjacency_angles.max()))
+    assert in_dih == pytest.approx(160.0, abs=1e-6)
+
+    out = _decimate_with_frozen(V.copy(), [list(f) for f in F], {0}, 102)
+    assert len(out) == 102
+    tm = trimesh.Trimesh(V, out, process=False)
+    assert tm.is_watertight and tm.is_winding_consistent
+    assert tm.volume == pytest.approx(w.volume, rel=0.02)
+    assert float(np.degrees(tm.face_adjacency_angles.max())) <= in_dih + 1e-6
 
 
 # --------------------------------------------------------------------------

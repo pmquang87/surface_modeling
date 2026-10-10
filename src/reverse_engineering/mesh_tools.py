@@ -4,6 +4,12 @@ import trimesh
 from typing import Optional, List, Dict, Any, Tuple
 from src.core.halfedge_mesh import HalfEdgeMesh
 
+# _decimate_with_frozen refuses a collapse that turns a surviving face's
+# normal by more than acos(_FOLD_COS_MIN) (about 72.5 deg) away from its
+# current normal, its original normal, or the input vertex normal at any of
+# its corners (that last floor drops to the input's own lean at sharp creases).
+_FOLD_COS_MIN = 0.3
+
 
 def _warn_if_not_triangles(mesh: HalfEdgeMesh, func_name: str) -> None:
     """Warn that a quad/ngon cage will come back triangulated.
@@ -337,8 +343,21 @@ def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
         boundary is never collapsed -- it passes the link condition, but
         merging its endpoints pinches the boundary into a bowtie vertex,
       * a fold check: the collapse moves v2 onto v1, and it is refused if any
-        surviving face around v2 would flip (or lose) its normal -- the link
-        condition is purely topological and cannot see that, and
+        surviving face around v2 would lose its normal (zero area) or turn it
+        by more than acos(_FOLD_COS_MIN) ~ 72.5 deg away from
+          - its current normal (a flip or near-flip in one step),
+          - its normal in the input mesh (so it cannot creep over in several
+            smaller steps; skipped for a face that was zero-area in the
+            input), or
+          - the input vertex normal at any of its three corners. Vertices
+            never move, so this is the true surface direction where the face
+            now sits; without it a face that slides across a curved surface
+            can keep its own old normal and still end up standing on edge.
+            At a sharp crease the input faces already lean further than
+            72.5 deg from the vertex normal, and the floor there drops to
+            the input's own worst lean.
+        The link condition is purely topological and cannot see any of
+        this, and
       * a floor of three incident faces on every frozen vertex, so a frozen
         vertex can never be stranded without a face and dropped later as
         unreferenced.
@@ -389,20 +408,76 @@ def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
         wx, wy, wz = cx - ax, cy - ay, cz - az
         return (uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx)
 
+    # each face's normal before any collapse, so the fold check sees the
+    # total turn of a face and not only the turn of the current step
+    n_orig = [_normal(int(f[0]), int(f[1]), int(f[2])) for f in faces]
+    # area-weighted vertex normals of the input: vertices never move, so this
+    # stays the local surface direction at each vertex for the whole pass
+    vn = [[0.0, 0.0, 0.0] for _ in range(n_v)]
+    for f, n in zip(faces, n_orig):
+        for x in f:
+            acc = vn[int(x)]
+            acc[0] += n[0]
+            acc[1] += n[1]
+            acc[2] += n[2]
+    for m in vn:
+        ln = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]) ** 0.5
+        if ln > 0.0:
+            m[0] /= ln
+            m[1] /= ln
+            m[2] /= ln
+    # per-vertex floor for cos(face normal, vertex normal): _FOLD_COS_MIN, or
+    # lower at a sharp crease where the input faces already lean further
+    vn_floor = [_FOLD_COS_MIN] * n_v
+    for f, n in zip(faces, n_orig):
+        ln = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) ** 0.5
+        if ln == 0.0:
+            continue
+        for x in f:
+            x = int(x)
+            m = vn[x]
+            cs = (n[0] * m[0] + n[1] * m[1] + n[2] * m[2]) / ln - 1e-9
+            if cs < vn_floor[x]:
+                vn_floor[x] = cs
+
+    def _turned(n, m):
+        # True when the angle between n and m exceeds acos(_FOLD_COS_MIN),
+        # or either vector is zero
+        d = n[0] * m[0] + n[1] * m[1] + n[2] * m[2]
+        nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2]
+        mm = m[0] * m[0] + m[1] * m[1] + m[2] * m[2]
+        if nn == 0.0 or mm == 0.0 or d <= 0.0:
+            return True
+        return d * d <= _FOLD_COS_MIN * _FOLD_COS_MIN * nn * mm
+
     def _folds(v1, v2, shared):
-        # v2 moves onto v1: does any surviving face of v2 flip its normal?
-        # (a zero-area result counts as a fold -- it would be dropped later
-        # and leave a hole)
+        # v2 moves onto v1: does any surviving face of v2 turn too far, from
+        # its current normal, its original one, or the surface direction at
+        # its corners? (a zero-area result counts as a fold -- it would be
+        # dropped later and leave a hole)
         for fi in vertex_faces[v2]:
             if not face_active[fi] or fi in shared:
                 continue
             a, b, c = (int(x) for x in faces[fi])
-            n_old = _normal(a, b, c)
-            n_new = _normal(v1 if a == v2 else a, v1 if b == v2 else b,
-                            v1 if c == v2 else c)
-            if (n_old[0] * n_new[0] + n_old[1] * n_new[1]
-                    + n_old[2] * n_new[2]) <= 0.0:
+            n_cur = _normal(a, b, c)
+            a, b, c = (v1 if a == v2 else a, v1 if b == v2 else b,
+                       v1 if c == v2 else c)
+            n_new = _normal(a, b, c)
+            if _turned(n_cur, n_new):
                 return True
+            n0 = n_orig[fi]
+            if (n0[0] or n0[1] or n0[2]) and _turned(n0, n_new):
+                return True
+            # the turned-away face can still match its own old normal when
+            # it slides across the surface: the vertex normals catch that
+            ln = (n_new[0] * n_new[0] + n_new[1] * n_new[1]
+                  + n_new[2] * n_new[2]) ** 0.5
+            for x in (a, b, c):
+                m = vn[x]
+                if (m[0] or m[1] or m[2]) and (
+                        n_new[0] * m[0] + n_new[1] * m[1]
+                        + n_new[2] * m[2]) < vn_floor[x] * ln:
+                    return True
         return False
 
     heap = []
