@@ -300,3 +300,92 @@ def test_m9_reopening_tool_ui_does_not_stack_buttons(qapp):
     assert panel.form_layout.count() == 0
     panel.deleteLater()
     _flush_deletes(qapp)
+
+
+# ----------------------------------------------------------------------------
+# L1: Shell/Thicken action apply()
+# ----------------------------------------------------------------------------
+
+class _FakeMainWindow(QWidget):
+    """Just the attributes init_actions' Shell/Thicken action touches."""
+
+    def __init__(self, mesh):
+        super().__init__()
+        from src.core.command import CommandManager
+        self.current_mesh = mesh
+        self.command_manager = CommandManager()
+        self.properties_panel = PropertiesPanel(self)
+        self.messages = []
+
+    def log(self, msg):
+        self.messages.append(msg)
+
+
+def test_l1_shell_action_apply_reads_dialog_values(qapp, monkeypatch):
+    """L1 (cand 4): pressing Apply in the Shell/Thicken tool panel runs
+    shell_solid through the command manager with the thickness and direction
+    shown in ShellThickenDialog (its widgets are .thickness / .direction),
+    instead of raising AttributeError on dlg.spin_thick, and then closes the
+    tool panel."""
+    from src.gui import actions
+    from src.gui.action_registry import registry
+    from src.gui.dialogs import ShellThickenDialog
+    from src.operations import shell_thicken
+    from src.subd import primitives
+
+    # Precondition: the dialog really exposes these names and not the old ones.
+    probe = ShellThickenDialog()
+    assert hasattr(probe, 'thickness') and hasattr(probe, 'direction')
+    assert not hasattr(probe, 'spin_thick') and not hasattr(probe, 'combo_dir')
+    probe.deleteLater()
+
+    calls = []
+    result_mesh = primitives.create_box(2.0, 2.0, 2.0)
+
+    def spy_shell_solid(mesh, **kwargs):
+        calls.append((mesh, kwargs))
+        return result_mesh
+
+    monkeypatch.setattr(shell_thicken, 'shell_solid', spy_shell_solid)
+
+    src_mesh = primitives.create_box()
+    win = _FakeMainWindow(src_mesh)
+
+    captured = {}
+    real_set_tool_ui = PropertiesPanel.set_tool_ui
+
+    def capture(self, title, widget, apply_callback=None, cancel_callback=None):
+        captured['apply'] = apply_callback
+        captured['dlg'] = widget
+        return real_set_tool_ui(self, title, widget, apply_callback, cancel_callback)
+
+    monkeypatch.setattr(PropertiesPanel, 'set_tool_ui', capture)
+    # The registry is a process-wide singleton: register into a copy so the
+    # closures over this throw-away window do not outlive the test.
+    monkeypatch.setattr(registry, '_actions', dict(registry._actions))
+
+    actions.init_actions(win)
+    registry.get_action("Shell / Thicken").callback()
+    dlg = captured['dlg']
+    assert isinstance(dlg, ShellThickenDialog)
+    assert len(_buttons(win.properties_panel, "Apply")) == 1
+
+    # Non-default values, so a fallback to the defaults would be caught.
+    dlg.thickness.setValue(0.25)
+    dlg.direction.setCurrentText("Outward")
+    assert not win.command_manager.can_undo()
+
+    captured['apply']()
+    _flush_deletes(qapp)
+
+    assert len(calls) == 1
+    mesh_arg, kwargs = calls[0]
+    assert mesh_arg is src_mesh
+    assert kwargs['thickness'] == pytest.approx(0.25, abs=1e-12)
+    assert kwargs['direction'] == 'outward'
+    assert win.current_mesh is result_mesh
+    assert win.command_manager.can_undo()
+    assert _buttons(win.properties_panel) == []
+
+    win.deleteLater()
+    _flush_deletes(qapp)

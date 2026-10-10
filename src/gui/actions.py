@@ -28,8 +28,8 @@ def init_actions(main_window):
             widget.setWindowFlags(widget.windowFlags() & ~main_window.windowFlags())
         
         def apply():
-            thickness = dlg.spin_thick.value()
-            direction = dlg.combo_dir.currentText().lower()
+            thickness = dlg.thickness.value()
+            direction = dlg.direction.currentText().lower()
             
             from src.core.command import MeshOperationCommand
             cmd = MeshOperationCommand("Shell", main_window, shell_solid, main_window.current_mesh, thickness=thickness, direction=direction)
