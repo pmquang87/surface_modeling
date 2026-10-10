@@ -4,6 +4,12 @@ import trimesh
 from typing import Optional, List, Dict, Any, Tuple
 from src.core.halfedge_mesh import HalfEdgeMesh
 
+# _decimate_with_frozen refuses a collapse that turns a surviving face's
+# normal by more than acos(_FOLD_COS_MIN) (about 72.5 deg) away from its
+# current normal, its original normal, or the input vertex normal at any of
+# its corners (that last floor drops to the input's own lean at sharp creases).
+_FOLD_COS_MIN = 0.3
+
 
 def _warn_if_not_triangles(mesh: HalfEdgeMesh, func_name: str) -> None:
     """Warn that a quad/ngon cage will come back triangulated.
@@ -331,8 +337,27 @@ def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
 
     Collapses are additionally guarded by:
       * the link condition (the common neighbourhood of the two endpoints must
-        be exactly the vertices opposite the shared faces) which is what keeps
-        the result manifold and fold-free, and
+        be exactly the vertices opposite the shared faces), which keeps the
+        result manifold on closed surfaces,
+      * a boundary rule: an interior edge whose two endpoints both lie on the
+        boundary is never collapsed -- it passes the link condition, but
+        merging its endpoints pinches the boundary into a bowtie vertex,
+      * a fold check: the collapse moves v2 onto v1, and it is refused if any
+        surviving face around v2 would lose its normal (zero area) or turn it
+        by more than acos(_FOLD_COS_MIN) ~ 72.5 deg away from
+          - its current normal (a flip or near-flip in one step),
+          - its normal in the input mesh (so it cannot creep over in several
+            smaller steps; skipped for a face that was zero-area in the
+            input), or
+          - the input vertex normal at any of its three corners. Vertices
+            never move, so this is the true surface direction where the face
+            now sits; without it a face that slides across a curved surface
+            can keep its own old normal and still end up standing on edge.
+            At a sharp crease the input faces already lean further than
+            72.5 deg from the vertex normal, and the floor there drops to
+            the input's own worst lean.
+        The link condition is purely topological and cannot see any of
+        this, and
       * a floor of three incident faces on every frozen vertex, so a frozen
         vertex can never be stranded without a face and dropped later as
         unreferenced.
@@ -358,6 +383,102 @@ def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
 
     def edge_key(a, b):
         return (a, b) if a < b else (b, a)
+
+    # Boundary vertices: endpoints of edges with exactly one face. A collapse
+    # that passes the guards below cannot turn an interior vertex into a
+    # boundary one, except the survivor inheriting the removed vertex's
+    # boundary status, which is tracked at the collapse.
+    edge_count: Dict[tuple, int] = {}
+    for f in faces:
+        for i in range(3):
+            k = edge_key(int(f[i]), int(f[(i + 1) % 3]))
+            edge_count[k] = edge_count.get(k, 0) + 1
+    on_boundary = set()
+    for (a, b), c in edge_count.items():
+        if c == 1:
+            on_boundary.update((a, b))
+
+    # plain-float copy for the per-collapse fold check: numpy call overhead
+    # on 3-vectors would dominate the whole pass
+    pos = verts.tolist()
+
+    def _normal(a, b, c):
+        (ax, ay, az), (bx, by, bz), (cx, cy, cz) = pos[a], pos[b], pos[c]
+        ux, uy, uz = bx - ax, by - ay, bz - az
+        wx, wy, wz = cx - ax, cy - ay, cz - az
+        return (uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx)
+
+    # each face's normal before any collapse, so the fold check sees the
+    # total turn of a face and not only the turn of the current step
+    n_orig = [_normal(int(f[0]), int(f[1]), int(f[2])) for f in faces]
+    # area-weighted vertex normals of the input: vertices never move, so this
+    # stays the local surface direction at each vertex for the whole pass
+    vn = [[0.0, 0.0, 0.0] for _ in range(n_v)]
+    for f, n in zip(faces, n_orig):
+        for x in f:
+            acc = vn[int(x)]
+            acc[0] += n[0]
+            acc[1] += n[1]
+            acc[2] += n[2]
+    for m in vn:
+        ln = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]) ** 0.5
+        if ln > 0.0:
+            m[0] /= ln
+            m[1] /= ln
+            m[2] /= ln
+    # per-vertex floor for cos(face normal, vertex normal): _FOLD_COS_MIN, or
+    # lower at a sharp crease where the input faces already lean further
+    vn_floor = [_FOLD_COS_MIN] * n_v
+    for f, n in zip(faces, n_orig):
+        ln = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) ** 0.5
+        if ln == 0.0:
+            continue
+        for x in f:
+            x = int(x)
+            m = vn[x]
+            cs = (n[0] * m[0] + n[1] * m[1] + n[2] * m[2]) / ln - 1e-9
+            if cs < vn_floor[x]:
+                vn_floor[x] = cs
+
+    def _turned(n, m):
+        # True when the angle between n and m exceeds acos(_FOLD_COS_MIN),
+        # or either vector is zero
+        d = n[0] * m[0] + n[1] * m[1] + n[2] * m[2]
+        nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2]
+        mm = m[0] * m[0] + m[1] * m[1] + m[2] * m[2]
+        if nn == 0.0 or mm == 0.0 or d <= 0.0:
+            return True
+        return d * d <= _FOLD_COS_MIN * _FOLD_COS_MIN * nn * mm
+
+    def _folds(v1, v2, shared):
+        # v2 moves onto v1: does any surviving face of v2 turn too far, from
+        # its current normal, its original one, or the surface direction at
+        # its corners? (a zero-area result counts as a fold -- it would be
+        # dropped later and leave a hole)
+        for fi in vertex_faces[v2]:
+            if not face_active[fi] or fi in shared:
+                continue
+            a, b, c = (int(x) for x in faces[fi])
+            n_cur = _normal(a, b, c)
+            a, b, c = (v1 if a == v2 else a, v1 if b == v2 else b,
+                       v1 if c == v2 else c)
+            n_new = _normal(a, b, c)
+            if _turned(n_cur, n_new):
+                return True
+            n0 = n_orig[fi]
+            if (n0[0] or n0[1] or n0[2]) and _turned(n0, n_new):
+                return True
+            # the turned-away face can still match its own old normal when
+            # it slides across the surface: the vertex normals catch that
+            ln = (n_new[0] * n_new[0] + n_new[1] * n_new[1]
+                  + n_new[2] * n_new[2]) ** 0.5
+            for x in (a, b, c):
+                m = vn[x]
+                if (m[0] or m[1] or m[2]) and (
+                        n_new[0] * m[0] + n_new[1] * m[1]
+                        + n_new[2] * m[2]) < vn_floor[x] * ln:
+                    return True
+        return False
 
     heap = []
     seen = set()
@@ -394,6 +515,11 @@ def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
         if (adj[v1] & adj[v2]) != apex:
             continue
 
+        # an interior edge spanning two boundary vertices: collapsing it
+        # pinches the boundary into a vertex shared by two separate fans
+        if len(shared) == 2 and v1 in on_boundary and v2 in on_boundary:
+            continue
+
         # frozen vertices must keep at least three live faces
         bad = False
         for fi in shared:
@@ -407,6 +533,11 @@ def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
             if bad:
                 break
         if bad:
+            continue
+
+        # the link condition is purely topological: also refuse a collapse
+        # that folds a surviving face over
+        if _folds(v1, v2, shared):
             continue
 
         # perform the collapse: v2 -> v1
@@ -428,6 +559,9 @@ def _decimate_with_frozen(verts: np.ndarray, faces: np.ndarray,
         adj[v2] = set()
         adj[v1].discard(v1)
         alive[v2] = False
+        if v2 in on_boundary:
+            on_boundary.discard(v2)
+            on_boundary.add(v1)
 
         if v1 not in frozen_set:
             for w in adj[v1]:
@@ -456,13 +590,17 @@ def decimate_mesh(mesh: HalfEdgeMesh, target_faces: int = None,
     is given -- a local edge-collapse pass that never touches those vertices.
 
     Note: the mesh round-trips through ``to_trimesh()``, so a quad/ngon cage
-    comes back triangulated (a warning says so).
+    comes back triangulated (a warning says so). ``target_faces`` counts the
+    output triangles, and ``ratio`` is taken of the triangulated input: a
+    quad cage has about twice as many triangles as quads, and a ratio of the
+    quad count would decimate it twice as hard as the same surface given as
+    triangles.
     """
     _warn_if_not_triangles(mesh, "decimate_mesh")
     t_mesh = mesh.to_trimesh()
 
     if target_faces is None:
-        target_faces = int(len(mesh.faces) * ratio)
+        target_faces = int(len(t_mesh.faces) * ratio)
 
     if frozen_vertices:
         verts = np.array(t_mesh.vertices, dtype=np.float64)
@@ -537,7 +675,10 @@ def collapse_short_edges(t_mesh: 'trimesh.Trimesh',
     faces. Anything else pinches the surface into non-manifold junk,
     boundary edges or loose scraps, which later surface as free edges in the
     sewn B-Rep. Link-violating short edges are left alone (the cage-level
-    edge stretcher deals with them geometrically).
+    edge stretcher deals with them geometrically). On an open mesh an
+    interior edge whose two endpoints both lie on the boundary is left
+    alone as well: it passes the link condition, but merging it pinches the
+    boundary into a bowtie vertex.
     """
     threshold = None
     for _ in range(max_rounds):
@@ -567,6 +708,11 @@ def collapse_short_edges(t_mesh: 'trimesh.Trimesh',
                 key = (u, v) if u < v else (v, u)
                 edge_apex.setdefault(key, set()).add(w)
 
+        on_boundary = set()
+        for key, apexes in edge_apex.items():
+            if len(apexes) == 1:
+                on_boundary.update(key)
+
         used = set()
         remap = np.arange(len(verts))
         n_collapsed = 0
@@ -580,6 +726,11 @@ def collapse_short_edges(t_mesh: 'trimesh.Trimesh',
                 continue  # non-manifold edge: not ours to fix
             if (adj[a] & adj[b]) != apexes:
                 continue  # link condition: the collapse would pinch
+            if len(apexes) == 2 and a in on_boundary and b in on_boundary:
+                # interior edge spanning two boundary vertices: it passes
+                # the link condition, but the merge pinches the boundary
+                # into a bowtie vertex
+                continue
             # lock the whole 1-ring: a second collapse inside it this round
             # would invalidate the adjacency the link check was made with
             used.update((a, b))
@@ -756,15 +907,17 @@ def compute_mesh_quality(mesh: HalfEdgeMesh) -> dict:
         'min_area', 'max_area',
         'watertight': bool,
         'manifold': bool,
-        'boundary_edges': int,
+        'boundary_edges': int  (undirected edges with exactly one face; an
+            edge whose two faces run the same way counts as interior here --
+            that winding defect shows up in 'manifold'),
         'non_manifold_edges': int  (undirected edges shared by >2 faces)
+    ``edge_count`` also counts undirected edges, each once.
     """
     t_mesh = mesh.to_trimesh()
 
     stats = {
         'face_count': len(mesh.faces),
         'vertex_count': len(mesh.vertices),
-        'edge_count': len(mesh.edges),
         'watertight': t_mesh.is_watertight,
         'manifold': t_mesh.is_winding_consistent,
     }
@@ -782,14 +935,12 @@ def compute_mesh_quality(mesh: HalfEdgeMesh) -> dict:
             stats['max_angle'] = float(np.max(angles))
             stats['avg_angle'] = float(np.mean(angles))
 
-    # Boundary edges
-    boundary_edges = sum(1 for e in mesh.edges if mesh.is_boundary_edge(e))
-    stats['boundary_edges'] = boundary_edges
-
-    # Non-manifold edges: count undirected edges with face incidence > 2.
-    # The half-edge structure does NOT enforce manifoldness -- add_face happily
-    # accepts a third face on an existing edge, it just leaves the extra
-    # half-edge untwinned -- so this has to be measured on the face set.
+    # Edge, boundary-edge and non-manifold-edge counts, all from undirected
+    # face incidence. The half-edge structure does NOT enforce manifoldness --
+    # add_face happily accepts a third face on an existing edge, it just
+    # leaves the extra half-edge untwinned as a second Edge -- so len(edges)
+    # and the untwinned-edge count both overcount there; measure on the face
+    # set instead.
     incidence: Dict[tuple, int] = {}
     for f in mesh.faces:
         fv = [v.index for v in mesh.get_face_vertices(f)]
@@ -798,6 +949,8 @@ def compute_mesh_quality(mesh: HalfEdgeMesh) -> dict:
             a, b = fv[i], fv[(i + 1) % n]
             key = (a, b) if a < b else (b, a)
             incidence[key] = incidence.get(key, 0) + 1
+    stats['edge_count'] = len(incidence)
+    stats['boundary_edges'] = int(sum(1 for c in incidence.values() if c == 1))
     stats['non_manifold_edges'] = int(sum(1 for c in incidence.values() if c > 2))
 
     return stats

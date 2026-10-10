@@ -1,0 +1,587 @@
+"""Regression tests for the RE mesh-tool bugs of the automated bug hunt on
+commit 4e2241347de43175401df20c6722f38fa70820b4 (bug-report.md).
+
+Covered:
+  M4  (cand 5)  _decimate_with_frozen folded triangles over (link condition
+                is purely topological, nothing checked the face normals).
+                Planar cases plus curved ones (spheres, a sharp wedge),
+                where a sign-only check still let faces turn on edge.
+  M5  (cand 20) _decimate_with_frozen pinched an open boundary into a bowtie
+                vertex by collapsing an interior edge joining two boundary
+                vertices.
+  M17 (cand 21) compute_mesh_quality overcounted edge_count and
+                boundary_edges on non-manifold meshes.
+  Suspicions from the report's "Not checked" list:
+  S:collapse_short_edges_pinch  collapse_short_edges had the same boundary
+                pinch as M5.
+  S:decimate_ratio  decimate_mesh took ``ratio`` of the quad count but
+                applied it to the triangulated mesh.
+
+Every geometry is built in code; nothing reads a fixture file.
+"""
+import warnings
+
+import numpy as np
+import pytest
+import trimesh
+
+from src.core.halfedge_mesh import HalfEdgeMesh
+from src.reverse_engineering.mesh_tools import (
+    _decimate_with_frozen,
+    collapse_short_edges,
+    compute_mesh_quality,
+    decimate_mesh,
+)
+
+
+# --------------------------------------------------------------------------
+# helpers / checkers
+# --------------------------------------------------------------------------
+
+def _face_lists(mesh: HalfEdgeMesh):
+    return [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
+
+
+def _signed_areas_z(verts, faces):
+    """Signed area (z of the cross product / 2) of each planar triangle."""
+    P = np.asarray(verts, dtype=np.float64)
+    out = []
+    for a, b, c in faces:
+        out.append(0.5 * float(np.cross(P[b] - P[a], P[c] - P[a])[2]))
+    return np.array(out)
+
+
+def _bowtie_vertices(faces):
+    """Vertices whose incident faces split into more than one edge-connected
+    fan (a pinched / bowtie vertex), plus any vertex on an edge with more than
+    two faces."""
+    bad = set()
+    edge_faces = {}
+    for fi, f in enumerate(faces):
+        for i in range(3):
+            a, b = int(f[i]), int(f[(i + 1) % 3])
+            edge_faces.setdefault((min(a, b), max(a, b)), []).append(fi)
+    for (a, b), fs in edge_faces.items():
+        if len(fs) > 2:
+            bad.update((a, b))
+    vert_faces = {}
+    for fi, f in enumerate(faces):
+        for v in f:
+            vert_faces.setdefault(int(v), set()).add(fi)
+    for v, fs in vert_faces.items():
+        # flood-fill the faces around v across the edges that contain v
+        fs = set(fs)
+        start = next(iter(fs))
+        seen = {start}
+        stack = [start]
+        while stack:
+            fi = stack.pop()
+            for w in faces[fi]:
+                w = int(w)
+                if w == v:
+                    continue
+                for g in edge_faces[(min(v, w), max(v, w))]:
+                    if g in fs and g not in seen:
+                        seen.add(g)
+                        stack.append(g)
+        if seen != fs:
+            bad.add(v)
+    return bad
+
+
+def _radial_cos(verts, faces):
+    """cos(angle) between each face normal and the direction from the origin
+    to the face centroid -- 1 for a face of a centred sphere facing out, -1
+    for one flipped inward, 0 for one standing on its edge. A zero-area face
+    gives nan."""
+    P = np.asarray(verts, dtype=np.float64)
+    F = np.asarray(faces, dtype=np.int64)
+    n = np.cross(P[F[:, 1]] - P[F[:, 0]], P[F[:, 2]] - P[F[:, 0]])
+    c = P[F].mean(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (np.einsum("ij,ij->i", n, c)
+                / (np.linalg.norm(n, axis=1) * np.linalg.norm(c, axis=1)))
+
+
+def test_checkers_say_no_to_known_bad_input():
+    """The checkers must flag the outputs the report gives for M4 and M5."""
+    # an inward-facing and an edge-on face of a sphere-like patch
+    V = [[0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 0, 0]]
+    assert _radial_cos(V, [[0, 1, 2]])[0] > 0.5
+    assert _radial_cos(V, [[0, 2, 1]])[0] < -0.5
+    # face through the origin's direction: normal is tangent (cos 0)
+    assert abs(_radial_cos([[1, 0, 0], [2, 0, 0], [1, 0, 1]], [[0, 1, 2]])[0]) < 1e-12
+    # M5's reported output: two triangles meeting only at vertex 1
+    assert _bowtie_vertices([[0, 3, 1], [1, 5, 2]]) == {1}
+    assert _bowtie_vertices([[0, 1, 2], [0, 2, 3]]) == set()
+    # three faces on edge 0-1 is non-manifold too
+    assert {0, 1} <= _bowtie_vertices([[0, 1, 2], [1, 0, 3], [0, 1, 4]])
+    # a clockwise triangle has negative signed area
+    V = [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+    assert _signed_areas_z(V, [[0, 1, 2]])[0] == pytest.approx(0.5)
+    assert _signed_areas_z(V, [[0, 2, 1]])[0] == pytest.approx(-0.5)
+
+
+# --------------------------------------------------------------------------
+# M4 (cand 5): frozen-vertex decimation folds triangles
+# --------------------------------------------------------------------------
+
+def _fold_fan():
+    """Planar fan around a frozen centre (vertex 4). Ring vertices, CCW:
+    0 at 2 deg, 2 at 175 deg, 1 at 185 deg, 3 at 270 deg. The shortest
+    collapsible edge is the ring edge 1-2; moving 2 onto 1 turns face
+    (4,0,2) (173 deg span) into (4,0,1) (183 deg span) -- a fold."""
+    ang = np.radians([2.0, 185.0, 175.0, 270.0])
+    V = np.zeros((5, 3))
+    V[:4, 0] = np.cos(ang)
+    V[:4, 1] = np.sin(ang)
+    F = [[4, 0, 2], [4, 2, 1], [4, 1, 3], [4, 3, 0]]
+    return V, F
+
+
+def test_m4_frozen_decimation_does_not_fold_triangles():
+    """M4 (cand 5): decimate_mesh(frozen_vertices=...) must not flip a face.
+
+    The fan with frozen={4}, target_faces=3 must lose exactly one face and
+    every surviving face must keep a positive signed area. On the buggy code
+    the 1-2 collapse produced face (4,0,1) with signed area -0.026.
+    """
+    V, F = _fold_fan()
+    # precondition: the input is a valid CCW fan and 1-2 is the shortest
+    # unfrozen edge, so it is the collapse tried first
+    assert np.all(_signed_areas_z(V, F) > 0)
+    unfrozen = [(0, 2), (1, 2), (1, 3), (0, 3)]
+    lens = {e: np.linalg.norm(V[e[0]] - V[e[1]]) for e in unfrozen}
+    assert min(lens, key=lens.get) == (1, 2)
+
+    out = decimate_mesh(HalfEdgeMesh.from_arrays(V, F), target_faces=3,
+                        frozen_vertices=[4])
+    out_V = np.array([v.position for v in out.vertices])
+    out_F = _face_lists(out)
+    # the decimation did happen, and only down to the target
+    assert len(out_F) == 3
+    assert len(out_V) == 4
+    areas = _signed_areas_z(out_V, out_F)
+    assert np.all(areas > 0), f"folded face(s): {out_F} areas {areas}"
+    # the frozen centre is still there, unmoved
+    assert any(np.allclose(p, [0, 0, 0], atol=1e-12) for p in out_V)
+
+
+def test_m4_direct_collapse_rejects_fold_and_takes_the_safe_edge():
+    """M4 (cand 5): the private pass must skip the folding 1-2 collapse and
+    collapse 1-3 instead (vertex 3 onto 1), leaving (4,0,2),(4,2,1),(4,1,0),
+    all with positive area: 0.0609, 0.0868, 0.0262 (+-1e-4)."""
+    V, F = _fold_fan()
+    new_faces = _decimate_with_frozen(V.copy(), [list(f) for f in F], {4}, 3)
+    assert sorted(map(tuple, new_faces)) == sorted([(4, 0, 2), (4, 2, 1), (4, 1, 0)])
+    areas = _signed_areas_z(V, new_faces)
+    expected = {(4, 0, 2): 0.5 * np.sin(np.radians(173.0)),
+                (4, 2, 1): 0.5 * np.sin(np.radians(10.0)),
+                (4, 1, 0): 0.5 * np.sin(np.radians(177.0))}
+    for f, a in zip(new_faces, areas):
+        assert a == pytest.approx(expected[tuple(f)], abs=1e-4)
+
+
+def _jittered_ico3():
+    rng = np.random.default_rng(0)
+    s = trimesh.creation.icosphere(subdivisions=3)
+    V = np.asarray(s.vertices) * (1 + rng.uniform(-0.02, 0.02, (len(s.vertices), 1)))
+    F = np.asarray(s.faces).tolist()
+    return V, F
+
+
+def _assert_closed_outward(V, F, n_faces, cos_min=0.5):
+    assert len(F) == n_faces
+    cos = _radial_cos(V, F)
+    assert np.all(np.isfinite(cos)), "zero-area face in the output"
+    # 0 would be a face standing on its edge, < 0 one flipped inward; the
+    # fixed pass keeps every face within ~60 deg of radial here
+    assert cos.min() > cos_min, (
+        f"{np.sum(cos <= cos_min)} face(s) folded or on edge, min cos {cos.min():.3f}")
+    tm = trimesh.Trimesh(np.asarray(V), np.asarray(F), process=False)
+    assert tm.is_watertight
+    assert tm.is_winding_consistent
+
+
+def test_m4_curved_surface_decimation_keeps_faces_outward():
+    """M4 (cand 5), curved input: on a 2%-jittered icosphere(3) with every
+    20th vertex frozen, decimation 1280 -> 256 faces must leave every face
+    facing outward (cos(normal, centroid direction) > 0) and the surface
+    closed. A check that only rejects a sign flip against the CURRENT normal
+    let faces turn ~90 deg per collapse and keep drifting: the first fix gave
+    5 inward faces here, min cos -0.998."""
+    V, F = _jittered_ico3()
+    frozen = set(range(0, len(V), 20))
+    # precondition: the input is a closed, cleanly outward sphere
+    assert len(F) == 1280 and len(frozen) == 33
+    assert _radial_cos(V, F).min() > 0.9
+    _assert_closed_outward(V, F, 1280)
+
+    out = _decimate_with_frozen(V.copy(), [list(f) for f in F], frozen, 256)
+    _assert_closed_outward(V, out, 256)
+    # the frozen vertices are all still used
+    assert frozen <= {int(v) for f in out for v in f}
+
+    # same through the public entry point
+    res = decimate_mesh(HalfEdgeMesh.from_arrays(V, F), target_faces=256,
+                        frozen_vertices=sorted(frozen))
+    res_V = np.array([v.position for v in res.vertices])
+    _assert_closed_outward(res_V, _face_lists(res), 256)
+
+
+def test_m4_clean_sphere_halved_has_no_edge_on_faces():
+    """M4 (cand 5), curved input: a clean icosphere(3) halved (frozen={0},
+    1280 -> 640) must not contain a face whose plane passes through the
+    centre (|det(a,b,c)| ~ 0, a face turned 90 deg). The first fix left 45
+    of them; every face must also still face outward."""
+    s = trimesh.creation.icosphere(subdivisions=3)
+    V = np.asarray(s.vertices)
+    F = np.asarray(s.faces).tolist()
+    P = V[np.asarray(F)]
+    assert np.abs(np.linalg.det(P)).min() > 1e-3      # precondition
+    out = _decimate_with_frozen(V.copy(), [list(f) for f in F], {0}, 640)
+    _assert_closed_outward(V, out, 640)
+    det = np.linalg.det(V[np.asarray(out)])
+    assert np.abs(det).min() > 1e-9, f"{np.sum(np.abs(det) < 1e-9)} edge-on face(s)"
+
+
+def _wedge(deg=20.0, subdiv=3):
+    """Closed triangular prism whose long edge has a sharp 'deg' crease."""
+    th = np.radians(deg)
+    P = np.array([[0, 0, 0], [1, 0, 0], [np.cos(th), np.sin(th), 0],
+                  [0, 0, 2], [1, 0, 2], [np.cos(th), np.sin(th), 2]])
+    w = trimesh.Trimesh(P, [[0, 2, 1], [3, 4, 5], [0, 1, 4], [0, 4, 3],
+                            [1, 2, 5], [1, 5, 4], [2, 0, 3], [2, 3, 5]],
+                        process=False)
+    w.fix_normals()
+    for _ in range(subdiv):
+        w = w.subdivide()
+    return w
+
+
+def test_m4_fold_check_still_decimates_along_a_sharp_crease():
+    """M4 (cand 5) companion: the fold check compares a face with the input
+    vertex normals, but at a sharp crease the INPUT faces already lean more
+    than acos(0.3) ~ 72.5 deg from the vertex normal. The floor there must
+    drop to the input's own lean, or the pass stalls: a 20-deg wedge
+    (512 faces, frozen={0}) must still reach 102 faces, closed, with the
+    volume kept to 2% and no dihedral sharper than the input's 160 deg."""
+    w = _wedge()
+    V, F = np.asarray(w.vertices), w.faces.tolist()
+    assert len(F) == 512 and w.is_watertight and w.is_winding_consistent
+    # precondition: some input face leans past acos(0.3) from an area-weighted
+    # vertex normal at one of its corners
+    fn = np.cross(V[w.faces[:, 1]] - V[w.faces[:, 0]], V[w.faces[:, 2]] - V[w.faces[:, 0]])
+    vn = np.zeros_like(V)
+    for k in range(3):
+        np.add.at(vn, w.faces[:, k], fn)
+    vn /= np.linalg.norm(vn, axis=1)[:, None]
+    fu = fn / np.linalg.norm(fn, axis=1)[:, None]
+    lean = min(float(fu[i] @ vn[x]) for i, f in enumerate(w.faces) for x in f)
+    assert lean < 0.3
+    in_dih = float(np.degrees(w.face_adjacency_angles.max()))
+    assert in_dih == pytest.approx(160.0, abs=1e-6)
+
+    out = _decimate_with_frozen(V.copy(), [list(f) for f in F], {0}, 102)
+    assert len(out) == 102
+    tm = trimesh.Trimesh(V, out, process=False)
+    assert tm.is_watertight and tm.is_winding_consistent
+    assert tm.volume == pytest.approx(w.volume, rel=0.02)
+    assert float(np.degrees(tm.face_adjacency_angles.max())) <= in_dih + 1e-6
+
+
+# --------------------------------------------------------------------------
+# M5 (cand 20): frozen-vertex decimation pinches boundaries
+# --------------------------------------------------------------------------
+
+def _pinch_strip(short_interior=True):
+    """Open 4-triangle strip. Top row 0,1,2 and bottom row 3,4,5 -- every
+    vertex is on the boundary. With short_interior the shortest edge is the
+    INTERIOR edge 1-4 (0.2 long), joining two boundary vertices."""
+    if short_interior:
+        V = np.array([[0, 1, 0], [1, .6, 0], [2, 1, 0],
+                      [0, 0, 0], [1, .4, 0], [2, 0, 0]], dtype=float)
+    else:
+        # the shortest edge is the BOUNDARY edge 0-1 (0.1 long)
+        V = np.array([[0, 1, 0], [0.1, 1, 0], [2, 1, 0],
+                      [0, 0, 0], [1, 0, 0], [2, 0, 0]], dtype=float)
+    F = [[3, 4, 0], [0, 4, 1], [4, 5, 1], [1, 5, 2]]
+    return V, F
+
+
+def test_m5_strip_precondition():
+    """M5 (cand 20) precondition: the strip is manifold, CCW, and its
+    shortest edge is the interior edge 1-4 with both endpoints on the
+    boundary (so the link condition alone accepts it)."""
+    V, F = _pinch_strip()
+    assert _bowtie_vertices(F) == set()
+    assert np.all(_signed_areas_z(V, F) > 0)
+    tm = trimesh.Trimesh(V, F, process=False)
+    edges = tm.edges_unique
+    lens = tm.edges_unique_length
+    assert tuple(sorted(edges[np.argmin(lens)])) == (1, 4)
+    assert lens.min() == pytest.approx(0.2, abs=1e-12)
+    # every vertex is a boundary vertex
+    q = compute_mesh_quality(HalfEdgeMesh.from_arrays(V, F))
+    assert q['boundary_edges'] == 6
+
+
+def test_m5_direct_decimation_keeps_boundary_manifold():
+    """M5 (cand 20): with no frozen vertex and target 2 the pass must still
+    reach 2 faces but never via the pinching 1-4 collapse; the result must
+    have no bowtie vertex. The buggy code returned [[3,1,0],[1,5,2]]."""
+    V, F = _pinch_strip()
+    new_faces = _decimate_with_frozen(V.copy(), [list(f) for f in F], set(), 2)
+    assert len(new_faces) == 2
+    assert _bowtie_vertices(new_faces) == set(), new_faces
+    assert np.all(_signed_areas_z(V, new_faces) > 0)
+    assert sorted(map(tuple, new_faces)) == sorted([(0, 4, 1), (4, 2, 1)])
+
+
+def test_m5_boundary_status_is_inherited_by_the_survivor():
+    """M5 (cand 20): after the interior vertex 4 absorbs a boundary vertex it
+    is itself on the boundary, so a later interior edge from it to another
+    boundary vertex must not be collapsed either. On this jittered 2x2 sheet
+    (target 3) forgetting that gives the bowtie [[0,2,3],[3,8,6]]; the right
+    result is [[0,4,3],[0,2,4],[4,8,3]]."""
+    V = np.array([[0.297, -0.11], [0.81, 0.228], [2.187, 0.101],
+                  [0.275, 1.255], [1.149, 1.216], [1.848, 0.785],
+                  [0.102, 2.129], [0.8, 1.937], [2.246, 2.037]])
+    V = np.column_stack([V, np.zeros(len(V))])
+    F = [[0, 1, 3], [1, 4, 3], [1, 2, 5], [1, 5, 4],
+         [3, 4, 6], [4, 7, 6], [4, 5, 7], [5, 8, 7]]
+    assert _bowtie_vertices(F) == set()
+    assert np.all(_signed_areas_z(V, F) > 0)
+    new_faces = _decimate_with_frozen(V.copy(), [list(f) for f in F], set(), 3)
+    assert sorted(map(tuple, new_faces)) == sorted([(0, 4, 3), (0, 2, 4), (4, 8, 3)])
+    assert _bowtie_vertices(new_faces) == set()
+    assert np.all(_signed_areas_z(V, new_faces) > 0)
+
+
+def test_m4_m5_random_open_sheets_stay_manifold_and_fold_free():
+    """M4 (cand 5) + M5 (cand 20): 300 seeded random jittered open sheets,
+    decimated to a random target: no output may contain a bowtie vertex or a
+    face with non-positive signed area, and the pass must actually remove
+    faces on most of them (it is not allowed to get there by doing nothing)."""
+    rng = np.random.default_rng(12345)
+    reduced = 0
+    for _ in range(300):
+        n, m = int(rng.integers(1, 4)), int(rng.integers(1, 4))
+        xs, ys = np.meshgrid(np.arange(n + 1.0), np.arange(m + 1.0))
+        V = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)])
+        V[:, :2] += rng.uniform(-0.3, 0.3, (len(V), 2))
+        F = []
+        for j in range(m):
+            for i in range(n):
+                a = j * (n + 1) + i
+                if rng.random() < 0.5:
+                    F += [[a, a + 1, a + n + 2], [a, a + n + 2, a + n + 1]]
+                else:
+                    F += [[a, a + 1, a + n + 1], [a + 1, a + n + 2, a + n + 1]]
+        assert np.all(_signed_areas_z(V, F) > 0)
+        tgt = int(rng.integers(1, len(F))) if len(F) > 1 else 1
+        out = _decimate_with_frozen(V.copy(), [list(f) for f in F], set(), tgt)
+        assert out, "decimation emptied the mesh"
+        assert _bowtie_vertices(out) == set(), (V.tolist(), F, tgt, out)
+        assert np.all(_signed_areas_z(V, out) > 0), (V.tolist(), F, tgt, out)
+        reduced += len(out) < len(F)
+    assert reduced >= 150
+
+
+def _euler_and_loops(faces):
+    """(V - E + F over the used vertices, number of boundary loops)."""
+    edges = {}
+    for f in faces:
+        for i in range(3):
+            a, b = int(f[i]), int(f[(i + 1) % 3])
+            k = (min(a, b), max(a, b))
+            edges[k] = edges.get(k, 0) + 1
+    used = {int(v) for f in faces for v in f}
+    chi = len(used) - len(edges) + len(faces)
+    nbr = {}
+    for (a, b), c in edges.items():
+        if c == 1:
+            nbr.setdefault(a, set()).add(b)
+            nbr.setdefault(b, set()).add(a)
+    loops, seen = 0, set()
+    for v in nbr:
+        if v in seen:
+            continue
+        loops += 1
+        stack = [v]
+        seen.add(v)
+        while stack:
+            for w in nbr[stack.pop()]:
+                if w not in seen:
+                    seen.add(w)
+                    stack.append(w)
+    return chi, loops
+
+
+def test_m4_m5_larger_sheets_with_holes_and_frozen_vertices():
+    """M4 (cand 5) + M5 (cand 20): 80 seeded jittered sheets of 4x4..8x8
+    cells, half of them with a one-cell hole, 0-3 random frozen vertices:
+    no bowtie, no fold, the topology (Euler characteristic, boundary-loop
+    count) kept, every frozen vertex still used, and the face count reduced
+    on most of them."""
+    # checker says yes to a disc and no to two separate triangles (chi 2,
+    # 2 loops) and to a square with a hole (chi 0, 2 loops)
+    assert _euler_and_loops([[0, 1, 2], [0, 2, 3]]) == (1, 1)
+    assert _euler_and_loops([[0, 1, 2], [3, 4, 5]]) == (2, 2)
+    ring = [[0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6],
+            [3, 0, 4], [3, 4, 7]]
+    assert _euler_and_loops(ring) == (0, 2)
+    rng = np.random.default_rng(2024)
+    reduced = 0
+    for _ in range(80):
+        n, m = int(rng.integers(4, 9)), int(rng.integers(4, 9))
+        xs, ys = np.meshgrid(np.arange(n + 1.0), np.arange(m + 1.0))
+        V = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)])
+        V[:, :2] += rng.uniform(-0.3, 0.3, (len(V), 2))
+        hole = (int(rng.integers(1, n - 1)), int(rng.integers(1, m - 1))) \
+            if rng.random() < 0.5 else None
+        F = []
+        for j in range(m):
+            for i in range(n):
+                if (i, j) == hole:
+                    continue
+                a = j * (n + 1) + i
+                if rng.random() < 0.5:
+                    F += [[a, a + 1, a + n + 2], [a, a + n + 2, a + n + 1]]
+                else:
+                    F += [[a, a + 1, a + n + 1], [a + 1, a + n + 2, a + n + 1]]
+        assert np.all(_signed_areas_z(V, F) > 0)
+        chi, loops = _euler_and_loops(F)
+        assert (chi, loops) == ((0, 2) if hole else (1, 1))
+        frozen = set(int(x) for x in rng.choice(len(V), int(rng.integers(0, 4)), replace=False))
+        tgt = int(rng.integers(1, len(F)))
+        out = _decimate_with_frozen(V.copy(), [list(f) for f in F], frozen, tgt)
+        assert out
+        # an interior collapse removes two faces, so it may undershoot by one
+        assert len(out) >= tgt - 1
+        assert _bowtie_vertices(out) == set(), (V.tolist(), F, frozen, tgt)
+        assert np.all(_signed_areas_z(V, out) > 0)
+        assert _euler_and_loops(out) == (chi, loops)
+        assert frozen <= {int(v) for f in out for v in f}
+        reduced += len(out) < len(F)
+    assert reduced >= 70
+
+
+def test_m5_public_decimation_keeps_boundary_manifold():
+    """M5 (cand 20): same strip through decimate_mesh(frozen_vertices=[2]),
+    target 2: two faces, manifold, frozen vertex 2 kept at (2,1,0)."""
+    V, F = _pinch_strip()
+    out = decimate_mesh(HalfEdgeMesh.from_arrays(V, F), target_faces=2,
+                        frozen_vertices=[2])
+    out_F = _face_lists(out)
+    out_V = np.array([v.position for v in out.vertices])
+    assert len(out_F) == 2
+    assert _bowtie_vertices(out_F) == set(), out_F
+    assert np.all(_signed_areas_z(out_V, out_F) > 0)
+    assert any(np.allclose(p, [2, 1, 0], atol=1e-12) for p in out_V)
+
+
+# --------------------------------------------------------------------------
+# S:collapse_short_edges_pinch
+# --------------------------------------------------------------------------
+
+def test_collapse_short_edges_does_not_pinch_open_boundary():
+    """Suspicion (same pinch as M5 in collapse_short_edges): the only short
+    edge (rel_threshold 0.3 -> threshold 0.323) is the interior edge 1-4
+    joining two boundary vertices. It must be left alone: 4 faces, 6
+    vertices, no bowtie. The buggy code merged it into [[3,1,0],[1,4,2]]."""
+    V, F = _pinch_strip()
+    tm = trimesh.Trimesh(V, F, process=False)
+    lens = np.sort(tm.edges_unique_length)
+    thr = 0.3 * float(np.median(lens))
+    assert np.sum(lens < thr) == 1        # exactly one short edge (1-4)
+
+    out = collapse_short_edges(tm, rel_threshold=0.3)
+    assert len(out.faces) == 4
+    assert len(out.vertices) == 6
+    assert _bowtie_vertices(out.faces.tolist()) == set()
+
+
+def test_collapse_short_edges_still_collapses_short_boundary_edge():
+    """Companion to the pinch test: a short BOUNDARY edge (0-1, 0.1 long)
+    is still collapsed -- 4 faces -> 3, 6 vertices -> 5, manifold."""
+    V, F = _pinch_strip(short_interior=False)
+    tm = trimesh.Trimesh(V, F, process=False)
+    lens = np.sort(tm.edges_unique_length)
+    assert np.sum(lens < 0.3 * float(np.median(lens))) == 1
+
+    out = collapse_short_edges(tm, rel_threshold=0.3)
+    assert len(out.faces) == 3
+    assert len(out.vertices) == 5
+    assert _bowtie_vertices(out.faces.tolist()) == set()
+
+
+# --------------------------------------------------------------------------
+# M17 (cand 21): compute_mesh_quality on non-manifold meshes
+# --------------------------------------------------------------------------
+
+_NM_VERTS = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [0, -1, 0]],
+                     dtype=float)
+
+
+@pytest.mark.parametrize("faces", [
+    [[0, 1, 2], [1, 0, 3], [0, 1, 4]],   # the report's input
+    [[0, 1, 2], [0, 1, 3], [0, 1, 4]],   # same edge, all one direction
+])
+def test_m17_non_manifold_edge_and_boundary_counts(faces):
+    """M17 (cand 21): three faces on edge 0-1 give 7 undirected edges, 6 of
+    them boundary (every edge except 0-1), 1 non-manifold. The buggy code
+    reported 8/7 (first input) and 9/9 (second) from the half-edge Edge
+    list, which holds a separate untwinned Edge per extra face."""
+    mesh = HalfEdgeMesh.from_arrays(_NM_VERTS, faces)
+    # precondition: the half-edge structure really does hold extra Edges
+    assert len(mesh.edges) > 7
+    q = compute_mesh_quality(mesh)
+    assert q['edge_count'] == 7
+    assert q['boundary_edges'] == 6
+    assert q['non_manifold_edges'] == 1
+
+
+def test_m17_manifold_counts_unchanged():
+    """M17 (cand 21) control: on manifold meshes the counts are the plain
+    ones -- a closed icosphere(2) has 480 edges and 0 boundary edges; a
+    single triangle has 3 edges, all boundary."""
+    ico = HalfEdgeMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=2))
+    q = compute_mesh_quality(ico)
+    assert q['edge_count'] == 480 == len(ico.edges)
+    assert q['boundary_edges'] == 0
+    tri = HalfEdgeMesh.from_arrays(_NM_VERTS[:3], [[0, 1, 2]])
+    q = compute_mesh_quality(tri)
+    assert q['edge_count'] == 3
+    assert q['boundary_edges'] == 3
+
+
+# --------------------------------------------------------------------------
+# S:decimate_ratio
+# --------------------------------------------------------------------------
+
+def _quad_grid(n=6):
+    xs, ys = np.meshgrid(np.arange(n + 1), np.arange(n + 1))
+    V = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)]).astype(float)
+    Q = [[j * (n + 1) + i, j * (n + 1) + i + 1,
+          (j + 1) * (n + 1) + i + 1, (j + 1) * (n + 1) + i]
+         for j in range(n) for i in range(n)]
+    return V, Q
+
+
+def test_decimate_ratio_counts_the_triangulated_mesh():
+    """Suspicion (decimate_ratio): ratio=0.5 on a 36-quad cage must give the
+    same result size as on its own 72-triangle triangulation (36 triangles),
+    not 18 (half the QUAD count, i.e. a quarter of the triangles decimated)."""
+    V, Q = _quad_grid(6)
+    quads = HalfEdgeMesh.from_arrays(V, Q)
+    tris = HalfEdgeMesh.from_trimesh(quads.to_trimesh())
+    assert len(quads.faces) == 36 and len(tris.faces) == 72
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)   # quad -> tri warning
+        from_quads = decimate_mesh(quads, ratio=0.5)
+    from_tris = decimate_mesh(tris, ratio=0.5)
+    # the decimation really reduced the triangle count ...
+    assert 30 <= len(from_tris.faces) <= 40
+    # ... and the quad cage is treated as the same surface
+    assert len(from_quads.faces) == len(from_tris.faces)
