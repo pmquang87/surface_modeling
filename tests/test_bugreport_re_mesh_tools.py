@@ -345,3 +345,34 @@ def test_m17_manifold_counts_unchanged():
     q = compute_mesh_quality(tri)
     assert q['edge_count'] == 3
     assert q['boundary_edges'] == 3
+
+
+# --------------------------------------------------------------------------
+# S:decimate_ratio
+# --------------------------------------------------------------------------
+
+def _quad_grid(n=6):
+    xs, ys = np.meshgrid(np.arange(n + 1), np.arange(n + 1))
+    V = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)]).astype(float)
+    Q = [[j * (n + 1) + i, j * (n + 1) + i + 1,
+          (j + 1) * (n + 1) + i + 1, (j + 1) * (n + 1) + i]
+         for j in range(n) for i in range(n)]
+    return V, Q
+
+
+def test_decimate_ratio_counts_the_triangulated_mesh():
+    """Suspicion (decimate_ratio): ratio=0.5 on a 36-quad cage must give the
+    same result size as on its own 72-triangle triangulation (36 triangles),
+    not 18 (half the QUAD count, i.e. a quarter of the triangles decimated)."""
+    V, Q = _quad_grid(6)
+    quads = HalfEdgeMesh.from_arrays(V, Q)
+    tris = HalfEdgeMesh.from_trimesh(quads.to_trimesh())
+    assert len(quads.faces) == 36 and len(tris.faces) == 72
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)   # quad -> tri warning
+        from_quads = decimate_mesh(quads, ratio=0.5)
+    from_tris = decimate_mesh(tris, ratio=0.5)
+    # the decimation really reduced the triangle count ...
+    assert 30 <= len(from_tris.faces) <= 40
+    # ... and the quad cage is treated as the same surface
+    assert len(from_quads.faces) == len(from_tris.faces)

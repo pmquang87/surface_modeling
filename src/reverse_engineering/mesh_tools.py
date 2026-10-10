@@ -515,13 +515,17 @@ def decimate_mesh(mesh: HalfEdgeMesh, target_faces: int = None,
     is given -- a local edge-collapse pass that never touches those vertices.
 
     Note: the mesh round-trips through ``to_trimesh()``, so a quad/ngon cage
-    comes back triangulated (a warning says so).
+    comes back triangulated (a warning says so). ``target_faces`` counts the
+    output triangles, and ``ratio`` is taken of the triangulated input: a
+    quad cage has about twice as many triangles as quads, and a ratio of the
+    quad count would decimate it twice as hard as the same surface given as
+    triangles.
     """
     _warn_if_not_triangles(mesh, "decimate_mesh")
     t_mesh = mesh.to_trimesh()
 
     if target_faces is None:
-        target_faces = int(len(mesh.faces) * ratio)
+        target_faces = int(len(t_mesh.faces) * ratio)
 
     if frozen_vertices:
         verts = np.array(t_mesh.vertices, dtype=np.float64)
