@@ -8,6 +8,8 @@ Covers:
   cand 12       _subdivide_once gave a dart (an interior vertex with exactly one
                 creased edge) the corner rule and pinned it in place; the
                 standard dart rule is the smooth vertex rule
+  S:isolated    identify_regular_regions called a vertex without faces
+                "regular" (flagged by the core-mesh fixes, M12 follow-up)
 
 pyopencl is not installed here, so the H1 tests stub ONLY pyopencl: the stub's
 Program compiles the kernel source string OpenCLSubdivider hands it (the
@@ -594,3 +596,23 @@ def test_cand12_boundary_vertex_with_one_crease_keeps_the_corner_rule():
     e.crease_weight = 1.0
     out = subdivide(plane, 1)
     assert np.allclose(out.vertices[1].position, v.position, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# S:isolated (M12 follow-up): a vertex without faces is not regular
+# ---------------------------------------------------------------------------
+
+def test_isolated_vertex_is_not_a_regular_vertex():
+    """S:isolated: identify_regular_regions documents regular vertices as
+    'surrounded by quads'. A vertex without any face is not, but it was
+    reported regular (is_boundary_vertex is True and valence 0 <= 3)."""
+    plane = create_plane(subdivisions_x=3, subdivisions_y=3)
+    lone = plane.add_vertex([5.0, 5.0, 5.0])
+    assert plane.get_vertex_faces(lone) == [] and plane.is_boundary_vertex(lone)
+
+    regular, irregular = identify_regular_regions(plane)
+    assert len(regular) + len(irregular) == len(plane.vertices) == 17
+    assert lone.index not in {v.index for v in regular}, "a vertex without faces is 'regular'"
+    assert lone.index in {v.index for v in irregular}
+    # the 16 vertices of the quad grid are still all regular
+    assert len(regular) == 16

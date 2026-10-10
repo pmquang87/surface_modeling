@@ -405,7 +405,12 @@ def identify_regular_regions(mesh: HalfEdgeMesh) -> tuple[list[Vertex], list[Ver
     for v in mesh.vertices:
         is_reg = True
         faces = mesh.get_vertex_faces(v)
-        
+        if not faces:
+            # No faces is not "surrounded by quads". Without this an isolated
+            # vertex passed as regular: it counts as boundary, valence 0 <= 3.
+            irregular.append(v)
+            continue
+
         for f in faces:
             if len(mesh.get_face_vertices(f)) != 4:
                 is_reg = False
