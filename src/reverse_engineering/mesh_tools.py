@@ -836,7 +836,6 @@ def compute_mesh_quality(mesh: HalfEdgeMesh) -> dict:
     stats = {
         'face_count': len(mesh.faces),
         'vertex_count': len(mesh.vertices),
-        'edge_count': len(mesh.edges),
         'watertight': t_mesh.is_watertight,
         'manifold': t_mesh.is_winding_consistent,
     }
@@ -854,14 +853,12 @@ def compute_mesh_quality(mesh: HalfEdgeMesh) -> dict:
             stats['max_angle'] = float(np.max(angles))
             stats['avg_angle'] = float(np.mean(angles))
 
-    # Boundary edges
-    boundary_edges = sum(1 for e in mesh.edges if mesh.is_boundary_edge(e))
-    stats['boundary_edges'] = boundary_edges
-
-    # Non-manifold edges: count undirected edges with face incidence > 2.
-    # The half-edge structure does NOT enforce manifoldness -- add_face happily
-    # accepts a third face on an existing edge, it just leaves the extra
-    # half-edge untwinned -- so this has to be measured on the face set.
+    # Edge, boundary-edge and non-manifold-edge counts, all from undirected
+    # face incidence. The half-edge structure does NOT enforce manifoldness --
+    # add_face happily accepts a third face on an existing edge, it just
+    # leaves the extra half-edge untwinned as a second Edge -- so len(edges)
+    # and the untwinned-edge count both overcount there; measure on the face
+    # set instead.
     incidence: Dict[tuple, int] = {}
     for f in mesh.faces:
         fv = [v.index for v in mesh.get_face_vertices(f)]
@@ -870,6 +867,8 @@ def compute_mesh_quality(mesh: HalfEdgeMesh) -> dict:
             a, b = fv[i], fv[(i + 1) % n]
             key = (a, b) if a < b else (b, a)
             incidence[key] = incidence.get(key, 0) + 1
+    stats['edge_count'] = len(incidence)
+    stats['boundary_edges'] = int(sum(1 for c in incidence.values() if c == 1))
     stats['non_manifold_edges'] = int(sum(1 for c in incidence.values() if c > 2))
 
     return stats

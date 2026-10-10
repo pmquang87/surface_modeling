@@ -305,3 +305,43 @@ def test_collapse_short_edges_still_collapses_short_boundary_edge():
     assert len(out.faces) == 3
     assert len(out.vertices) == 5
     assert _bowtie_vertices(out.faces.tolist()) == set()
+
+
+# --------------------------------------------------------------------------
+# M17 (cand 21): compute_mesh_quality on non-manifold meshes
+# --------------------------------------------------------------------------
+
+_NM_VERTS = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [0, -1, 0]],
+                     dtype=float)
+
+
+@pytest.mark.parametrize("faces", [
+    [[0, 1, 2], [1, 0, 3], [0, 1, 4]],   # the report's input
+    [[0, 1, 2], [0, 1, 3], [0, 1, 4]],   # same edge, all one direction
+])
+def test_m17_non_manifold_edge_and_boundary_counts(faces):
+    """M17 (cand 21): three faces on edge 0-1 give 7 undirected edges, 6 of
+    them boundary (every edge except 0-1), 1 non-manifold. The buggy code
+    reported 8/7 (first input) and 9/9 (second) from the half-edge Edge
+    list, which holds a separate untwinned Edge per extra face."""
+    mesh = HalfEdgeMesh.from_arrays(_NM_VERTS, faces)
+    # precondition: the half-edge structure really does hold extra Edges
+    assert len(mesh.edges) > 7
+    q = compute_mesh_quality(mesh)
+    assert q['edge_count'] == 7
+    assert q['boundary_edges'] == 6
+    assert q['non_manifold_edges'] == 1
+
+
+def test_m17_manifold_counts_unchanged():
+    """M17 (cand 21) control: on manifold meshes the counts are the plain
+    ones -- a closed icosphere(2) has 480 edges and 0 boundary edges; a
+    single triangle has 3 edges, all boundary."""
+    ico = HalfEdgeMesh.from_trimesh(trimesh.creation.icosphere(subdivisions=2))
+    q = compute_mesh_quality(ico)
+    assert q['edge_count'] == 480 == len(ico.edges)
+    assert q['boundary_edges'] == 0
+    tri = HalfEdgeMesh.from_arrays(_NM_VERTS[:3], [[0, 1, 2]])
+    q = compute_mesh_quality(tri)
+    assert q['edge_count'] == 3
+    assert q['boundary_edges'] == 3
