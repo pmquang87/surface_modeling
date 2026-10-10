@@ -15,9 +15,9 @@ rewrite. Two deliberate differences from the original:
 * the original discards the whole HEADER; here the HEADER is **kept** (with
   the timestamp blanked). A changed schema, unit, or preprocessor version is
   a real change in the product we ship, and dropping the HEADER would hide it.
-* section slicing is string-literal aware rather than line-anchored, so a
-  ``DATA;`` that occurs *inside* a STEP string cannot be mistaken for the
-  start of the DATA section.
+* section slicing is string-literal and comment aware rather than
+  line-anchored, so a ``DATA;`` that occurs *inside* a STEP string or a
+  ``/* ... */`` comment cannot be mistaken for the start of the DATA section.
 
 What is deliberately **not** done:
 
@@ -84,10 +84,12 @@ def strip_file_name_timestamp(text: str) -> str:
 
 
 def _string_mask(text: str) -> List[bool]:
-    """True for every character that sits inside a STEP ``'...'`` literal.
+    """True for every character inside a STEP ``'...'`` literal or comment.
 
     STEP escapes an apostrophe by doubling it, so ``'it''s'`` is one string.
-    The mask marks the quotes themselves as inside, which is all we need:
+    A ``/* ... */`` comment may sit between tokens; an apostrophe inside it is
+    not a string delimiter, and a ``/*`` inside a string is not a comment.
+    The mask marks the delimiters themselves as inside, which is all we need:
     a section keyword found at a masked position is not a keyword.
     """
     mask = [False] * len(text)
@@ -96,6 +98,12 @@ def _string_mask(text: str) -> List[bool]:
     n = len(text)
     while i < n:
         ch = text[i]
+        if not inside and ch == "/" and i + 1 < n and text[i + 1] == "*":
+            close = text.find("*/", i + 2)
+            end = n if close < 0 else close + 2
+            mask[i:end] = [True] * (end - i)
+            i = end
+            continue
         if ch == "'":
             if inside and i + 1 < n and text[i + 1] == "'":
                 mask[i] = True

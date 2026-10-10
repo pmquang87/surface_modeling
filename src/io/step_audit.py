@@ -133,6 +133,23 @@ def _census(step_path: str) -> Optional[Dict[str, Any]]:
         return {"error": str(exc)}
 
 
+def _census_problem(census: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Why the census cannot serve as a witness, or None when it can.
+
+    ``None`` (the census module is not installed) is not a problem: the
+    census is optional. A census that ran and failed, or whose faces did not
+    all land in a surface bucket, is - otherwise the audit would pass with its
+    second witness silently gone (step_census docstring, item 8).
+    """
+    if not isinstance(census, dict):
+        return None
+    if census.get("ok") is False or "error" in census:
+        return str(census.get("error") or "census failed")
+    if census.get("surfaces_consistent") is False:
+        return "an ADVANCED_FACE has no surface bucket (surfaces_consistent)"
+    return None
+
+
 def _load_reference(reference: Any):
     """Accept a path to an STL/OBJ or an in-memory ``trimesh.Trimesh``."""
     if reference is None:
@@ -160,7 +177,7 @@ def _empty_measurement(expected_faces: Optional[int]) -> Dict[str, Any]:
         "bbox_step": None, "bbox_stl": None, "bbox_max_diff_mm": None,
         "dev_mean_mm": None, "dev_p95_mm": None, "dev_max_mm": None,
         "expected_faces": expected_faces,
-        "census_faces": None, "census": None,
+        "census_faces": None, "census": None, "census_error": None,
     }
 
 
@@ -178,6 +195,7 @@ def measure_step(step_path: str, reference_stl: Optional[str] = None,
         m = _empty_measurement(expected_faces)
         m["step_path"] = step_path
         m["census"] = _census(step_path)
+        m["census_error"] = _census_problem(m["census"])
         return m
     m = measure_shape(shape, reference_stl=reference_stl,
                       expected_faces=expected_faces,
@@ -186,6 +204,9 @@ def measure_step(step_path: str, reference_stl: Optional[str] = None,
     m["step_path"] = step_path
     census = _census(step_path)
     m["census"] = census
+    # flat copy of the census failure: callers pop the verbose ``census`` dict
+    # before ``verdict`` (convert.py, faceted_step.py)
+    m["census_error"] = _census_problem(census)
     if census and "faces" in census:
         m["census_faces"] = int(census["faces"])
     return m
@@ -250,7 +271,7 @@ def measure_shape(shape: Any, reference_stl: Optional[str] = None,
         if m["bbox_step"] is not None:
             m["bbox_max_diff_mm"] = float(np.abs(
                 np.asarray(m["bbox_step"]) - ref.bounds).max())
-        if len(points):
+        if len(points) and deviation_samples > 0:   # 0 samples = not measured
             rng = np.random.default_rng(seed)
             k = min(deviation_samples, len(points))
             sample = points[rng.choice(len(points), k, replace=False)]
@@ -298,6 +319,9 @@ def verdict(m: Dict[str, Any], volume_tol_pct: Optional[float] = None
     cf = m.get("census_faces")
     if _CENSUS_MUST_MATCH and cf is not None and cf != m.get("faces"):
         reasons.append(f"text census counts {cf} faces, OpenCascade read {m.get('faces')}")
+    census_problem = m.get("census_error") or _census_problem(m.get("census"))
+    if census_problem:
+        reasons.append(f"text census failed: {census_problem}")
     return (2 if reasons else 0), reasons
 
 

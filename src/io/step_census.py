@@ -45,6 +45,9 @@ Copyright (c) 2026 stl2step contributors); modified for surface_modeling:
    ``{"ok": False, "error": ...}``. ``step_audit._census`` swallows an
    exception into a warning, which would have removed the second witness from
    the audit without failing it.
+9. ``compare_expect`` also checks ``edges`` and ``curves_consistent`` (both
+   in every census, so a truth file written from one carries them) and sorts
+   the expected ``cylinder_radii`` the way the census sorts its own.
 
 Why the file exists at all: it is the audit's second witness. It shares no code
 with the OpenCascade writer or reader, so when ``step_audit.verdict`` finds the
@@ -465,7 +468,9 @@ def compare_expect(expected: dict[str, Any], actual: dict[str, Any]) -> list[str
     if not actual.get("ok"):
         return [actual.get("error", "census failed")]
 
-    for key in ("faces",):
+    # every count the census reports; a truth file written from a census
+    # carries "edges" too, and must not have it silently ignored
+    for key in ("faces", "edges"):
         if key in expected and actual.get(key) != expected[key]:
             errs.append(f"{key}: got {actual.get(key)} want {expected[key]}")
 
@@ -478,13 +483,16 @@ def compare_expect(expected: dict[str, Any], actual: dict[str, Any]) -> list[str
                 errs.append(f"{section}.{k}: got {got} want {want}")
 
     if "cylinder_radii" in expected:
-        exp_r = [_json_num(float(x)) for x in expected["cylinder_radii"]]
+        # the census reports the radii sorted; file order is not content
+        exp_r = sorted(_json_num(float(x)) for x in expected["cylinder_radii"])
         got_r = actual.get("cylinder_radii", [])
         if got_r != exp_r:
             errs.append(f"cylinder_radii: got {got_r} want {exp_r}")
 
     if not actual.get("surfaces_consistent", True):
         errs.append("surfaces_consistent: an ADVANCED_FACE has no surface bucket")
+    if not actual.get("curves_consistent", True):
+        errs.append("curves_consistent: an EDGE_CURVE has no curve bucket")
 
     return errs
 
