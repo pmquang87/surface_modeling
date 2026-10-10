@@ -819,11 +819,16 @@ def export_step_faceted(mesh, filepath, *, schema: str = "AP214IS",
         report["shells"] = pre["shells"]
         report["closed_measured"] = pre["closed_measured"]
         report["brepcheck_valid"] = pre["brepcheck_valid"]
-        report["volume_brep_mm3"] = pre["brep_volume_mm3"]
+        brep = pre["brep_volume_mm3"]
+        if brep is not None and not math.isfinite(brep):
+            # None, not NaN, when unmeasurable: the report must stay valid JSON
+            warn(f"B-Rep volume of the assembled shape is not finite ({brep!r})")
+            brep = None
+        report["volume_brep_mm3"] = brep
         report["volume_mesh_mm3"] = float(volume_mesh)
-        if volume_mesh and pre["brep_volume_mm3"] is not None:
-            report["volume_delta_pct"] = float(
-                100.0 * (pre["brep_volume_mm3"] - volume_mesh) / volume_mesh)
+        if volume_mesh and brep is not None:
+            delta = 100.0 * (brep - volume_mesh) / volume_mesh
+            report["volume_delta_pct"] = float(delta) if math.isfinite(delta) else None
         if pre["solids"] != report["solids"]:
             warn(f"{report['solids']} solids were built but the assembled shape "
                  f"holds {pre['solids']}")
