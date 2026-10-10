@@ -633,8 +633,11 @@ def test_continuity_string_reaches_the_fitter_weight_table(monkeypatch):
 
     seen = list(spy.constructed)
     assert len(seen) == 4, seen
-    assert len(set(seen)) == 4, f"continuity levels collapsed to {set(seen)}"
-    assert seen == sorted(seen), f"stricter continuity must weigh more: {seen}"
+    # distinct entries prove each string reached its own table entry (an
+    # unknown key falls back to G2's); the ordering pins the table itself
+    # (0/5/20/50 - G1..G3 add the same C3 rows, only the weight differs)
+    assert len(set(seen)) == 4, f"continuity levels hit the same table entry: {set(seen)}"
+    assert seen == sorted(seen), f"weight table is not 0 < G1 < G2 < G3 any more: {seen}"
 
     # An int (the old GUI value) is not a key -> it silently falls back to G2.
     spy.constructed.clear()
