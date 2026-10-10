@@ -35,7 +35,8 @@ import trimesh
 
 from src.operations import shell_thicken
 from src.operations.shell_thicken import (_GWN_INTEGER_TOL, _compute_sdf,
-                                          _sample_cells, _winding_numbers)
+                                          _sample_cells, _winding_mode,
+                                          _winding_numbers)
 
 LOGGER = shell_thicken.__name__
 
@@ -233,6 +234,87 @@ class TestNestedPlates:
         assert wrong_out == 0, f"{wrong_out} far-field air cells signed inside"
         assert np.all(diag['sign'][at] == -1.0)       # the winding decided
 
+    @staticmethod
+    def _holed_plates(n=16, r_hole=0.07):
+        """The same plates, each top face an n x n quad grid with the cells
+        whose centre lies within `r_hole` of 6 hole centres removed (a soup:
+        T-junctions at the rim, as the hole is all that matters). Each hole
+        is 1-2 cells, at most 0.21 x 0.11 -- sealed by the wall cells
+        (2 x 1.62 voxels = 0.16 per side of the gap)."""
+        parts = [_cube()]
+        removed = 0
+        holes = [(x, y) for x in (-0.5, 0.0, 0.5) for y in (-0.3, 0.3)]
+        u = np.linspace(-PLATE_HALF[0], PLATE_HALF[0], n + 1)
+        mid = (u[:-1] + u[1:]) / 2
+        I, J = np.meshgrid(np.arange(n), np.arange(n), indexing='ij')
+        cut = np.zeros((n, n), dtype=bool)
+        for hx, hy in holes:
+            cut |= np.hypot(mid[I] - hx, mid[J] - hy) < r_hole
+        a = I * (n + 1) + J
+        quads = np.stack([a, a + n + 1, a + n + 2, a + 1], axis=-1)[~cut]
+        top = np.concatenate([quads[:, [0, 1, 2]], quads[:, [0, 2, 3]]])
+        X, Y = np.meshgrid(u, u, indexing='ij')
+        for z in PLATE_Z:
+            box = trimesh.creation.box(
+                extents=2 * np.array(PLATE_HALF),
+                transform=trimesh.transformations.translation_matrix((0, 0, z)))
+            sides = box.face_normals[:, 2] < 0.5
+            parts.append(trimesh.Trimesh(box.vertices, box.faces[sides], process=False))
+            V = np.column_stack([X.ravel(), Y.ravel(),
+                                 np.full(X.size, z + PLATE_HALF[2])])
+            parts.append(trimesh.Trimesh(V, top, process=False))
+            removed += 2 * int(cut.sum())
+        return trimesh.util.concatenate(parts), removed
+
+    def test_small_sealed_holes_keep_the_winding_decision(self):
+        """Six small holes in each plate's top face: the holes are sealed by
+        the wall cells (the components stay the gaps), but samples next to a
+        hole read w = 0.95-1.13. Requiring EVERY sample within 0.05 of an
+        integer (f502d0a) sent the gaps to the vote, which signs them air:
+        5,492 far-field material cells. At least 75 % near an integer, all on
+        one side of 0.5, keeps them 'winding'."""
+        tm, removed = self._holed_plates()
+        assert removed == 5 * 2 * 8
+        up = tm.face_normals[:, 2] > 0.5
+        assert up.sum() == 2 + 5 * (2 * 16 * 16 - 16)   # top faces wound up
+        assert not tm.is_watertight
+
+        diag = {}
+        grid, origin, voxel = _compute_sdf(np.asarray(tm.vertices, float),
+                                           np.asarray(tm.faces), self.RES,
+                                           exact_band=0.05, diagnostics=diag)
+        assert voxel == pytest.approx(0.05)
+        pts = _grid_points(grid, origin, voxel)
+        dist = np.abs(_box_sdf(pts, (0, 0, 0), (1, 1, 1)))
+        for z in PLATE_Z:
+            dist = np.minimum(dist, np.abs(_box_sdf(pts, (0, 0, z), PLATE_HALF)))
+        material = np.all(np.abs(pts) < 1.0, axis=1)
+        far = dist > 2 * voxel
+        far_material = far & material
+
+        labels = diag['labels'].ravel()
+        gap = (far_material & (pts[:, 2] > PLATE_Z[0]) & (pts[:, 2] < PLATE_Z[-1])
+               & np.all(np.abs(pts[:, :2]) < PLATE_HALF[0], axis=1))
+        gap_labels = np.unique(labels[gap])
+        assert len(gap_labels) == 4, gap_labels      # still sealed: one per gap
+        at = np.searchsorted(diag['enclosed'], gap_labels)
+        assert np.array_equal(diag['enclosed'][at], gap_labels)
+        # precondition: the holes push some samples off the integer (so an
+        # every-sample rule refuses), and the vote would sign the gaps air
+        assert np.all(diag['near_fraction'][at] < 1.0)
+        assert np.all(diag['w_max'][at] > 1.0 + _GWN_INTEGER_TOL)
+        assert np.all(diag['vote_sign'][at] == +1.0)
+        assert np.all(diag['w_min'][at] > 0.5)       # all samples inside
+
+        g = grid.ravel()
+        assert 15_000 < far_material.sum() < 18_000
+        wrong_in = int((g[far_material] >= 0).sum())
+        wrong_out = int((g[far & ~material] <= 0).sum())
+        assert wrong_in == 0, f"{wrong_in} far-field material cells signed air"
+        assert wrong_out == 0, f"{wrong_out} far-field air cells signed inside"
+        assert np.all(diag['mode'][at] == 'winding')
+        assert np.all(diag['near_fraction'][at] >= 0.75)
+
 
 
 # --------------------------------------------------------------------------
@@ -298,17 +380,17 @@ R_VOID = 0.6
 CAP_DEG = 20.0
 
 
-def _holed_hollow_sphere():
+def _holed_hollow_sphere(cap_deg=CAP_DEG):
     """Outward sphere r = 1 plus an inside-out sphere r = 0.6 (the void's
-    faces point into it) with every triangle within 20 degrees of +z removed:
-    a hole about 0.4 across, much wider than the wall seal (2 x 1.62 voxels
+    faces point into it) with every triangle within cap_deg of +z removed:
+    at 20 degrees a hole about 0.4 across, much wider than the wall seal (2 x 1.62 voxels
     = 0.16 at resolution 48), so the flood fill joins void and material."""
     outer = trimesh.creation.icosphere(subdivisions=4, radius=1.0)
     void = trimesh.creation.icosphere(subdivisions=4, radius=R_VOID)
     void.invert()
     c = void.triangles_center
     polar = np.degrees(np.arccos(c[:, 2] / np.linalg.norm(c, axis=1)))
-    void = trimesh.Trimesh(void.vertices, void.faces[polar > CAP_DEG],
+    void = trimesh.Trimesh(void.vertices, void.faces[polar > cap_deg],
                            process=False)
     return trimesh.util.concatenate([outer, void])
 
@@ -371,6 +453,42 @@ class TestHoleJoinsVoidAndMaterial:
         logs = [r_ for r_ in caplog.records
                 if r_.name == LOGGER and 'span both sides' in r_.getMessage()]
         assert len(logs) == 1
+
+    def test_split_needs_only_half_the_samples_near_an_integer(self):
+        """A 30-degree cap: more samples sit in the wider throat, only ~71 %
+        are within 0.05 of an integer -- above _GWN_SPLIT_FRACTION (0.5),
+        below 0.75. The per-cell path must still be taken: the vote (what a
+        stricter split threshold such as 0.9 falls back to) signs the whole
+        component inside, 3,586 far-field void cells."""
+        cap = 30.0
+        tm = _holed_hollow_sphere(cap)
+        removed = 2 * 5120 - len(tm.faces)
+        assert 300 < removed < 450
+        diag = {}
+        grid, origin, voxel = _compute_sdf(np.asarray(tm.vertices, float),
+                                           np.asarray(tm.faces), self.RES,
+                                           diagnostics=diag)
+        pts = _grid_points(grid, origin, voxel)
+        r = np.linalg.norm(pts, axis=1)
+        polar = np.degrees(np.arccos(np.clip(pts[:, 2] / np.maximum(r, 1e-12), -1, 1)))
+        sd = np.maximum(r - 1.0, R_VOID - r)
+        far = np.abs(sd) > 2 * voxel
+        far_material = far & (sd < 0)
+        far_void = far & (r < R_VOID) & ((polar > cap + 20) | (r < 0.3))
+
+        assert len(diag['enclosed']) == 1
+        # precondition: the near-integer fraction lies between the split
+        # threshold and the winding one, and the vote says "inside"
+        assert 0.5 <= diag['near_fraction'][0] < 0.75
+        assert diag['vote_sign'][0] == -1.0
+
+        g = grid.ravel()
+        assert 10_000 < far_material.sum() < 16_000 and 3_000 < far_void.sum() < 5_000
+        wrong_material = int((g[far_material] >= 0).sum())
+        wrong_void = int((g[far_void] <= 0).sum())
+        assert wrong_material == 0, f"{wrong_material} far material cells signed air"
+        assert wrong_void == 0, f"{wrong_void} far void cells signed inside"
+        assert diag['mode'][0] == 'split'
 
 
 # --------------------------------------------------------------------------
@@ -465,3 +583,56 @@ class TestFractionalWindingFallsBackToVote:
         assert not [r for r in caplog.records if r.name == LOGGER]
         assert grid[_index_of([0.0, 0.0, 0.0], origin, voxel)] == pytest.approx(
             -1.0, abs=0.01)
+
+
+# --------------------------------------------------------------------------
+# the decision rule, at its boundaries
+# --------------------------------------------------------------------------
+
+def _w(*runs):
+    """Concatenate (count, value) runs into one sample array."""
+    return np.concatenate([np.full(n, v, dtype=float) for n, v in runs])
+
+
+class TestWindingMode:
+    @pytest.mark.parametrize("w, expected", [
+        (_w((32, 1.0)), ('winding', True)),
+        (_w((32, 0.0)), ('winding', False)),
+        (_w((32, 2.0)), ('winding', True)),        # overlap: union inside
+        (_w((32, -1.0)), ('winding', False)),      # inside-out body: air
+        (_w((31, 1.0), (1, 1.0 + 1e-9)), ('winding', True)),
+    ])
+    def test_clean_components(self, w, expected):
+        assert _winding_mode(w) == expected
+
+    def test_winding_needs_three_quarters_near_an_integer(self):
+        """24 of 32 (75 %) near 1, the rest at 1.13 (next to a small sealed
+        hole) -> 'winding'; 23 of 32 -> no longer trusted -> 'vote'."""
+        assert _winding_mode(_w((24, 1.0), (8, 1.13))) == ('winding', True)
+        assert _winding_mode(_w((23, 1.0), (9, 1.13))) == ('vote', None)
+        assert _winding_mode(_w((24, 0.0), (8, 0.12))) == ('winding', False)
+
+    def test_winding_needs_every_sample_on_one_side(self):
+        """31 samples at exactly 1 and ONE at 0.45 -> not 'winding'; the
+        near-integer samples are all on one side, so not 'split' either."""
+        assert _winding_mode(_w((31, 1.0), (1, 0.45))) == ('vote', None)
+        assert _winding_mode(_w((31, 0.0), (1, 0.55))) == ('vote', None)
+        assert _winding_mode(_w((31, 1.0), (1, 0.55))) == ('winding', True)
+
+    def test_split_needs_half_near_an_integer_on_both_sides(self):
+        """16 of 32 near an integer (8 at 0, 8 at 1), 16 in a throat at 0.3
+        -> 'split'; 15 of 32 -> 'vote'; near samples on one side only ->
+        'vote'."""
+        assert _winding_mode(_w((8, 0.0), (8, 1.0), (16, 0.3))) == ('split', None)
+        assert _winding_mode(_w((7, 0.0), (8, 1.0), (17, 0.3))) == ('vote', None)
+        assert _winding_mode(_w((16, 1.0), (16, 0.3))) == ('vote', None)
+        # many near-integer samples on both sides -> split, not winding
+        assert _winding_mode(_w((16, 0.0), (16, 1.0))) == ('split', None)
+
+    def test_fractional_everywhere_goes_to_the_vote(self):
+        """40-42 % flipped triangles: w ~ 0.16-0.2 everywhere. A wider
+        tolerance (0.2) would call this 'winding', air, silently."""
+        rng = np.random.default_rng(0)
+        assert _winding_mode(0.16 + 0.03 * rng.random(32)) == ('vote', None)
+        assert _winding_mode(0.7 + 0.03 * rng.random(32)) == ('vote', None)
+        assert _GWN_INTEGER_TOL < 0.16

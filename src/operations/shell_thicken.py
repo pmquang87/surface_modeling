@@ -15,11 +15,13 @@ logger = logging.getLogger(__name__)
 # and constant on a flood-fill component (which never crosses the surface).
 # It drifts from an integer only through defects: a hole of solid angle Omega
 # seen from the point shifts w by Omega / 4 pi, a flipped triangle by twice
-# that. So w is trusted only where it is near an integer:
-#   * every sample within _GWN_INTEGER_TOL of an integer, all on one side of
-#     0.5 -> the component is that side ("winding");
-#   * at least half the samples near an integer, and those on BOTH sides ->
-#     a hole joins two regions into one component (samples in the hole's
+# that. So w is trusted only where it is near an integer (_winding_mode):
+#   * at least _GWN_WINDING_FRACTION of the samples within _GWN_INTEGER_TOL
+#     of an integer and ALL samples on one side of 0.5 -> the component is
+#     that side ("winding"). Not every sample: a sample next to a small
+#     sealed hole reads e.g. 1.13 (internal plates with 0.07 holes, res 48);
+#   * at least _GWN_SPLIT_FRACTION near an integer, and those on BOTH sides
+#     -> a hole joins two regions into one component (samples in the hole's
 #     throat are fractional by construction): each cell is signed by w on its
 #     own ("split");
 #   * otherwise (w fractional: holes or flipped triangles all around) -> the
@@ -28,8 +30,11 @@ logger = logging.getLogger(__name__)
 # the nearest integer unambiguous (a sphere with 40 of 1280 triangles removed
 # gives 0.968 at the centre); a sphere with 40 % of its triangles flipped
 # gives ~0.2, a 20-degree hole in a void ~0.03 at the void centre but up to
-# 0.3 in its throat.
+# 0.3 in its throat. Do not widen the tolerance instead of the fractions: at
+# 0.2 a ~42 %-flipped sphere (w ~ 0.16) would be signed air without a word.
 _GWN_INTEGER_TOL = 0.05
+_GWN_WINDING_FRACTION = 0.75
+_GWN_SPLIT_FRACTION = 0.5
 _GWN_SAMPLES = 5          # deepest cells per component ...
 _GWN_STRATA = 3           # ... plus the deepest cell of each of 3^3 blocks
 # A split component evaluates w on a lattice subsample of its cells, at most
@@ -90,6 +95,24 @@ def _winding_numbers(triangles: np.ndarray, points: np.ndarray,
             acc += np.arctan2(det, den).sum(axis=1)
         w[ps:ps + p_chunk] = acc / (2.0 * np.pi)   # 2 atan2 / (4 pi)
     return w
+
+
+def _winding_mode(w: np.ndarray) -> Tuple[str, Optional[bool]]:
+    """How to sign a component from the winding numbers `w` of its samples.
+
+    Returns ('winding', inside) to sign it whole, ('split', None) to sign it
+    per cell, or ('vote', None) to leave it to the near-surface vote. See
+    the rules at _GWN_INTEGER_TOL.
+    """
+    w = np.asarray(w, dtype=np.float64)
+    near = np.abs(w - np.rint(w)) < _GWN_INTEGER_TOL
+    inside = w > 0.5
+    if near.mean() >= _GWN_WINDING_FRACTION and (inside.all() or not inside.any()):
+        return 'winding', bool(inside[0])
+    if (near.mean() >= _GWN_SPLIT_FRACTION
+            and inside[near].any() and not inside[near].all()):
+        return 'split', None
+    return 'vote', None
 
 
 def _sample_cells(labels_flat: np.ndarray, depth: np.ndarray,
@@ -246,6 +269,8 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
             sign decision of the flood fill (closed surfaces only): arrays
             ``enclosed`` (label ids), ``size``, ``n_samples``, ``winding`` /
             ``w_min`` / ``w_max`` (median / range of w over the samples),
+            ``near_fraction`` (share of samples within _GWN_INTEGER_TOL of
+            an integer),
             ``mode`` ('winding', 'split' or 'vote'), ``vote`` / ``vote_sign``
             (the near-surface vote), ``sign`` (final, +1 outside, 0 = per
             cell), ``fallback`` (vote used), plus ``labels`` (the label grid)
@@ -394,6 +419,7 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
     n_enc = len(enclosed)
     winding = np.zeros(n_enc)
     w_min, w_max = np.zeros(n_enc), np.zeros(n_enc)
+    near_frac = np.zeros(n_enc)
     n_samples = np.zeros(n_enc, dtype=np.int64)
     mode = np.full(n_enc, 'winding', dtype='<U7')
     split_cells, split_signs, n_split_evals = [], [], 0
@@ -407,15 +433,14 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
         groups = np.split(np.arange(len(cells)), starts[1:])
         for i, g in enumerate(groups):
             w = w_cells[g]
-            near = np.abs(w - np.rint(w)) < _GWN_INTEGER_TOL
-            inside = w > 0.5
             winding[i], w_min[i], w_max[i] = np.median(w), w.min(), w.max()
+            near_frac[i] = np.mean(np.abs(w - np.rint(w)) < _GWN_INTEGER_TOL)
             n_samples[i] = len(g)
             label = enclosed[i]
-            if near.all() and (inside.all() or not inside.any()):
-                comp_sign[label] = -1.0 if inside[0] else 1.0
-            elif near.mean() >= 0.5 and inside[near].any() and not inside[near].all():
-                mode[i] = 'split'
+            mode[i], inside = _winding_mode(w)
+            if mode[i] == 'winding':
+                comp_sign[label] = -1.0 if inside else 1.0
+            elif mode[i] == 'split':
                 comp = np.flatnonzero(labels_flat == label)
                 signs, n_eval = _sign_split_component(
                     comp, (nx, ny, nz), points, triangles, cells[g], w)
@@ -423,7 +448,6 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
                 split_signs.append(signs)
                 n_split_evals += n_eval
             else:
-                mode[i] = 'vote'
                 comp_sign[label] = vote_sign[label]
         if (mode == 'split').any():
             sel = mode == 'split'
@@ -448,6 +472,7 @@ def _compute_sdf(vertices: np.ndarray, faces: np.ndarray,
             enclosed=enclosed,
             size=np.bincount(labels_flat, minlength=n_labels + 1)[enclosed],
             winding=winding, w_min=w_min, w_max=w_max, n_samples=n_samples,
+            near_fraction=near_frac,
             mode=mode,
             vote=votes[enclosed],
             vote_sign=vote_sign[enclosed],
