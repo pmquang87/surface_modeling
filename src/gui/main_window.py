@@ -862,7 +862,11 @@ class PowerSurfacingMainWindow(QMainWindow):
                         self.current_mesh, simplify=simplify, reference_mesh=reference
                     )
                     patch_count = len(result.get('patches', []))
+                    shape = result.get('shape')
                     self.log(f"NURBS conversion complete — {patch_count} patches generated")
+                    if shape is None:
+                        self.log("NURBS conversion produced no NURBS shape — "
+                                 "nothing to export as STEP.")
                     if patch_count == 0:
                         QMessageBox.warning(self, "No Patches Generated", 
                             "0 patches were generated because your mesh contains no quad (4-sided) faces.\n\n"
@@ -872,8 +876,9 @@ class PowerSurfacingMainWindow(QMainWindow):
                         self.current_mesh = result['mesh']
                         self.viewport.update_mesh(self.current_mesh)
                         self.properties_panel.set_mesh_info(self.current_mesh)
-                    if result.get('shape'):
-                        self._set_shape(result['shape'])
+                    # Always replace: a conversion without a shape must not
+                    # leave the previous one behind for STEP export.
+                    self._set_shape(shape)
                 except Exception as e:
                     QMessageBox.warning(self, "Error", f"NURBS conversion failed: {e}")
                     self.log(f"ERROR: NURBS conversion failed: {e}")

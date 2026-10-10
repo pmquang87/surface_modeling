@@ -457,3 +457,31 @@ def test_m3_clean_mesh_is_still_reported_unchanged(env):
     assert win.current_mesh is mesh
     assert len(mesh.faces) == 12 and len(mesh.vertices) == 8
     assert any('mesh unchanged' in m for m in win.logs), win.logs
+
+
+# --------------------------------------------------------------------------
+# M20 - zero-patch conversion keeps the old shape
+# --------------------------------------------------------------------------
+
+def test_m20_zero_patch_conversion_drops_the_old_shape(env, monkeypatch, tmp_path):
+    """M20 (cand 35): convert (6 patches, shape A), then convert again with 0
+    patches (no shape). Export STEP must warn "run Convert to NURBS" instead
+    of writing shape A, and the log must say no shape was produced."""
+    win, box, written = env
+    win.current_mesh = _box_mesh()
+    old = _Shape('A')
+    _install_converter(monkeypatch, [(old, 6), (None, 0)])
+    win.on_convert_nurbs()
+    assert win.current_shape is old  # precondition
+
+    win.on_convert_nurbs()
+    assert win.current_shape is None
+    assert any('0 patches' in m for m in win.logs), win.logs
+    assert any('no NURBS shape' in m for m in win.logs), win.logs
+    box.shown.clear()  # drop the "No Patches Generated" box
+
+    _set_export(monkeypatch, 'STEP', tmp_path / 'out.step')
+    win.on_export()
+    assert written['step'] == []
+    warnings = box.texts('warning')
+    assert len(warnings) == 1 and 'Convert to NURBS' in warnings[0], box.shown
