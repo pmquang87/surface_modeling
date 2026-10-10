@@ -221,7 +221,7 @@ def insert_edge_loop(mesh: HalfEdgeMesh, edge_index: int, position: float = 0.5)
             he = he.next
             if he == start_he: break
             
-        split_hes = [he for he in f_edges if he.edge.index in ring_edge_indices]
+        split_hes = [he for he in f_edges if he.edge.index in edge_to_new_vert]
         if len(split_hes) == 2 and len(f_edges) == 4:
             idx0 = f_edges.index(split_hes[0])
             he0, he1, he2, he3 = f_edges[idx0], f_edges[(idx0+1)%4], f_edges[(idx0+2)%4], f_edges[(idx0+3)%4]
@@ -234,8 +234,18 @@ def insert_edge_loop(mesh: HalfEdgeMesh, edge_index: int, position: float = 0.5)
             faces.append([v_a, nv0, nv2, v_d])
             faces.append([nv0, v_b, v_c, nv2])
         else:
-            faces.append([he.vertex.index for he in f_edges])
-            
+            # A face the ring ends in (n-gon cap, pole triangle) is not cut, but
+            # it still has to carry the new vertex of every split edge, or the
+            # neighbouring split quad leaves a T-junction crack. he runs
+            # he.prev.vertex -> he.vertex, so the new point goes just before
+            # he.vertex.
+            poly = []
+            for he in f_edges:
+                if he.edge.index in edge_to_new_vert:
+                    poly.append(edge_to_new_vert[he.edge.index])
+                poly.append(he.vertex.index)
+            faces.append(poly)
+
     return HalfEdgeMesh.from_arrays(verts, faces)
 
 
