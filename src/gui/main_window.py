@@ -3,6 +3,8 @@ import sys
 import io
 import html
 import datetime
+import hashlib
+import numpy as np
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QSplitter, QMenuBar, QMenu, QToolBar, QStatusBar,
                                QFileDialog, QMessageBox, QApplication, QTextEdit,
@@ -110,6 +112,8 @@ class PowerSurfacingMainWindow(QMainWindow):
         
         self.current_mesh = None
         self.current_shape = None
+        # (mesh, geometry key) that current_shape was built from; see _set_shape
+        self._shape_source = None
         
         # Initialize Command Manager for Undo/Redo
         try:
@@ -257,6 +261,49 @@ class PowerSurfacingMainWindow(QMainWindow):
     def log(self, message):
         """Public method to log a message to the GUI log panel."""
         print(message)  # goes through LogStream → _append_log
+
+    @staticmethod
+    def _mesh_geometry_key(mesh):
+        """Digest of what a B-rep built from `mesh` depends on: vertex
+        positions, crease weights and the element counts."""
+        h = hashlib.blake2b(digest_size=16)
+        h.update(np.asarray([v.position for v in mesh.vertices], dtype=np.float64).tobytes())
+        h.update(np.asarray([e.crease_weight for e in mesh.edges], dtype=np.float64).tobytes())
+        h.update(np.asarray([len(mesh.vertices), len(mesh.edges), len(mesh.faces)],
+                            dtype=np.int64).tobytes())
+        return h.digest()
+
+    def _set_shape(self, shape):
+        """Make `shape` (or None) the B-rep of current_mesh as it is right now."""
+        self.current_shape = shape
+        if shape is not None and self.current_mesh is not None:
+            self._shape_source = (self.current_mesh,
+                                  self._mesh_geometry_key(self.current_mesh))
+        else:
+            self._shape_source = None
+
+    def _replace_mesh(self, mesh):
+        """Make `mesh` the current mesh. A B-rep belonged to the old mesh, so it
+        is dropped: STEP export then asks for 'Convert to NURBS' again."""
+        self.current_mesh = mesh
+        self._set_shape(None)
+
+    def _exportable_shape(self):
+        """current_shape if it still matches current_mesh, else None.
+
+        The handlers drop the shape when they change the mesh, but the mesh can
+        also change behind their back (a gizmo drag moves vertices in place in
+        the viewport; a command can swap current_mesh), so the export checks.
+        """
+        shape = getattr(self, 'current_shape', None)
+        if shape is None:
+            return None
+        source = getattr(self, '_shape_source', None)
+        if (source is None or source[0] is not self.current_mesh
+                or source[1] != self._mesh_geometry_key(self.current_mesh)):
+            self._set_shape(None)
+            return None
+        return shape
 
     def _setup_light_theme(self):
         palette = QPalette()
@@ -497,6 +544,7 @@ class PowerSurfacingMainWindow(QMainWindow):
             if abs(float(vertex.position[axis]) - new_value) < 1e-12:
                 return  # nothing actually changed (panel repopulation)
             vertex.position[axis] = new_value
+            self._set_shape(None)  # the B-rep no longer matches the mesh
             mesh.compute_face_normals()
             self.viewport.refresh_geometry()
             self.log(f"Vertex {index} {prop_name[-1].upper()} -> {new_value:.6g}")
@@ -509,6 +557,7 @@ class PowerSurfacingMainWindow(QMainWindow):
             if abs(float(edge.crease_weight) - new_value) < 1e-12:
                 return
             edge.crease_weight = new_value
+            self._set_shape(None)  # the B-rep no longer matches the mesh
             self.log(f"Edge {index} crease weight -> {new_value:.4g}")
 
         else:
@@ -533,8 +582,7 @@ class PowerSurfacingMainWindow(QMainWindow):
         if HalfEdgeMesh is None:
             QMessageBox.warning(self, "Error", "Core modules not available.")
             return
-        self.current_mesh = HalfEdgeMesh()
-        self.current_shape = None
+        self._replace_mesh(HalfEdgeMesh())
         self.viewport.clear()
         self.properties_panel.clear()
         self.status_bar.showMessage("New mesh created.")
@@ -588,8 +636,9 @@ class PowerSurfacingMainWindow(QMainWindow):
                 return
 
             if mesh and len(mesh.vertices) > 0:
+                # A STEP import brings the mesh and its B-rep together.
                 self.current_mesh = mesh
-                self.current_shape = shape
+                self._set_shape(shape)
                 self.viewport.set_mesh(mesh)
                 self.properties_panel.set_mesh_info(mesh)
                 vcount = len(mesh.vertices)
@@ -663,8 +712,13 @@ class PowerSurfacingMainWindow(QMainWindow):
                 elif fmt == 'obj' and export_obj:
                     export_obj(self.current_mesh, filepath)
                 elif fmt == 'step' and export_step:
-                    if getattr(self, 'current_shape', None):
-                        export_step(self.current_shape, filepath)
+                    had_shape = getattr(self, 'current_shape', None) is not None
+                    shape = self._exportable_shape()
+                    if shape is not None:
+                        export_step(shape, filepath)
+                    elif had_shape:
+                        QMessageBox.warning(self, "Export", "The mesh has changed since the NURBS shape was built. Please run 'Convert to NURBS' again.")
+                        return
                     else:
                         QMessageBox.warning(self, "Export", "No NURBS shape available to export. Please run 'Convert to NURBS' first.")
                         return
@@ -713,8 +767,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                     create_fn = self._primitive_factories().get(
                         ptype, self._primitive_factories()['box']
                     )
-                    self.current_mesh = create_fn(size)
-                    self.current_shape = None
+                    self._replace_mesh(create_fn(size))
                     self.viewport.set_mesh(self.current_mesh)
                     self.properties_panel.set_mesh_info(self.current_mesh)
                     v = len(self.current_mesh.vertices)
@@ -739,7 +792,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                     f_before = len(self.current_mesh.faces)
                     self.log(f"Subdividing {params['levels']} level(s)... ({v_before} verts, {f_before} faces)")
                     QApplication.processEvents()
-                    self.current_mesh = catmull_clark.subdivide(self.current_mesh, params['levels'], smooth=params['smooth'])
+                    self._replace_mesh(catmull_clark.subdivide(self.current_mesh, params['levels'], smooth=params['smooth']))
                     v_after = len(self.current_mesh.vertices)
                     f_after = len(self.current_mesh.faces)
                     self.viewport.update_mesh(self.current_mesh)
@@ -763,7 +816,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                 try:
                     self.log(f"Running Shell/Thicken (thickness={thickness}, direction={direction})...")
                     QApplication.processEvents()
-                    self.current_mesh = shell_solid(self.current_mesh, thickness=thickness, direction=direction)
+                    self._replace_mesh(shell_solid(self.current_mesh, thickness=thickness, direction=direction))
                     self.viewport.update_mesh(self.current_mesh)
                     self.properties_panel.set_mesh_info(self.current_mesh)
                     v = len(self.current_mesh.vertices)
@@ -815,12 +868,12 @@ class PowerSurfacingMainWindow(QMainWindow):
                             "0 patches were generated because your mesh contains no quad (4-sided) faces.\n\n"
                             "NURBS conversion only works on quad faces. If you imported an STL, it only contains triangles. "
                             "Please run 'Reverse Engineering -> Quad Wrap' first to convert your mesh into a quad-dominant Sub-D cage.")
-                    if result.get('shape'):
-                        self.current_shape = result['shape']
                     if result.get('mesh'):
                         self.current_mesh = result['mesh']
                         self.viewport.update_mesh(self.current_mesh)
                         self.properties_panel.set_mesh_info(self.current_mesh)
+                    if result.get('shape'):
+                        self._set_shape(result['shape'])
                 except Exception as e:
                     QMessageBox.warning(self, "Error", f"NURBS conversion failed: {e}")
                     self.log(f"ERROR: NURBS conversion failed: {e}")
@@ -848,7 +901,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                     result = wrapper.wrap(self.current_mesh, frozen_face_ids=frozen_faces)
                     v = len(result.vertices)
                     f = len(result.faces)
-                    self.current_mesh = result
+                    self._replace_mesh(result)
                     self.viewport.set_mesh(self.current_mesh)
                     self.properties_panel.set_mesh_info(self.current_mesh)
                     self.log(f"Quad Wrap complete — {v} vertices, {f} faces")
@@ -899,7 +952,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                 self.log("No sliver edges found — mesh unchanged.")
                 self.status_bar.showMessage("No sliver edges found.")
                 return
-            self.current_mesh = result
+            self._replace_mesh(result)
             self.viewport.set_mesh(self.current_mesh)
             self.properties_panel.set_mesh_info(self.current_mesh)
             self.log(f"Sliver removal complete — {v} vertices, {f} faces "
@@ -953,7 +1006,7 @@ class PowerSurfacingMainWindow(QMainWindow):
                     result = shrinker.wrap(self.current_mesh, reference, frozen_vertices=frozen_verts)
                     v = len(result.vertices)
                     f = len(result.faces)
-                    self.current_mesh = result
+                    self._replace_mesh(result)
                     self.viewport.set_mesh(self.current_mesh)
                     self.properties_panel.set_mesh_info(self.current_mesh)
                     self.log(f"Shrink Wrap complete — {v} vertices, {f} faces")
