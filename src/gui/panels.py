@@ -115,12 +115,26 @@ class PropertiesPanel(QWidget):
         self.layout.addWidget(self.group_box)
         self.layout.addStretch()
 
-    def clear(self):
-        while self.form_layout.count():
-            item = self.form_layout.takeAt(0)
+    @staticmethod
+    def _empty_layout(layout):
+        """Delete every widget in ``layout``, descending into nested layouts.
+
+        A row added with ``addRow(QHBoxLayout)`` (set_tool_ui's Apply/Cancel
+        row) comes back from takeAt() as a layout item whose widget() is None,
+        so a widget-only loop left those buttons alive and clickable.
+        """
+        while layout.count():
+            item = layout.takeAt(0)
             widget = item.widget()
             if widget:
                 widget.deleteLater()
+            child = item.layout()
+            if child is not None:
+                PropertiesPanel._empty_layout(child)
+                child.deleteLater()
+
+    def clear(self):
+        self._empty_layout(self.form_layout)
         self.group_box.setTitle("Properties")
         self.current_target = None
 
