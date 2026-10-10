@@ -81,6 +81,9 @@ def convert(input_path: str, output_path: str, target_faces: int = 2000,
 
     def fail(msg: str) -> Tuple[int, Dict[str, Any]]:
         log("ERROR: " + msg)
+        # ``ok`` is set True once a STEP is written; a failed audit after that
+        # must not leave it True in RESULT
+        result["ok"] = False
         result["error"] = msg
         result["exit_code"] = 1
         result["seconds"] = round(time.time() - log.t0, 3)
