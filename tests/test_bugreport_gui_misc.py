@@ -389,3 +389,55 @@ def test_l1_shell_action_apply_reads_dialog_values(qapp, monkeypatch):
 
     win.deleteLater()
     _flush_deletes(qapp)
+
+
+# ----------------------------------------------------------------------------
+# Suspicion: PyVista cell id == face index (not a bug; invariant guard)
+# ----------------------------------------------------------------------------
+
+def _mismatched_cells(mesh, dataset):
+    """Face indices whose PyVista cell (same id) has different corner points."""
+    bad = []
+    for i, f in enumerate(mesh.faces):
+        want = sorted(map(tuple, np.round([v.position for v in mesh.get_face_vertices(f)], 9)))
+        got = sorted(map(tuple, np.round(dataset.get_cell(i).points, 9)))
+        if want != got:
+            bad.append(i)
+    return bad
+
+
+def test_suspicion_pick_cell_id_is_face_index():
+    """Suspicion (viewport picking maps cell ids to face indices): not a bug.
+    HalfEdgeMesh drops < 3-vertex faces at add_face, so to_pyvista() emits one
+    cell per face in face order, and the dataset pyvista gives the mapper
+    (a copy under smooth_shading, as the viewport uses) keeps that order for
+    quads, a warped quad, an n-gon, a non-manifold edge and a face with a
+    repeated non-consecutive vertex."""
+    import pyvista as pv
+
+    V = np.array([[0, 0, 0], [2, 0, 0], [2, 2, 0.7], [0, 2, 0], [3, 1, 0], [1, -1, 0],
+                  [1, 1, 2], [1, 1, -2], [5, 5, 5], [6, 5, 5], [5, 6, 5]], float)
+    F = [[0, 1, 2, 3], [1, 4, 2], [0, 5, 1], [0, 1, 6], [1, 0, 7],
+         [5, 3, 2, 1, 0], [8, 9, 10], [3, 3, 2], [8, 9], [0, 1, 0, 2]]
+    mesh = HalfEdgeMesh.from_arrays(V, F)
+    # The two degenerate inputs never become faces.
+    assert len(mesh.faces) == len(F) - 2
+    assert all(len(mesh.get_face_vertices(f)) >= 3 for f in mesh.faces)
+
+    pd = mesh.to_pyvista()
+    assert pd.n_cells == len(mesh.faces)
+    assert _mismatched_cells(mesh, pd) == []
+
+    pl = pv.Plotter(off_screen=True)
+    try:
+        actor = pl.add_mesh(pd, color="#6699bb", show_edges=True, style='surface',
+                            smooth_shading=True, pickable=True, reset_camera=False)
+        shown = actor.mapper.dataset
+        assert shown.n_cells == len(mesh.faces)
+        assert _mismatched_cells(mesh, shown) == []
+    finally:
+        pl.close()
+
+    # The checker must say "no" to a dataset whose cells are out of order.
+    swapped = HalfEdgeMesh.from_arrays(V, [F[1], F[0]] + F[2:])
+    assert _mismatched_cells(mesh, swapped.to_pyvista()) == [0, 1]
