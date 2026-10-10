@@ -185,10 +185,12 @@ def _jittered_grid(nx=5, ny=4, seed=7, scale=1.0):
 
 def _old_rule(mesh, v_idx, amount):
     """The pre-H4-follow-up rule, inline: move along the unit mean of the
-    unit edge vectors, boundary or not."""
+    unit edge vectors, boundary or not (zero-length edges skipped, as the
+    old code's length cut-off did)."""
     v = mesh.vertices[v_idx]
     units = [(n.position - v.position) / np.linalg.norm(n.position - v.position)
-             for n in mesh.get_vertex_neighbors(v)]
+             for n in mesh.get_vertex_neighbors(v)
+             if np.linalg.norm(n.position - v.position) > 0.0]
     mean = np.sum(units, axis=0) / len(units)
     return v.position + mean / np.linalg.norm(mean) * amount
 
@@ -294,3 +296,16 @@ def test_pinched_vertex_keeps_to_its_boundary_edges():
         assert _boundary_neighbours(m, 0) == [6, 7]          # precondition
         out = edge_slide(m, [0], 0.3)
         assert _on_outline(m, 0, _pos(out, 0)), _pos(out, 0)
+
+
+def test_boundary_vertex_with_only_zero_length_boundary_edges_stays():
+    """Vertices 0, 1 and 2 of the grid coincide, so vertex 1's boundary edges
+    have zero length: its outline is a single point. It must stay on it, not
+    fall through to the interior rule and move into the mesh."""
+    pts = np.array([v.position for v in _grid().vertices], dtype=float)
+    pts[0] = pts[2] = pts[1]
+    m = HalfEdgeMesh.from_arrays(pts, [[0, 1, 4, 3], [1, 2, 5, 4], [3, 4, 7, 6], [4, 5, 8, 7]])
+    assert _boundary_neighbours(m, 1) == [0, 2]                  # precondition
+    assert all(np.array_equal(_pos(m, n), _pos(m, 1)) for n in (0, 2))
+    assert not np.allclose(_old_rule(m, 1, 0.3), _pos(m, 1))     # old rule moves it
+    assert np.array_equal(_pos(edge_slide(m, [1], 0.3), 1), _pos(m, 1))

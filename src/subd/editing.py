@@ -105,7 +105,7 @@ def extrude_edges(mesh: HalfEdgeMesh, edge_indices: list[int], distance: float =
         nv2_idx = len(verts) - 1
 
         # Wind the strip against the source face: it must traverse the shared
-        # edge as (v2, v1). Reusing (v1, v2) — as the old code did — means both
+        # edge as (v2, v1). Reusing (v1, v2) â€” as the old code did â€” means both
         # faces walk the edge the same way, so they can never be twinned and the
         # result can never close up.
         faces.append([v2_idx, v1_idx, nv1_idx, nv2_idx])
@@ -269,7 +269,7 @@ def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: 
     """Delete both face groups and connect their boundary edges with new quad faces.
 
     If the bridge cannot be built cleanly, the mesh is returned untouched (a
-    copy). Deleting the faces first — as the old code did — punched two
+    copy). Deleting the faces first â€” as the old code did â€” punched two
     permanent holes in the model whenever the bridge could not be built. The
     request is refused when:
 
@@ -558,7 +558,7 @@ def edge_slide(mesh: HalfEdgeMesh, vertex_indices: list[int], amount: float) -> 
 
     Each vertex moves by `amount` along the mean of its unit edge vectors (a
     negative amount moves against it). A boundary vertex stays on the
-    outline: it slides by `amount` along whichever of its boundary edges
+    outline: it slides by |amount| along whichever of its boundary edges
     that move favours, stopping exactly on the neighbour when the edge is
     shorter, and stays put when the move favours none of them (a tie within
     1e-9 relative) - e.g. a vertex on a symmetric straight boundary, or a
@@ -613,7 +613,10 @@ def edge_slide(mesh: HalfEdgeMesh, vertex_indices: list[int], amount: float) -> 
             if length > 0.0:
                 boundary.append((vec / length, length, n_idx))
         if not boundary:
-            verts[v_idx] += move
+            if v_idx not in boundary_nbrs:   # interior vertex
+                verts[v_idx] += move
+            # else: every boundary edge has zero length - the outline is a
+            # single point here, so stay on it
             continue
 
         along = [float(np.dot(move, u)) for u, _, _ in boundary]
