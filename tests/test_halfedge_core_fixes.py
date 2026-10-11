@@ -214,13 +214,13 @@ def test_boundary_vertex_fan_walks_both_directions():
                        [f_right.index, f_mid.index, f_left.index])
 
     neighbours = {n.index for n in mesh.get_vertex_neighbors(v0)}
-    # Vertex 4 is reachable only through the half-edge 4->0; this structure has
-    # no boundary half-edges, so vertex 0 owns no outgoing spoke towards it and
-    # an outgoing-fan walk cannot report it.
-    assert neighbours == {1, 2, 3}
+    # Vertex 4 is reachable only through the boundary half-edge 4->0: vertex 0
+    # owns no outgoing spoke towards it, but it is still a neighbour (bug
+    # report H4 / cand 6 - this test used to pin the truncated set {1, 2, 3}).
+    assert neighbours == {1, 2, 3, 4}
     # Asserting the number, not `len(get_vertex_neighbors(...))` - vertex_valence
     # *is* that len(), so comparing the two can never fail.
-    assert mesh.vertex_valence(v0) == 3
+    assert mesh.vertex_valence(v0) == 4
     # The two-sided walk must not hand the same spoke back twice.
     fan = mesh.get_vertex_fan(v0)
     assert len({he.index for he in fan}) == len(fan) == 3

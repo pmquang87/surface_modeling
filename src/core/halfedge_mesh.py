@@ -61,6 +61,16 @@ class HalfEdgeMesh:
         return v
 
     def add_face(self, vertex_indices: List[int]) -> Optional[Face]:
+        # Validate before building anything: a bad index used to raise only
+        # after the Face and its half-edges were appended, leaving a partial
+        # face (vertex None) that broke every later traversal. A negative
+        # index would silently alias another vertex under a different key.
+        n_verts = len(self.vertices)
+        for v_idx in vertex_indices:
+            if not 0 <= v_idx < n_verts:
+                raise IndexError(f"add_face: vertex index {v_idx} out of range "
+                                 f"for a mesh with {n_verts} vertices")
+
         # A repeated consecutive index would build a half-edge from a vertex to
         # itself: it becomes its own twin and never gets an Edge record.
         indices = []
@@ -189,7 +199,22 @@ class HalfEdgeMesh:
         return [he.face for he in self.get_vertex_fan(vertex) if he.face is not None]
 
     def get_vertex_neighbors(self, vertex: Vertex) -> List[Vertex]:
-        return [he.vertex for he in self.get_vertex_fan(vertex) if he.vertex is not None]
+        """
+        Neighbouring vertices in ring order.
+
+        Each outgoing spoke gives one neighbour, but an open fan has one more
+        edge than spokes: the incoming boundary half-edge in front of fan[0]
+        starts at a vertex no spoke points to. It is prepended, so that
+        consecutive neighbours always share a face with `vertex`.
+        """
+        fan = self.get_vertex_fan(vertex)
+        neighbors = [he.vertex for he in fan if he.vertex is not None]
+        if fan and fan[0].prev is not None and fan[0].prev.twin is None:
+            incoming = fan[0].prev
+            start = incoming.prev.vertex if incoming.prev is not None else None
+            if start is not None and start is not vertex and start not in neighbors:
+                neighbors.insert(0, start)
+        return neighbors
 
     def get_edge_faces(self, edge: Edge) -> Tuple[Optional[Face], Optional[Face]]:
         if edge.half_edge is None:
@@ -412,7 +437,10 @@ class HalfEdgeMesh:
                 # corner triangle (verts[0], verts[1], verts[-1]) inverts the
                 # normal whenever that corner is reflex, and ignores warping on
                 # non-planar quads.
+                # Centring first keeps a small face far from the origin from
+                # drowning in the rounding of P + Q.
                 P = np.asarray(verts, dtype=np.float64)
+                P = P - P.mean(axis=0)
                 Q = np.roll(P, -1, axis=0)
                 d = P - Q
                 s = P + Q
@@ -422,7 +450,13 @@ class HalfEdgeMesh:
                     np.dot(d[:, 0], s[:, 1]),
                 ], dtype=np.float64)
                 norm = np.linalg.norm(n)
-                f.normal = n / norm if norm > 1e-8 else np.zeros(3)
+                # |n| is twice the area, so compare it with the squared edge
+                # lengths: an absolute threshold zeroed every valid face with
+                # sub-1e-4 edges (scans in metres). Only a numerically
+                # zero-area face is degenerate, and it gets the zero vector,
+                # which compute_vertex_normals simply skips.
+                scale = np.einsum('ij,ij->', d, d)
+                f.normal = n / norm if norm > 1e-12 * scale else np.zeros(3)
 
     def compute_vertex_normals(self):
         self.compute_face_normals()

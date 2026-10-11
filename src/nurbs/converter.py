@@ -10,12 +10,102 @@ class SubDToNURBSConverter:
         self.continuity = continuity
         self.tolerance = tolerance
 
+    # Subdivision levels behind the no-reference dense grids: 2**2 + 1 = 5
+    # exact limit samples per side, resampled to the fitter's 6 (see
+    # _limit_dense_grids for why not 3 levels / 9 samples).
+    dense_grid_levels = 2
+
+    def _limit_dense_grids(self, mesh: HalfEdgeMesh, grid_size: int = 6,
+                           levels: Optional[int] = None) -> Dict[int, np.ndarray]:
+        """Dense samples of the TRUE Catmull-Clark limit surface, per quad.
+
+        Returns ``{face.index: (grid_size, grid_size, 3)}`` for every quad of
+        `mesh`, laid out like the fitter's tensor grid: entry ``[i, j]`` at
+        ``(u, v) = (i, j) / (grid_size - 1)``, u along c0 -> c1, v along
+        c0 -> c3 of ``mesh.get_face_vertices(face)``.
+
+        The mesh is subdivided `levels` times with the repo's own
+        `_subdivide_once` (creases, corners and darts included), and each
+        quad's (2**levels + 1)^2 sub-grid of vertices is found with
+        `subdivide_with_quad_lineage`. The limit positions of those vertices
+        are exact limit points at the dyadic parameters (i, j) / 2**levels of
+        the face; the corner samples are the limit positions of the quad's
+        own cage vertices, so on a closed cage they agree with the patch
+        corners to rounding. On an open cage `evaluate_limit_surface`
+        keeps boundary vertices where the subdivided mesh has them, which
+        is neither their limit nor where the coarse cage has them. The
+        boundary samples themselves have no effect on the fit (its boundary
+        rows are fixed), but they are nodes of the resampling below, so
+        they do shift the interior 6 x 6 samples: measured in review, by up
+        to 2.6e-4 of the bounding-box diagonal on an open grid and 9.2e-5
+        on an open cylinder.
+
+        Used by both no-reference paths: the GUI "Convert to NURBS" for
+        SubD modelling and the convert CLI's ``--no-reference-fit``
+        (measured in review on an icosphere STL: mean deviation 0.280 ->
+        0.228 mm).
+
+        When grid_size is not 2**levels + 1 the samples are resampled by
+        tensor Lagrange interpolation of degree 2**levels in u and v. At the
+        default 2 levels that is quartic through 5 x 5 nodes, which is exact
+        wherever the limit is a bicubic polynomial on the face (every face
+        whose 1-ring is regular, i.e. a uniform bicubic B-spline piece, and
+        every planar face) and reproduces the nodes, so the corners stay
+        exact. Faces at an extraordinary vertex are not polynomial there:
+        measured against 3 levels (exact samples at the eighths), the
+        resampling error grows with the valence and runs from 0 (to
+        rounding: create_torus, the fully creased box) through 7e-5 of the
+        bounding-box diagonal (create_sphere), 1.1e-3 to 1.2e-3 (unit-cube
+        cages, four valence-3 vertices per face), 1.6e-3 (a valence-8 cap) and 1.7e-3
+        (an open grid, mostly tangential: its normal part is <= 8.5e-4) up
+        to 4.4e-3 at a valence-48 pole (2.0e-3 on the interior targets
+        alone); the last three were measured in review. The old bump was
+        off by up to 0.1 of the diagonal. 3 levels would avoid the resampling but
+        costs ~5x the subdivision and limit evaluation (5000-quad torus
+        cage: ~21 s vs ~104 s, on a conversion of ~50-120 s) and, at
+        9 x 9, 2.25x the fitter's data equations, while the patch error of
+        this path is dominated by its straight boundary chords anyway.
+
+        Raises (ValueError / anything from the subdivision) when the quad
+        lineage cannot be traced; the caller falls back to the heuristic.
+        """
+        from src.subd.catmull_clark import (subdivide_with_quad_lineage,
+                                            evaluate_limit_surface)
+        if levels is None:
+            levels = self.dense_grid_levels
+        fine, lineage = subdivide_with_quad_lineage(mesh, levels)
+        if not lineage:
+            return {}
+        fine_limit, _ = evaluate_limit_surface(fine)
+        n = 2 ** levels + 1
+        nodes = np.linspace(0.0, 1.0, n)
+        targets = np.linspace(0.0, 1.0, grid_size)
+        if grid_size == n:
+            L = None
+        else:
+            # L[t, a] = a-th Lagrange basis polynomial on `nodes` at target t
+            L = np.ones((grid_size, n))
+            for a in range(n):
+                for b in range(n):
+                    if b != a:
+                        L[:, a] *= (targets - nodes[b]) / (nodes[a] - nodes[b])
+        grids = {}
+        for fidx, idx in lineage.items():
+            g = fine_limit[idx]
+            if L is not None:
+                g = np.einsum('ta,abk,sb->tsk', L, g, L)
+            grids[fidx] = g
+        return grids
+
     def _evaluate_dense_grid(self, mesh: HalfEdgeMesh, face: Any, limit_positions: np.ndarray, grid_size: int = 17) -> np.ndarray:
         """
-        Evaluates the limit surface at a dense grid of points for a given quad face.
-        Here we use a basic approximation: bilinear interpolation of the corners' limit positions,
-        optionally inflated by the face normal to approximate the limit surface curvature.
-        In a full implementation, this would use Stam's exact evaluation or sample a refined mesh.
+        HEURISTIC dense grid for one quad, no longer used by generate_patches
+        (which samples the true limit surface, `_limit_dense_grids`); it is
+        its fallback when the quad lineage cannot be traced.
+        Bilinear interpolation of the corners' limit positions, inflated by
+        the face normal by a fixed bump of 0.025 * |c1 - c0| at the centre.
+        The bump ignores creases and is only a crude stand-in for the limit
+        surface: a fully creased unit box came out with volume 1.0667.
         """
         vertices = mesh.get_face_vertices(face)
         corners = [limit_positions[v.index] for v in vertices]
@@ -27,10 +117,17 @@ class SubDToNURBSConverter:
         v2 = c3 - c0
         normal = np.cross(v1, v2)
         n_len = np.linalg.norm(normal)
-        if n_len > 1e-6:
+        # Scale-relative degeneracy test, the M15 rule of
+        # HalfEdgeMesh.compute_face_normals: |n| is an area, so compare it with
+        # the squared edge lengths. The old absolute 1e-6 bumped every valid
+        # quad with sub-1e-3 edges in-plane along z. A zero-area quad has no
+        # normal and gets no bump at all.
+        d = np.asarray(corners, dtype=np.float64)
+        d = d - np.roll(d, -1, axis=0)
+        if n_len > 1e-12 * np.einsum('ij,ij->', d, d):
             normal = normal / n_len
         else:
-            normal = np.array([0, 0, 1])
+            normal = np.zeros(3)
             
         grid = np.zeros((grid_size, grid_size, 3))
         u_vals = np.linspace(0, 1, grid_size)
@@ -42,7 +139,7 @@ class SubDToNURBSConverter:
                 p = (1-u)*(1-v)*c0 + u*(1-v)*c1 + u*v*c2 + (1-u)*v*c3
                 
                 # Add a simple quadratic bump to approximate subdivision limit surface bulging
-                bump = u * (1 - u) * v * (1 - v) * 4.0  # Max 1.0 at center
+                bump = u * (1 - u) * v * (1 - v) * 4.0  # Max 0.25 at center
                 # Scale bump based on the size of the quad
                 side_len = np.linalg.norm(c1 - c0)
                 displacement = normal * (side_len * 0.1) * bump
@@ -55,8 +152,10 @@ class SubDToNURBSConverter:
                          reference_mesh: Optional[HalfEdgeMesh] = None) -> List[Any]:
         """Fit one 6x6 Bezier patch per quad face of `mesh`.
 
-        There is no subdivision step: the cage is fitted at the density it
-        arrives with. (An unused ``subdivision_levels`` argument used to be
+        One patch per cage quad: the cage is fitted at the density it arrives
+        with. (Without a reference mesh the cage is subdivided internally,
+        but only to sample the limit surface for the fit,
+        `_limit_dense_grids`.) (An unused ``subdivision_levels`` argument used to be
         accepted here and in ``convert`` -- it was never read; use
         ``src.subd.catmull_clark.subdivide`` on the cage beforehand if you want
         a denser one.)
@@ -79,16 +178,40 @@ class SubDToNURBSConverter:
             mesh.compute_vertex_normals()
 
         from src.nurbs.g3_fitter import G3Fitter
-        # Map the requested continuity level onto the fitter's soft-constraint
-        # weight; data equations have weight 1, so values far above ~50 make
-        # the solver satisfy smoothness identities while ignoring the surface.
+        # Continuity level -> weight of the fitter's cross-patch rows (data
+        # rows have weight 1). G0 adds none. G1, G2 and G3 all add the SAME
+        # rows - a third-derivative (C3) match per shared boundary column -
+        # and the exact solve treats any weight of order 1 or more alike, so
+        # they give practically the same surface (max interior difference
+        # 1.3e-4 mm on a 2152-quad part). Tangent (C1) or curvature (C2)
+        # continuity is not enforced: hard C1 rows cost 24 % (mean) to 37 %
+        # (p95) more audit deviation on that part and are left as a possible
+        # later opt-in. The names stay accepted (scripts pass --continuity G1).
+        # Fairing (G3Fitter.fit_surface docstring) only on the reference fit,
+        # at every level: projected scan/STL samples are noisy, and 0.01
+        # damps the pole oscillations the 6x6-sample fit cannot see (real
+        # part: 44 -> 0 Coons resets, SolidWorks-validated). Without a
+        # reference the samples are clean limit-surface points, nothing runs
+        # away, and fairing only costs fidelity (mean interior error vs the
+        # limit surface +3 % on create_torus up to +21..25 % on create_box /
+        # create_cylinder, measured on the exact-limit dense grid), so it is
+        # off there.
         continuity_weights = {'G0': 0.0, 'G1': 5.0, 'G2': 20.0, 'G3': 50.0}
-        fitter = G3Fitter(continuity_weight=continuity_weights.get(self.continuity, 20.0))
+        fitter = G3Fitter(continuity_weight=continuity_weights.get(self.continuity, 20.0),
+                          fairing_weight=0.01 if ref_tm is not None else 0.0)
 
         quad_faces = [f for f in mesh.faces if len(mesh.get_face_vertices(f)) == 4]
         face_to_idx = {f.index: idx for idx, f in enumerate(quad_faces)}
 
         grid_size = 6
+        limit_grids = {}
+        if ref_tm is None and quad_faces:
+            try:
+                limit_grids = self._limit_dense_grids(mesh, grid_size=grid_size)
+            except Exception as e:
+                print(f"NURBS conversion: limit-surface sampling failed ({e}); "
+                      f"using the approximate dense grid")
+                limit_grids = {}
         quad_mesh_data = []
         for face in quad_faces:
             vertices = mesh.get_face_vertices(face)
@@ -103,14 +226,20 @@ class SubDToNURBSConverter:
             he = face.half_edge
             curr = he
             for _ in range(4):
-                if curr.twin and curr.twin.face and curr.twin.face.index in face_to_idx:
+                # A creased edge (crease_weight > 0, fractions included) is an
+                # intended sharp feature: list no neighbour across it, so the
+                # fitter adds no continuity rows there and keeps the crease.
+                sharp = curr.edge is not None and curr.edge.crease_weight > 0
+                if not sharp and curr.twin and curr.twin.face and curr.twin.face.index in face_to_idx:
                     neighbors.append(face_to_idx[curr.twin.face.index])
                 else:
                     neighbors.append(-1)
                 curr = curr.next
 
             if ref_tm is None:
-                dense_points = self._evaluate_dense_grid(mesh, face, limit_positions, grid_size=grid_size)
+                dense_points = limit_grids.get(face.index)
+                if dense_points is None:
+                    dense_points = self._evaluate_dense_grid(mesh, face, limit_positions, grid_size=grid_size)
                 corner_normals = None
             else:
                 dense_points = None  # filled below by batched projection

@@ -39,26 +39,22 @@ def import_step(filepath: str) -> Dict[str, Any]:
         logger.error(f"File not found: {filepath}")
         raise FileNotFoundError(f"File not found: {filepath}")
 
-    # Try OCP (support both 'OCP.Module' and cadquery-style 'OCP.OCP.Module')
+    # Try OCP. Only the flat ``OCP.<Module>`` names are public: the conda build
+    # and the cadquery-ocp wheels up to 7.7.2 ship one top-level OCP extension,
+    # and from 7.7.2.2b2 on the wheels put the native module at ``OCP/OCP.pyd``
+    # (hence ``OCP.OCP.*`` in tracebacks) behind per-module ``OCP/<Module>``
+    # wrapper packages, which also add compatibility aliases this code needs
+    # (``TopoDS.Face_s`` and friends on 7.9). Importing ``OCP.OCP.*`` directly
+    # would skip those aliases, so there is no nested-layout fallback.
     try:
-        try:
-            from OCP.STEPControl import STEPControl_Reader
-            from OCP.BRepMesh import BRepMesh_IncrementalMesh
-            from OCP.TopExp import TopExp_Explorer
-            from OCP.TopAbs import TopAbs_FACE
-            from OCP.BRep import BRep_Tool
-            from OCP.TopLoc import TopLoc_Location
-            from OCP.TopoDS import TopoDS
-        except ImportError:
-            # cadquery-ocp nests under OCP.OCP.*
-            from OCP.OCP.STEPControl import STEPControl_Reader
-            from OCP.OCP.BRepMesh import BRepMesh_IncrementalMesh
-            from OCP.OCP.TopExp import TopExp_Explorer
-            from OCP.OCP.TopAbs import TopAbs_FACE
-            from OCP.OCP.BRep import BRep_Tool
-            from OCP.OCP.TopLoc import TopLoc_Location
-            from OCP.OCP.TopoDS import TopoDS
-        
+        from OCP.STEPControl import STEPControl_Reader
+        from OCP.BRepMesh import BRepMesh_IncrementalMesh
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
+        from OCP.BRep import BRep_Tool
+        from OCP.TopLoc import TopLoc_Location
+        from OCP.TopoDS import TopoDS
+
         from src.io.occt_utils import quiet_occt
         quiet_occt()  # keep OCCT's transfer banner off stdout
         reader = STEPControl_Reader()
@@ -88,8 +84,6 @@ def import_step(filepath: str) -> Dict[str, Any]:
         mesh_algo = BRepMesh_IncrementalMesh(shape, 0.1)
         if not mesh_algo.IsDone():
             logger.warning("BRepMesh_IncrementalMesh failed to generate a mesh.")
-        
-        from OCP.TopAbs import TopAbs_REVERSED
 
         explorer = TopExp_Explorer(shape, TopAbs_FACE)
         vertices = []

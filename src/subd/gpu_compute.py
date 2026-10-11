@@ -199,7 +199,7 @@ __kernel void compute_limit_surface(
         }
     }
     
-    if (is_boundary || n_edges == 0) {
+    if (is_boundary || n_edges == 0 || n_faces == 0) {
         limit_points_out[i * 3 + 0] = px;
         limit_points_out[i * 3 + 1] = py;
         limit_points_out[i * 3 + 2] = pz;
@@ -222,13 +222,19 @@ __kernel void compute_limit_surface(
             sum_Rz += (vertices[v0 * 3 + 2] + vertices[v1 * 3 + 2]) / 2.0f;
         }
         
+        // Limit position, the same mask as catmull_clark.evaluate_limit_surface:
+        //   ((n - 3) P + 4 Rbar + 4 Fbar) / (n + 5)
+        // with Rbar the mean edge midpoint and Fbar the mean face centroid.
+        // (n-2)/n P + (sum_R + sum_F)/n^2 is the one-step vertex point, not
+        // the limit.
         float n = (float)n_edges;
-        float factor_P = (n - 2.0f) / n;
-        float factor_RF = 1.0f / (n * n);
-        
-        limit_points_out[i * 3 + 0] = factor_P * px + factor_RF * sum_Rx + factor_RF * sum_Fx;
-        limit_points_out[i * 3 + 1] = factor_P * py + factor_RF * sum_Ry + factor_RF * sum_Fy;
-        limit_points_out[i * 3 + 2] = factor_P * pz + factor_RF * sum_Rz + factor_RF * sum_Fz;
+        float factor_P = (n - 3.0f) / (n + 5.0f);
+        float factor_R = 4.0f / (n * (n + 5.0f));
+        float factor_F = 4.0f / ((float)n_faces * (n + 5.0f));
+
+        limit_points_out[i * 3 + 0] = factor_P * px + factor_R * sum_Rx + factor_F * sum_Fx;
+        limit_points_out[i * 3 + 1] = factor_P * py + factor_R * sum_Ry + factor_F * sum_Fy;
+        limit_points_out[i * 3 + 2] = factor_P * pz + factor_R * sum_Rz + factor_F * sum_Fz;
     }
 }
 """
@@ -460,6 +466,13 @@ class OpenCLSubdivider:
     def evaluate_limit_surface(self, vertices, face_vertices, face_offsets=None):
         """
         Evaluate limit surface positions using OpenCL kernel.
+
+        Interior vertices get the exact smooth Catmull-Clark limit, the same
+        mask as `src.subd.catmull_clark.evaluate_limit_surface`; boundary
+        vertices are left in place, as there. This path takes no crease
+        weights (like `subdivide` above), so it equals the CPU path only for a
+        mesh whose crease weights are all zero. Use the CPU function for a
+        creased cage.
         """
         if face_offsets is None:
             faces_2d = np.asarray(face_vertices)

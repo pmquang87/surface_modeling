@@ -15,6 +15,25 @@ def _unit(vec) -> np.ndarray | None:
     return v / length
 
 
+def _valid_indices(indices, count: int) -> list[int]:
+    """`indices` as in-range, non-repeating positions into a list of `count`.
+
+    Negative indices count from the end, as Python's do; out-of-range ones are
+    dropped; a repeat keeps only its first occurrence. Without this, faces[-1]
+    overwrote a face appended a moment earlier and a repeated index was
+    extruded twice, both of which leave holes.
+    """
+    out, seen = [], set()
+    for i in indices:
+        i = int(i)
+        if i < 0:
+            i += count
+        if 0 <= i < count and i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
 def extrude_faces(mesh: HalfEdgeMesh, face_indices: list[int], distance: float = 0.1, direction: np.ndarray = None) -> HalfEdgeMesh:
     """Extrude selected faces along their normals or a given direction.
 
@@ -26,8 +45,7 @@ def extrude_faces(mesh: HalfEdgeMesh, face_indices: list[int], distance: float =
 
     mesh.compute_face_normals()
 
-    for f_idx in face_indices:
-        if f_idx >= len(mesh.faces): continue
+    for f_idx in _valid_indices(face_indices, len(mesh.faces)):
         f = mesh.faces[f_idx]
         f_verts = [v.index for v in mesh.get_face_vertices(f)]
 
@@ -65,8 +83,7 @@ def extrude_edges(mesh: HalfEdgeMesh, edge_indices: list[int], distance: float =
 
     mesh.compute_vertex_normals()
 
-    for e_idx in edge_indices:
-        if e_idx >= len(mesh.edges): continue
+    for e_idx in _valid_indices(edge_indices, len(mesh.edges)):
         e = mesh.edges[e_idx]
         if e.half_edge is None or e.half_edge.prev is None: continue
         # e.half_edge runs v1 -> v2 inside its own face, so that face already
@@ -88,7 +105,7 @@ def extrude_edges(mesh: HalfEdgeMesh, edge_indices: list[int], distance: float =
         nv2_idx = len(verts) - 1
 
         # Wind the strip against the source face: it must traverse the shared
-        # edge as (v2, v1). Reusing (v1, v2) — as the old code did — means both
+        # edge as (v2, v1). Reusing (v1, v2) â€” as the old code did â€” means both
         # faces walk the edge the same way, so they can never be twinned and the
         # result can never close up.
         faces.append([v2_idx, v1_idx, nv1_idx, nv2_idx])
@@ -101,8 +118,7 @@ def inset_faces(mesh: HalfEdgeMesh, face_indices: list[int], inset_amount: float
     verts = [v.position.copy() for v in mesh.vertices]
     faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
     
-    for f_idx in face_indices:
-        if f_idx >= len(mesh.faces): continue
+    for f_idx in _valid_indices(face_indices, len(mesh.faces)):
         f = mesh.faces[f_idx]
         f_verts = [v.index for v in mesh.get_face_vertices(f)]
         
@@ -221,7 +237,7 @@ def insert_edge_loop(mesh: HalfEdgeMesh, edge_index: int, position: float = 0.5)
             he = he.next
             if he == start_he: break
             
-        split_hes = [he for he in f_edges if he.edge.index in ring_edge_indices]
+        split_hes = [he for he in f_edges if he.edge.index in edge_to_new_vert]
         if len(split_hes) == 2 and len(f_edges) == 4:
             idx0 = f_edges.index(split_hes[0])
             he0, he1, he2, he3 = f_edges[idx0], f_edges[(idx0+1)%4], f_edges[(idx0+2)%4], f_edges[(idx0+3)%4]
@@ -234,18 +250,40 @@ def insert_edge_loop(mesh: HalfEdgeMesh, edge_index: int, position: float = 0.5)
             faces.append([v_a, nv0, nv2, v_d])
             faces.append([nv0, v_b, v_c, nv2])
         else:
-            faces.append([he.vertex.index for he in f_edges])
-            
+            # A face the ring ends in (n-gon cap, pole triangle) is not cut, but
+            # it still has to carry the new vertex of every split edge, or the
+            # neighbouring split quad leaves a T-junction crack. he runs
+            # he.prev.vertex -> he.vertex, so the new point goes just before
+            # he.vertex.
+            poly = []
+            for he in f_edges:
+                if he.edge.index in edge_to_new_vert:
+                    poly.append(edge_to_new_vert[he.edge.index])
+                poly.append(he.vertex.index)
+            faces.append(poly)
+
     return HalfEdgeMesh.from_arrays(verts, faces)
 
 
 def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: list[int]) -> HalfEdgeMesh:
     """Delete both face groups and connect their boundary edges with new quad faces.
 
-    If the two groups do not present matching boundary loops there is nothing to
-    bridge, and the mesh is returned untouched. Deleting the faces first — as the
-    old code did — punched two permanent holes in the model whenever the bridge
-    could not be built.
+    If the bridge cannot be built cleanly, the mesh is returned untouched (a
+    copy). Deleting the faces first â€” as the old code did â€” punched two
+    permanent holes in the model whenever the bridge could not be built. The
+    request is refused when:
+
+    * the two groups do not present matching simple boundary loops;
+    * the groups overlap (share a face, also through index aliases such as -1);
+    * a new side quad would walk a directed edge that a kept face or another
+      side quad already walks (e.g. opposite faces of a box, whose side quads
+      would land on the existing walls);
+    * a vertex of either loop would end up non-manifold: two or more separate
+      face fans (groups touching at a single corner give a bow-tie vertex and
+      back-to-back side triangles), or no face at all (groups sharing a chain
+      of boundary edges collapse it, orphaning its inner vertices and leaving
+      zero-area or folded side faces). Vertices inside a group, off both
+      loops, are dropped from the surface as usual.
     """
     verts = [v.position.copy() for v in mesh.vertices]
 
@@ -277,8 +315,23 @@ def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: 
                     found = True
                     break
             if not found: break 
-        return [he.prev.vertex.index for he in loop if he.prev]
+        # Only one simple closed loop can be bridged. Edges left unchained (a
+        # band with two boundary loops), a chain that does not close, or one
+        # that passes a vertex twice (groups touching at a corner) mean the
+        # bridge cannot be built.
+        if (boundary_edges or loop[0].prev is None
+                or loop[-1].vertex is not loop[0].prev.vertex):
+            return []
+        vert_loop = [he.prev.vertex.index for he in loop if he.prev]
+        if len(vert_loop) != len(loop) or len(set(vert_loop)) != len(vert_loop):
+            return []
+        return vert_loop
 
+    face_indices_a = _valid_indices(face_indices_a, len(mesh.faces))
+    face_indices_b = _valid_indices(face_indices_b, len(mesh.faces))
+    # A face in both groups would be deleted once but bridged from twice.
+    if set(face_indices_a) & set(face_indices_b):
+        return mesh.copy()
     loop_a = get_boundary_loop(set(face_indices_a))
     loop_b = get_boundary_loop(set(face_indices_b))
 
@@ -302,14 +355,77 @@ def bridge_faces(mesh: HalfEdgeMesh, face_indices_a: list[int], face_indices_b: 
 
     loop_b_aligned = loop_b[best_shift:] + loop_b[:best_shift]
 
+    # A side quad that walks a directed edge some face already walks makes the
+    # result non-manifold with holes. This also catches a side quad landing on
+    # a face we keep (opposite faces of a box: the four side quads ARE the four
+    # walls): wound the same way it repeats all four of the wall's edges, wound
+    # the other way its neighbouring side quad repeats a wall edge. Check every
+    # side quad as add_face will build it before committing to the bridge.
+    used = {(fv[i], fv[(i + 1) % len(fv)]) for fv in faces for i in range(len(fv))}
+    new_faces, new_polys = [], []
     for i in range(n):
         v1 = loop_a[i]
         v2 = loop_a[(i + 1) % n]
         v3 = loop_b_aligned[(i + 1) % n]
         v4 = loop_b_aligned[i]
-        faces.append([v1, v2, v3, v4])
+        quad = [v1, v2, v3, v4]
+        # add_face drops repeated consecutive corners (groups sharing an edge
+        # or a corner); a quad left with < 3 corners is not built at all.
+        poly = [v for k, v in enumerate(quad) if v != quad[k - 1]]
+        if len(poly) < 3:
+            continue
+        for k in range(len(poly)):
+            e = (poly[k], poly[(k + 1) % len(poly)])
+            if e in used:
+                return mesh.copy()
+            used.add(e)
+        new_faces.append(quad)
+        new_polys.append(poly)
 
-    return HalfEdgeMesh.from_arrays(verts, faces)
+    # Groups touching at a single corner pass the edge check but pinch the
+    # result: the shared vertex keeps two separate face fans (a bow-tie), and
+    # the collapsed side triangles lie back-to-back on the kept faces. A loop
+    # vertex must end up with exactly one fan. None means it was orphaned:
+    # groups sharing a chain of boundary edges collapse the chain, and the
+    # side faces built around it are folded or of zero area.
+    fans = _fan_counts(faces + new_polys, set(loop_a) | set(loop_b))
+    if any(c != 1 for c in fans.values()):
+        return mesh.copy()
+
+    return HalfEdgeMesh.from_arrays(verts, faces + new_faces)
+
+
+def _fan_counts(faces: list[list[int]], vertex_ids) -> dict[int, int]:
+    """Number of separate face fans around each vertex in ``vertex_ids``.
+
+    Two faces at a vertex are in the same fan when they share an edge out of
+    that vertex. A manifold vertex has one fan; a bow-tie (pinched) vertex has
+    two or more; an unused vertex has none.
+    """
+    corners = {v: [] for v in vertex_ids}
+    for fv in faces:
+        for k, v in enumerate(fv):
+            if v in corners:
+                corners[v].append((fv[k - 1], fv[(k + 1) % len(fv)]))
+    counts = {}
+    for v, cs in corners.items():
+        parent = list(range(len(cs)))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        first_at = {}
+        for i, (prev_v, next_v) in enumerate(cs):
+            for u in (prev_v, next_v):
+                if u in first_at:
+                    parent[find(i)] = find(first_at[u])
+                else:
+                    first_at[u] = i
+        counts[v] = len({find(i) for i in range(len(cs))})
+    return counts
 
 
 def mirror_mesh(mesh: HalfEdgeMesh, axis: str = 'x', merge_distance: float = 0.001) -> HalfEdgeMesh:
@@ -324,14 +440,21 @@ def mirror_mesh(mesh: HalfEdgeMesh, axis: str = 'x', merge_distance: float = 0.0
     lands on a face that is already there. Reflections whose vertex set repeats
     a face already in the result are dropped, so mirroring a symmetric mesh is
     an identity instead of a doubled, zero-thickness shell.
+
+    `axis` is 'x', 'y' or 'z' in either case; anything else raises ValueError.
     """
+    # An unknown axis used to fall back to X silently, so 'Y' mirrored across
+    # the wrong plane. Accept either case; refuse anything else.
+    axis_idx = {'x': 0, 'y': 1, 'z': 2}.get(str(axis).lower())
+    if axis_idx is None:
+        raise ValueError(f"mirror_mesh: axis must be 'x', 'y' or 'z', got {axis!r}")
+
     faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
     n_orig = len(mesh.vertices)
     if n_orig == 0:
         return mesh.copy()
 
     positions = np.array([v.position for v in mesh.vertices], dtype=np.float64)
-    axis_idx = {'x': 0, 'y': 1, 'z': 2}.get(axis, 0)
 
     mirrored = positions.copy()
     mirrored[:, axis_idx] *= -1.0
@@ -431,29 +554,85 @@ def set_edge_weight(mesh: HalfEdgeMesh, edge_indices: list[int], weight: float) 
 
 
 def edge_slide(mesh: HalfEdgeMesh, vertex_indices: list[int], amount: float) -> HalfEdgeMesh:
-    """Slide selected vertices along their adjacent edges."""
+    """Slide selected vertices along their adjacent edges.
+
+    Each vertex moves by `amount` along the mean of its unit edge vectors (a
+    negative amount moves against it). A boundary vertex stays on the
+    outline: it slides by |amount| along whichever of its boundary edges
+    that move favours, stopping exactly on the neighbour when the edge is
+    shorter, and stays put when the move favours none of them (a tie within
+    1e-9 relative) - e.g. a vertex on a symmetric straight boundary, or a
+    corner whose only edges are its two boundary edges (their mean is the
+    bisector). Following the mean direction there dented the outline into
+    the mesh. Boundary edges are read from the faces, so a pinched vertex
+    also sees those of the fan get_vertex_neighbors does not walk. All moves
+    use the original positions. Indices are normalised like the other
+    editing ops: negative ones count from the end, out-of-range ones are
+    skipped, a repeat slides once.
+    """
     verts = [v.position.copy() for v in mesh.vertices]
     faces = [[v.index for v in mesh.get_face_vertices(f)] for f in mesh.faces]
-    
-    for v_idx in vertex_indices:
-        if v_idx >= len(mesh.vertices): continue
+
+    # an edge that only one face uses is on the boundary
+    edge_use = {}
+    for poly in faces:
+        for a, b in zip(poly, poly[1:] + poly[:1]):
+            key = (min(a, b), max(a, b))
+            edge_use[key] = edge_use.get(key, 0) + 1
+    boundary_nbrs = {}
+    for (a, b), count in edge_use.items():
+        if count == 1 and a != b:
+            boundary_nbrs.setdefault(a, []).append(b)
+            boundary_nbrs.setdefault(b, []).append(a)
+
+    for v_idx in _valid_indices(vertex_indices, len(mesh.vertices)):
         v = mesh.vertices[v_idx]
         neighbors = mesh.get_vertex_neighbors(v)
         if not neighbors: continue
-        
-        # Calculate average edge vector away from vertex
+
+        # Calculate average edge vector away from vertex. Only an exactly
+        # zero-length edge is skipped: an absolute 1e-6 cut-off skipped every
+        # edge of a sub-micron cage, so nothing there could slide.
         avg_vec = np.zeros(3)
         for n in neighbors:
             vec = n.position - v.position
             length = np.linalg.norm(vec)
-            if length > 1e-6:
+            if length > 0.0:
                 avg_vec += (vec / length)
-                
+
         avg_vec /= len(neighbors)
         avg_len = np.linalg.norm(avg_vec)
-        if avg_len > 1e-6:
-            verts[v_idx] += (avg_vec / avg_len) * amount
-            
+        if avg_len <= 1e-6:
+            continue
+        move = (avg_vec / avg_len) * amount
+
+        boundary = []
+        for n_idx in sorted(boundary_nbrs.get(v_idx, ())):
+            vec = mesh.vertices[n_idx].position - v.position
+            length = np.linalg.norm(vec)
+            if length > 0.0:
+                boundary.append((vec / length, length, n_idx))
+        if not boundary:
+            if v_idx not in boundary_nbrs:   # interior vertex
+                verts[v_idx] += move
+            # else: every boundary edge has zero length - the outline is a
+            # single point here, so stay on it
+            continue
+
+        along = [float(np.dot(move, u)) for u, _, _ in boundary]
+        best = int(np.argmax(along))
+        tol = 1e-9 * abs(amount)
+        if along[best] <= tol or any(a >= along[best] - tol
+                                     for k, a in enumerate(along) if k != best):
+            continue  # no boundary direction is favoured
+        u, length, n_idx = boundary[best]
+        if abs(amount) >= length:
+            # end stop exactly on the neighbour: u * length lands an ulp off
+            # it, and that ulp-short edge would steer the next slide
+            verts[v_idx] = mesh.vertices[n_idx].position.copy()
+        else:
+            verts[v_idx] += u * abs(amount)
+
     return HalfEdgeMesh.from_arrays(verts, faces)
 
 

@@ -56,11 +56,16 @@ class _Progress:
         self("WARNING: " + msg)
 
 
+@contextlib.contextmanager
 def _library_output_to_stderr(quiet: bool):
     """Library modules still ``print()`` progress; keep stdout for RESULT."""
     if quiet:
-        return contextlib.redirect_stdout(open(os.devnull, "w"))
-    return contextlib.redirect_stdout(sys.stderr)
+        # close the sink afterwards: an unclosed devnull leaked per quiet run
+        with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink):
+            yield
+    else:
+        with contextlib.redirect_stdout(sys.stderr):
+            yield
 
 
 def convert(input_path: str, output_path: str, target_faces: int = 2000,
@@ -81,6 +86,9 @@ def convert(input_path: str, output_path: str, target_faces: int = 2000,
 
     def fail(msg: str) -> Tuple[int, Dict[str, Any]]:
         log("ERROR: " + msg)
+        # ``ok`` is set True once a STEP is written; a failed audit after that
+        # must not leave it True in RESULT
+        result["ok"] = False
         result["error"] = msg
         result["exit_code"] = 1
         result["seconds"] = round(time.time() - log.t0, 3)
@@ -205,8 +213,13 @@ def main(argv=None) -> int:
                              "(default 2000; more = finer, slower)")
     parser.add_argument("--continuity", choices=["G0", "G1", "G2", "G3"],
                         default="G1",
-                        help="cross-patch smoothness weight; G0 = best fidelity, "
-                             "G3 = smoothest (default G1)")
+                        help="cross-patch smoothing rows: G0 = none, which is "
+                             "NOT the most faithful on a reference fit (real "
+                             "part: mean deviation 0.0736 mm, 9 reset patches, "
+                             "vs 0.0695 mm, 0 at G1); G1, G2 and G3 add the "
+                             "same third-derivative (C3) rows and give "
+                             "practically the same surface - tangent or "
+                             "curvature continuity is not enforced (default G1)")
     parser.add_argument("--smoothing", type=float, default=0.5,
                         help="cage relaxation weight 0..1 (default 0.5)")
     parser.add_argument("--no-reference-fit", action="store_true",

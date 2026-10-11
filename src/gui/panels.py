@@ -21,8 +21,9 @@ def face_normal(mesh, face) -> np.ndarray:
     keeps this off the O(faces) path (positions can change at any time, so a
     non-zero cached value is no proof it is still current).
 
-    Mirrors ``HalfEdgeMesh.compute_face_normals`` (Newell over every edge), which
-    is orientation-correct for reflex corners and warped quads alike.
+    Mirrors ``HalfEdgeMesh.compute_face_normals`` (Newell over every edge about
+    the centroid, scale-relative degeneracy test), which is orientation-correct
+    for reflex corners and warped quads alike.
     """
     try:
         verts = [v.position for v in mesh.get_face_vertices(face)]
@@ -31,7 +32,10 @@ def face_normal(mesh, face) -> np.ndarray:
     if len(verts) < 3:
         return np.zeros(3, dtype=np.float64)
 
+    # Centring first keeps a small face far from the origin from drowning in
+    # the rounding of P + Q (same as the core routine).
     P = np.asarray(verts, dtype=np.float64)
+    P = P - P.mean(axis=0)
     Q = np.roll(P, -1, axis=0)
     d = P - Q
     s = P + Q
@@ -41,7 +45,11 @@ def face_normal(mesh, face) -> np.ndarray:
         np.dot(d[:, 0], s[:, 1]),
     ], dtype=np.float64)
     norm = np.linalg.norm(n)
-    n = n / norm if norm > 1e-8 else np.zeros(3, dtype=np.float64)
+    # Scale-relative degeneracy test, as in the core routine: |n| is twice the
+    # area, so an absolute threshold zeroed every valid face with sub-1e-4
+    # edges (scans in metres). Only a numerically zero-area face gets zeros.
+    scale = np.einsum('ij,ij->', d, d)
+    n = n / norm if norm > 1e-12 * scale else np.zeros(3, dtype=np.float64)
     try:
         face.normal = n
     except Exception:
@@ -115,12 +123,26 @@ class PropertiesPanel(QWidget):
         self.layout.addWidget(self.group_box)
         self.layout.addStretch()
 
-    def clear(self):
-        while self.form_layout.count():
-            item = self.form_layout.takeAt(0)
+    @staticmethod
+    def _empty_layout(layout):
+        """Delete every widget in ``layout``, descending into nested layouts.
+
+        A row added with ``addRow(QHBoxLayout)`` (set_tool_ui's Apply/Cancel
+        row) comes back from takeAt() as a layout item whose widget() is None,
+        so a widget-only loop left those buttons alive and clickable.
+        """
+        while layout.count():
+            item = layout.takeAt(0)
             widget = item.widget()
             if widget:
                 widget.deleteLater()
+            child = item.layout()
+            if child is not None:
+                PropertiesPanel._empty_layout(child)
+                child.deleteLater()
+
+    def clear(self):
+        self._empty_layout(self.form_layout)
         self.group_box.setTitle("Properties")
         self.current_target = None
 

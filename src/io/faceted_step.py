@@ -233,12 +233,18 @@ def unify_verdict(faces_before: int, faces_after: int, volume_before: float,
     over the wrong wire and the volume changes, or the merge splits a face
     instead of joining it and the count goes UP. Either one means the faceted
     body was the better answer.
+
+    A non-finite volume on either side is rejected: every comparison with NaN
+    is False, so a ``rel > tol`` gate would wave a failed integration through.
     """
+    if not (math.isfinite(volume_before) and math.isfinite(volume_after)):
+        return (False, f"volume is not finite ({volume_before!r} -> "
+                       f"{volume_after!r})", float("nan"))
     if volume_before:
         rel = abs(volume_after - volume_before) / abs(volume_before)
     else:
         rel = abs(volume_after)
-    if rel > volume_tol_rel:
+    if not rel <= volume_tol_rel:
         return (False, f"volume moved by {rel:.3g} relative "
                        f"(budget {volume_tol_rel:g})", rel)
     if faces_after > faces_before:
@@ -282,7 +288,8 @@ def _unify_same_domain(shape: Any, angle_deg: float, volume_tol_rel: float,
         accepted, reason, rel = unify_verdict(
             info["faces_before"], faces_after, volume_before, volume_after,
             volume_tol_rel)
-        info["volume_rel_delta"] = float(rel)
+        # None, not NaN, when unmeasurable: the report must stay valid JSON
+        info["volume_rel_delta"] = float(rel) if math.isfinite(rel) else None
         info["faces_after"] = faces_after
         if not accepted:
             info["rejected"] = reason
@@ -803,18 +810,25 @@ def export_step_faceted(mesh, filepath, *, schema: str = "AP214IS",
         report["bodies"] = [{k: v for k, v in b.items() if k != "shape"}
                             for b in bodies]
         report["solids"] = sum(1 for b in bodies if b["solid"])
-        report["open_shells"] = sum(1 for b in bodies if not b["solid"])
+        # closure, not solidity: with make_solids=False a closed shell is a
+        # closed surface body, not damage
+        report["open_shells"] = sum(1 for b in bodies if not b["closed"])
 
         pre = _premeasure(shape)
         report["faces"] = pre["faces"]
         report["shells"] = pre["shells"]
         report["closed_measured"] = pre["closed_measured"]
         report["brepcheck_valid"] = pre["brepcheck_valid"]
-        report["volume_brep_mm3"] = pre["brep_volume_mm3"]
+        brep = pre["brep_volume_mm3"]
+        if brep is not None and not math.isfinite(brep):
+            # None, not NaN, when unmeasurable: the report must stay valid JSON
+            warn(f"B-Rep volume of the assembled shape is not finite ({brep!r})")
+            brep = None
+        report["volume_brep_mm3"] = brep
         report["volume_mesh_mm3"] = float(volume_mesh)
-        if volume_mesh and pre["brep_volume_mm3"] is not None:
-            report["volume_delta_pct"] = float(
-                100.0 * (pre["brep_volume_mm3"] - volume_mesh) / volume_mesh)
+        if volume_mesh and brep is not None:
+            delta = 100.0 * (brep - volume_mesh) / volume_mesh
+            report["volume_delta_pct"] = float(delta) if math.isfinite(delta) else None
         if pre["solids"] != report["solids"]:
             warn(f"{report['solids']} solids were built but the assembled shape "
                  f"holds {pre['solids']}")

@@ -113,6 +113,13 @@ def _subdivide_once(mesh: HalfEdgeMesh, smooth: bool = True) -> HalfEdgeMesh:
             if len(crease_edges) == 2:
                 avg_crease_mid = np.mean([edge_midpoints[e.index] for e in crease_edges], axis=0)
                 crease_vp = (avg_crease_mid + P) / 2.0
+            elif len(crease_edges) == 1 and not is_boundary:
+                # Dart: a crease that ends inside the surface. The standard
+                # dart rule (Hoppe et al. 1994; DeRose, Kass & Truong 1998)
+                # is the smooth vertex rule, so the crease fades out here
+                # instead of pinning a cone point. A boundary vertex already
+                # has two sharp boundary edges, so one crease is a corner.
+                crease_vp = vp
             else:
                 crease_vp = P
             vp = vp * (1.0 - max_w) + crease_vp * max_w
@@ -186,11 +193,126 @@ def _subdivide_once(mesh: HalfEdgeMesh, smooth: bool = True) -> HalfEdgeMesh:
     return new_mesh
 
 
+def subdivide_with_quad_lineage(mesh: HalfEdgeMesh, levels: int
+                                ) -> tuple[HalfEdgeMesh, dict[int, np.ndarray]]:
+    """
+    Subdivide `levels` times and say where each quad's sub-grid went.
+
+    Returns ``(fine, lineage)``. ``fine`` is ``subdivide(mesh, levels)``.
+    ``lineage[face.index]`` is an ``(n, n)`` int array, n = 2**levels + 1, for
+    every face of `mesh` with exactly four vertices: ``fine`` vertex indices
+    laid out on the face's parameter grid, entry ``[i, j]`` at
+    ``(u, v) = (i, j) / 2**levels``. With ``c0..c3 = mesh.get_face_vertices(face)``
+    in their cyclic order, u runs along c0 -> c1 and v along c0 -> c3, so
+    ``[0, 0], [n-1, 0], [n-1, n-1], [0, n-1]`` are c0, c1, c2, c3 (the layout
+    of the converter's dense grids and of ``G3Fitter``'s tensor grid).
+    ``evaluate_limit_surface(fine)[0][lineage[f]]`` is then the limit surface
+    at those dyadic parameters, exactly, creases included.
+
+    The indices follow from how `_subdivide_once` numbers its output: the old
+    vertices first (in list order), then one edge point per edge (list order),
+    then one face point per face (list order); the sub-quad it builds for
+    half-edge h is [h.vertex, point(h.next.edge), point(face), point(h.edge)],
+    which keeps the parent's winding. Each level refines every grid cell
+    (a, b, c, d) into four, and the cell is checked to be a face of the
+    current mesh with exactly that cyclic order before it is refined, so a
+    numbering change in `_subdivide_once` raises instead of silently
+    scrambling the grids. Triangles and n-gons are subdivided as usual (their
+    sub-quads are just not tracked); quads next to them are unaffected.
+
+    Raises ValueError when a cell is not found as such a face (non-manifold
+    or inconsistently wound input).
+    """
+    if levels < 0:
+        raise ValueError("levels must be >= 0")
+    lineage = {}
+    for f in mesh.faces:
+        verts = mesh.get_face_vertices(f)
+        if len(verts) == 4:
+            c0, c1, c2, c3 = (v.index for v in verts)
+            lineage[f.index] = np.array([[c0, c3], [c1, c2]], dtype=np.int64)
+
+    current = mesh
+    for level in range(levels + 1):
+        directed = _directed_half_edges(current)
+        if level == levels:
+            # the last level is not refined, but its cells are checked too
+            for g in lineage.values():
+                for i in range(g.shape[0] - 1):
+                    for j in range(g.shape[1] - 1):
+                        _cell_half_edge(directed, int(g[i, j]), int(g[i + 1, j]),
+                                        int(g[i + 1, j + 1]), int(g[i, j + 1]))
+            break
+
+        n_v = len(current.vertices)
+        n_e = len(current.edges)
+        # the same maps `_subdivide_once` builds: index -> new vertex index
+        v_new = {v.index: p for p, v in enumerate(current.vertices)}
+        e_new = {e.index: n_v + p for p, e in enumerate(current.edges)}
+        f_new = {f.index: n_v + n_e + p for p, f in enumerate(current.faces)}
+
+        refined = {}
+        for fidx, g in lineage.items():
+            m = g.shape[0]
+            r = np.empty((2 * m - 1, 2 * m - 1), dtype=np.int64)
+            for i in range(m):
+                for j in range(m):
+                    r[2 * i, 2 * j] = v_new[int(g[i, j])]
+            for i in range(m - 1):
+                for j in range(m - 1):
+                    he = _cell_half_edge(directed, int(g[i, j]), int(g[i + 1, j]),
+                                         int(g[i + 1, j + 1]), int(g[i, j + 1]))
+                    # he: a -> b, he.next: b -> c, he.next.next: c -> d,
+                    # he.next.next.next: d -> a
+                    r[2 * i + 1, 2 * j + 1] = f_new[he.face.index]
+                    r[2 * i + 1, 2 * j] = e_new[he.edge.index]
+                    r[2 * i + 2, 2 * j + 1] = e_new[he.next.edge.index]
+                    r[2 * i + 1, 2 * j + 2] = e_new[he.next.next.edge.index]
+                    r[2 * i, 2 * j + 1] = e_new[he.next.next.next.edge.index]
+            refined[fidx] = r
+        lineage = refined
+        current = _subdivide_once(current)
+
+    if levels == 0:
+        current = mesh.copy()
+    return current, lineage
+
+
+def _directed_half_edges(mesh: HalfEdgeMesh) -> dict:
+    """(source index, target index) -> half-edge. A key that occurs twice
+    (non-manifold input) maps to None: it cannot name one face."""
+    directed = {}
+    for he in mesh.half_edges:
+        if he.prev is None or he.vertex is None or he.prev.vertex is None:
+            continue
+        key = (he.prev.vertex.index, he.vertex.index)
+        directed[key] = None if key in directed else he
+    return directed
+
+
+def _cell_half_edge(directed: dict, a: int, b: int, c: int, d: int) -> HalfEdge:
+    """The half-edge a -> b of the quad face whose cycle is a, b, c, d."""
+    he = directed.get((a, b))
+    ok = he is not None and he.face is not None
+    walk = he
+    for want in (c, d, a):
+        if not ok:
+            break
+        walk = walk.next
+        ok = walk is not None and walk.vertex is not None and walk.vertex.index == want
+    if not ok or walk.next is not he:
+        raise ValueError(f"quad lineage: cell {(a, b, c, d)} is not a quad "
+                         f"face of the subdivided mesh")
+    return he
+
+
 def evaluate_limit_surface(mesh: HalfEdgeMesh) -> tuple[np.ndarray, np.ndarray]:
     """
     Project every cage vertex onto the Catmull-Clark limit surface.
 
-    Positions are exact. For an interior vertex of valence n the limit point is
+    Interior positions are exact: they are where repeated `_subdivide_once`
+    passes take each vertex. For an interior vertex of valence n whose edges
+    all have crease weight 0 the limit point is
 
         limit = ((n - 3) * P + 4 * Rbar + 4 * Fbar) / (n + 5)
 
@@ -202,9 +324,22 @@ def evaluate_limit_surface(mesh: HalfEdgeMesh) -> tuple[np.ndarray, np.ndarray]:
     sum(diagonals)) / 36. The weights sum to n + 5, so the map is affine
     invariant.
 
-    Boundary vertices are left where they are: the boundary limit rule depends on
-    the crease/boundary curve rather than the interior mask, and this module does
-    not model open boundaries.
+    An interior vertex with a creased edge goes through its own local
+    subdivision matrix instead (`_creased_interior_limit`). `_subdivide_once`
+    clips every weight to [0, 1] and hands it on unchanged to both halves of
+    its edge, so the rules around the vertex repeat identically at every level,
+    for fractional weights as much as for sharp ones, and the eigenvector gives
+    the exact limit for any weights. The fully sharp cases reduce to the
+    familiar closed forms: P for three or more sharp edges (corner), and
+    (a + 4P + b) / 6 for two sharp edges to a and b (a cubic B-spline crease).
+    A dart (one creased edge) uses the smooth vertex rule, but its edge stays
+    sharp, so its limit is not the smooth stencil.
+
+    Boundary vertices are left where they are, which keeps the outline of an
+    open patch on the cage. That is NOT their subdivision limit: the boundary
+    rule of `_subdivide_once` is a cubic B-spline along the boundary, whose
+    limit is (a + 4P + b) / 6. A vertex whose fan is not a closed manifold ring
+    keeps the smooth formula above, creases or not.
 
     Normals are an APPROXIMATION, not the analytic limit normal. They are the
     angle-independent area-weighted normals of the polygon mesh formed by the
@@ -229,6 +364,10 @@ def evaluate_limit_surface(mesh: HalfEdgeMesh) -> tuple[np.ndarray, np.ndarray]:
             continue
         edge_midpoints[e.index] = (he.prev.vertex.position + he.vertex.position) / 2.0
 
+    # The local limit weights of a creased vertex depend only on its weights
+    # and ring layout, which repeat all along a crease.
+    crease_cache = {}
+
     for v in mesh.vertices:
         P = v.position
         if mesh.is_boundary_vertex(v):
@@ -246,12 +385,93 @@ def evaluate_limit_surface(mesh: HalfEdgeMesh) -> tuple[np.ndarray, np.ndarray]:
             limit_positions[v.index] = P
             continue
 
+        if any(e.crease_weight > 0 for e in inc_edges):
+            creased = _creased_interior_limit(P, fan, face_points, edge_midpoints,
+                                              crease_cache)
+            if creased is not None:
+                limit_positions[v.index] = creased
+                continue
+
         R_bar = np.mean([edge_midpoints[e.index] for e in inc_edges], axis=0)
         F_bar = np.mean([face_points[f.index] for f in faces], axis=0)
         limit_positions[v.index] = ((n - 3) * P + 4.0 * R_bar + 4.0 * F_bar) / (n + 5.0)
 
     limit_normals = _normals_from_positions(mesh, limit_positions)
     return limit_positions, limit_normals
+
+
+def _creased_interior_limit(P, fan, face_points, edge_midpoints, cache):
+    """
+    Exact limit of an interior vertex with creased edges, by `_subdivide_once`.
+
+    After one pass the vertex, its n edge points and its n face points form a
+    ring of n quads, and since every crease weight is passed on unchanged,
+    each later pass maps that ring onto the next by the same
+    (2n+1) x (2n+1) matrix S. The limit is l . X1, with X1 the ring after the
+    first pass and l the left eigenvector of S for eigenvalue 1, scaled to
+    sum 1. `step` below restates the interior vertex and edge rules of
+    `_subdivide_once`; it runs on real positions for the first pass and on
+    unit coefficient rows to build S.
+
+    Returns None when the fan is not a closed manifold ring.
+    """
+    n = len(fan)
+    slot = {}
+    for j, he in enumerate(fan):
+        if he.edge is None or he.face is None or he.face.index not in face_points:
+            return None
+        slot[he.edge.index] = j
+    # Face j holds spoke j and the spoke that runs into he.prev.
+    ring = []
+    for j, he in enumerate(fan):
+        k = slot.get(he.prev.edge.index) if he.prev is not None and he.prev.edge is not None else None
+        if k is None or k == j:
+            return None
+        ring.append(k)
+    if len(slot) != n or sorted(ring) != list(range(n)):
+        return None
+    # Spoke j borders face j and face other[j].
+    other = [0] * n
+    for f, k in enumerate(ring):
+        other[k] = f
+
+    raw = [float(he.edge.crease_weight) for he in fan]
+    w = np.clip(raw, 0.0, 1.0)[:, None]
+    max_w = float(w.max())
+    sharp = [j for j in range(n) if raw[j] > 0]
+
+    def step(P, mids, fps):
+        vp = (fps.mean(axis=0) + 2.0 * mids.mean(axis=0) + (n - 3) * P) / n
+        if max_w > 0:
+            if len(sharp) == 2:
+                crease_vp = (mids[sharp].mean(axis=0) + P) / 2.0
+            elif len(sharp) == 1:
+                crease_vp = vp          # dart: smooth rule
+            else:
+                crease_vp = P           # corner
+            vp = vp * (1.0 - max_w) + crease_vp * max_w
+        smooth_ep = (2.0 * mids + fps + fps[other]) / 4.0
+        return vp, smooth_ep * (1.0 - w) + mids * w
+
+    fps0 = np.array([face_points[he.face.index] for he in fan])
+    mids0 = np.array([edge_midpoints[he.edge.index] for he in fan])
+    p1, e1 = step(P, mids0, fps0)
+    ring1 = np.vstack([p1, e1, fps0])
+
+    key = (tuple(raw), tuple(ring))
+    l = cache.get(key)
+    if l is None:
+        eye = np.eye(2 * n + 1)
+        Pb, Eb, Cb = eye[0], eye[1:n + 1], eye[n + 1:]
+        fps = (Pb + Eb + Cb + Eb[ring]) / 4.0       # quad j: P, E_j, C_j, E_ring[j]
+        pn, en = step(Pb, (Pb + Eb) / 2.0, fps)
+        S = np.vstack([pn, en, fps])
+        A = np.vstack([S.T - eye, np.ones((1, 2 * n + 1))])
+        b = np.zeros(2 * n + 2)
+        b[-1] = 1.0
+        l = np.linalg.lstsq(A, b, rcond=None)[0]
+        cache[key] = l
+    return l @ ring1
 
 
 def _normals_from_positions(mesh: HalfEdgeMesh, positions: np.ndarray) -> np.ndarray:
@@ -262,6 +482,8 @@ def _normals_from_positions(mesh: HalfEdgeMesh, positions: np.ndarray) -> np.nda
     not disturb whatever the caller had stored there.
     """
     normals = np.zeros((len(mesh.vertices), 3))
+    # sum of the squared edge lengths of the faces around each vertex
+    scale = np.zeros(len(mesh.vertices))
 
     for f in mesh.faces:
         fv = [v.index for v in mesh.get_face_vertices(f)]
@@ -269,7 +491,10 @@ def _normals_from_positions(mesh: HalfEdgeMesh, positions: np.ndarray) -> np.nda
             continue
         # Newell's method: robust for non-planar and non-convex polygons, and
         # its magnitude is twice the projected area, giving the area weighting.
+        # Centring first keeps a small face far from the origin from drowning
+        # in the rounding of P + Q.
         Pp = positions[fv]
+        Pp = Pp - Pp.mean(axis=0)
         Q = np.roll(Pp, -1, axis=0)
         d = Pp - Q
         s = Pp + Q
@@ -278,11 +503,16 @@ def _normals_from_positions(mesh: HalfEdgeMesh, positions: np.ndarray) -> np.nda
             np.dot(d[:, 2], s[:, 0]),
             np.dot(d[:, 0], s[:, 1]),
         ])
+        sq = np.einsum('ij,ij->', d, d)
         for idx in fv:
             normals[idx] += fn
+            scale[idx] += sq
 
+    # Degenerate means numerically zero area, judged against the squared edge
+    # lengths (an absolute threshold left the normals of a cage below ~1e-6
+    # unnormalised). Those vertices keep the zero vector.
     lengths = np.linalg.norm(normals, axis=1)
-    good = lengths > 1e-12
+    good = lengths > 1e-12 * scale
     normals[good] /= lengths[good][:, None]
     return normals
 
@@ -298,7 +528,12 @@ def identify_regular_regions(mesh: HalfEdgeMesh) -> tuple[list[Vertex], list[Ver
     for v in mesh.vertices:
         is_reg = True
         faces = mesh.get_vertex_faces(v)
-        
+        if not faces:
+            # No faces is not "surrounded by quads". Without this an isolated
+            # vertex passed as regular: it counts as boundary, valence 0 <= 3.
+            irregular.append(v)
+            continue
+
         for f in faces:
             if len(mesh.get_face_vertices(f)) != 4:
                 is_reg = False
