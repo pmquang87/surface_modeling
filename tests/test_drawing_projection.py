@@ -353,3 +353,25 @@ def test_grid_cells_distinct_and_mirror():
 def test_grid_cell_rejects_unknown(args):
     with pytest.raises(ValueError):
         grid_cell(*args)
+
+
+# ------------------------------------------------- depth flip (QA issue 14) --
+
+@pytest.mark.parametrize("extents", [(100.0, 10.0, 60.0), (40.0, 20.0, 60.0), (10.0, 50.0, 30.0)])
+def test_flip_depth_turns_180_about_z(extents):
+    from src.drawing.projection import flip_depth
+    o = auto_orientation(np.array(extents))
+    f = flip_depth(o)
+    assert f != o                                         # precondition: it changes something
+    assert np.linalg.det(f.matrix) == pytest.approx(1.0)  # still a proper rotation
+    np.testing.assert_allclose(f.matrix, np.diag([-1.0, -1.0, 1.0]) @ o.matrix, atol=1e-12)
+    # the drawing extents are unchanged, the up axis is kept, X and depth reverse
+    np.testing.assert_allclose(_extents_after(f, extents), _extents_after(o, extents), atol=1e-9)
+    p = np.array([3.0, -2.0, 7.0])
+    q0, q1 = o.apply(p), f.apply(p)
+    assert q1[2] == pytest.approx(q0[2]) and q1[0] == pytest.approx(-q0[0])
+    assert q1[1] == pytest.approx(-q0[1])
+    # the front viewer now stands on the other side of the part (file coordinates)
+    n = VIEWS["front"].n
+    np.testing.assert_allclose(f.matrix.T @ n, -(o.matrix.T @ n), atol=1e-12)
+    assert flip_depth(f) == o and f.mode == o.mode

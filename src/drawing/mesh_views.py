@@ -53,7 +53,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .geometry2d import dedupe_primitives, merge_collinear, subtract_covered
+from .geometry2d import (chain_to_primitives, dedupe_primitives, merge_collinear,
+                         premerge_collinear, subtract_covered)
 from .model import BBox2D, LineStyle, Polyline, ProjectedView, Segment
 
 log = logging.getLogger(__name__)
@@ -61,6 +62,12 @@ log = logging.getLogger(__name__)
 FRONT_EPS = 1e-9
 CHUNK_PX = 8_000_000              # bound on per-chunk pixel arrays in raster_span
 CLEANUP_TOL_PX = 0.5              # 2D clean-up tolerance (merge, subtract, dedupe), in pixels
+_OUTLINE_COVER_PX = 3.0           # organic: runs within this of the mask outline are the outline
+_MIN_CHAIN_PX = 2.0               # chains shorter than this are noise (QA issue 24)
+_ORGANIC_MIN_CHAIN_PAPER_MM = 3.0  # organic meshes: shorter chains are dropped (QA issues 13, 24)
+_DASH_PERIOD_PAPER_MM = 3.0       # one hidden dash: chains with >= 2 shorter chords -> Polyline
+_DEFAULT_VIEW_PAPER_MM = 120.0    # paper-scale guess: the view's long side spans this on paper
+_MAX_ORGANIC_SILHOUETTE_FACES = 2_000_000   # above: organic silhouettes skipped and disclosed
 _SKIMAGE_WARM = {"done": False}
 
 
@@ -247,16 +254,52 @@ def _min_filter(buf: np.ndarray, nbhd: int) -> np.ndarray:
     return out
 
 
+def _hysteresis(vis: np.ndarray, rep: np.ndarray) -> np.ndarray:
+    """Absorb single-sample state flips inside one segment (QA issue 24).
+
+    A sample whose two neighbours (same segment) agree with each other and
+    not with it takes their state; an end sample takes the state of the next
+    two when those agree with each other and not with it. A run therefore
+    keeps its state for at least two samples before switching.
+    """
+    v = vis.copy()
+    n = len(v)
+    if n < 3:
+        return v
+    same_prev = np.zeros(n, dtype=bool)
+    same_prev[1:] = rep[1:] == rep[:-1]
+    same_next = np.zeros(n, dtype=bool)
+    same_next[:-1] = rep[:-1] == rep[1:]
+    prev = np.r_[v[:1], v[:-1]]
+    nxt = np.r_[v[1:], v[-1:]]
+    inner = same_prev & same_next & (prev == nxt) & (v != prev)
+    nxt2 = np.r_[v[2:], v[-1:], v[-1:]]
+    same_next2 = np.zeros(n, dtype=bool)
+    same_next2[:-2] = rep[:-2] == rep[2:]
+    first = ~same_prev & same_next & same_next2 & (nxt == nxt2) & (v != nxt)
+    prev2 = np.r_[v[:1], v[:1], v[:-2]]
+    same_prev2 = np.zeros(n, dtype=bool)
+    same_prev2[2:] = rep[2:] == rep[:-2]
+    last = ~same_next & same_prev & same_prev2 & (prev == prev2) & (v != prev)
+    flip = inner | first | last
+    v[flip] = ~v[flip]
+    return v
+
+
 def edge_visibility(segments_view: np.ndarray, depth_buffer: np.ndarray, grid: dict,
-                    tol_px: float = 1.5, nbhd: int = 1) -> Tuple[np.ndarray, np.ndarray]:
+                    tol_px: float = 1.5, nbhd: int = 1,
+                    hysteresis: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """Split 3D view-space segments into visible and hidden 2D runs.
 
     ``segments_view`` (k, 2, 3) holds view columns [x, y, depth]. Each
     segment is sampled about one pixel apart; a sample is visible when its
     depth >= (minimum of the buffer over a (2 nbhd + 1)^2 window) - tol_px *
-    px. Runs break halfway between two samples of different state. Segments
-    seen end-on (projected length below 1e-6 px) are dropped. Returns
-    ``(visible (m, 2, 2), hidden (h, 2, 2))`` in view coordinates.
+    px. With ``hysteresis`` (default) a single sample of the other state
+    inside a run is absorbed, so a crease near the threshold does not
+    flicker into one-pixel runs (QA issue 24). Runs break halfway between
+    two samples of different state. Segments seen end-on (projected length
+    below 1e-6 px) are dropped. Returns ``(visible (m, 2, 2), hidden (h, 2,
+    2))`` in view coordinates.
     """
     segs = np.asarray(segments_view, dtype=np.float64)
     empty = np.zeros((0, 2, 2))
@@ -283,6 +326,8 @@ def edge_visibility(segments_view: np.ndarray, depth_buffer: np.ndarray, grid: d
     c = np.clip(np.floor(q[:, 0]).astype(np.int64), 0, W - 1)
     r = np.clip(np.floor(q[:, 1]).astype(np.int64), 0, H - 1)
     vis = P[:, 2] >= bmin[r, c] - tol
+    if hysteresis:
+        vis = _hysteresis(vis, rep)
     # run boundaries: segment starts and state changes inside a segment
     same_seg = rep[1:] == rep[:-1]
     change = same_seg & (vis[1:] != vis[:-1])
@@ -306,27 +351,36 @@ def edge_visibility(segments_view: np.ndarray, depth_buffer: np.ndarray, grid: d
 
 # ----------------------------------------------------------------- outline
 
-def mask_outline(mask: np.ndarray, grid: dict, tol_px: float = 0.75) -> List[np.ndarray]:
+def mask_outline(mask: np.ndarray, grid: dict, tol_px: float = 0.75,
+                 smooth_px: float = 0.7) -> List[np.ndarray]:
     """Closed outline loops of a coverage mask, in view coordinates.
 
     ``skimage.measure.find_contours`` on the mask padded by one empty pixel
     (so every contour closes) at level 0.5, simplified with
-    ``approximate_polygon(tol_px)``. Contour points sit on the pixel-centre
-    lattice (half a pixel inside the covered pixels' outer edges). Outer
-    boundaries and holes both come back; loops have no repeated end point
-    and at least 3 points.
+    ``approximate_polygon(tol_px)``. With ``smooth_px > 0`` the mask is
+    first blurred with a Gaussian of that sigma (pixels), so the level-0.5
+    contour runs at sub-pixel positions instead of along the pixel
+    staircase (QA issue 24; corners round off by about one pixel). Contour
+    points sit on the pixel-centre lattice (half a pixel inside the covered
+    pixels' outer edges). Outer boundaries and holes both come back; loops
+    have no repeated end point and at least 3 points.
     """
     from skimage import measure
 
     m = np.asarray(mask, dtype=float)
     if m.size == 0 or not m.any():
         return []
-    contours = measure.find_contours(np.pad(m, 1), 0.5)
+    padded = np.pad(m, 2 if smooth_px and smooth_px > 0 else 1)
+    if smooth_px and smooth_px > 0:
+        from scipy.ndimage import gaussian_filter
+        padded = gaussian_filter(padded, float(smooth_px), mode="constant", cval=0.0)
+    off = 2.0 if smooth_px and smooth_px > 0 else 1.0
+    contours = measure.find_contours(padded, 0.5)
     loops: List[np.ndarray] = []
     for cont in contours:
         if tol_px and tol_px > 0:
             cont = measure.approximate_polygon(cont, tolerance=float(tol_px))
-        rc = cont - 1.0                                   # undo the pad
+        rc = cont - off                                   # undo the pad
         pxc = np.stack([rc[:, 1] + 0.5, rc[:, 0] + 0.5], axis=-1)
         loop = _px_to_view(pxc, grid)
         if len(loop) >= 2 and np.allclose(loop[0], loop[-1]):
@@ -380,70 +434,8 @@ def candidate_edges(mesh, n: np.ndarray, feature_angle_deg: float,
 
 # --------------------------------------------------------------- projection
 
-def premerge_collinear(segs: np.ndarray, tol: float) -> np.ndarray:
-    """Cheap O(n log n) union of overlapping runs on (numerically) the same line.
-
-    Edge-on rims project onto one line as hundreds of short, exactly
-    collinear segments (a 2000-section cylinder in a side view: 4000 rim
-    edges on two lines). ``geometry2d.merge_collinear`` pairs them all
-    (union-find over ~n^2/2 pairs: 5.7 s measured for that cylinder), so
-    segments whose direction agrees to 1e-9 rad and whose line offset falls
-    in the same ``tol`` bin are first unioned per line here (1D interval
-    union, gap <= tol), keeping the extreme original endpoints. Segments in
-    neighbouring bins are left to ``merge_collinear``. Zero-length segments
-    are dropped.
-    """
-    s = np.asarray(segs, dtype=np.float64).reshape(-1, 2, 2)
-    if len(s) < 2:
-        return s
-    d = s[:, 1] - s[:, 0]
-    length = np.linalg.norm(d, axis=1)
-    s, d, length = s[length > 0], d[length > 0], length[length > 0]
-    if len(s) < 2:
-        return s
-    u = d / length[:, None]
-    flip = (u[:, 0] < 0) | ((u[:, 0] == 0) & (u[:, 1] < 0))
-    u[flip] *= -1.0
-    theta = np.arctan2(u[:, 1], u[:, 0])
-    off = s[:, 0, 0] * -u[:, 1] + s[:, 0, 1] * u[:, 0]
-    keys = np.stack([np.round(theta / 1e-9), np.round(off / max(tol, 1e-300))], axis=1).astype(np.int64)
-    _, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
-    inv = np.asarray(inv).ravel()
-    single = counts[inv] == 1
-    out = [s[single]]
-    multi = np.nonzero(~single)[0]
-    if len(multi):
-        order = multi[np.argsort(inv[multi], kind="stable")]
-        g = inv[order]
-        cuts = np.nonzero(np.diff(g))[0] + 1
-        for members in np.split(order, cuts):
-            ref_u = u[members[0]]
-            p0 = s[members[0], 0]
-            pts = s[members].reshape(-1, 2)              # (2m, 2)
-            t = (pts - p0) @ ref_u
-            t_pair = t.reshape(-1, 2)
-            lo_i = np.argmin(t_pair, axis=1)
-            t_lo = t_pair[np.arange(len(members)), lo_i]
-            t_hi = t_pair[np.arange(len(members)), 1 - lo_i]
-            p_lo = pts.reshape(-1, 2, 2)[np.arange(len(members)), lo_i]
-            p_hi = pts.reshape(-1, 2, 2)[np.arange(len(members)), 1 - lo_i]
-            idx = np.argsort(t_lo, kind="stable")
-            run_a, run_b, run_end = p_lo[idx[0]], p_hi[idx[0]], t_hi[idx[0]]
-            runs = []
-            for k in idx[1:]:
-                if t_lo[k] <= run_end + tol:
-                    if t_hi[k] > run_end:
-                        run_end, run_b = t_hi[k], p_hi[k]
-                else:
-                    runs.append((run_a, run_b))
-                    run_a, run_b, run_end = p_lo[k], p_hi[k], t_hi[k]
-            runs.append((run_a, run_b))
-            out.append(np.asarray(runs, dtype=np.float64).reshape(-1, 2, 2))
-    return np.concatenate(out).reshape(-1, 2, 2)
-
-
-def _clean_segments(segs: np.ndarray, tol: float) -> np.ndarray:
-    return merge_collinear(premerge_collinear(segs, tol), tol)
+def _clean_segments(segs: np.ndarray, tol: float, deadline: Optional[float] = None) -> np.ndarray:
+    return merge_collinear(segs, tol, deadline=deadline)          # premerges exact runs itself
 
 
 def _segments_to_prims(segs: np.ndarray, style: LineStyle) -> list:
@@ -451,10 +443,16 @@ def _segments_to_prims(segs: np.ndarray, style: LineStyle) -> list:
             for s in segs]
 
 
+def _loop_edges(loops) -> np.ndarray:
+    chunks = [np.stack([L, np.roll(L, -1, axis=0)], axis=1) for L in loops if len(L) >= 2]
+    return np.concatenate(chunks) if chunks else np.zeros((0, 2, 2))
+
+
 def _project(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: bool,
              hidden: bool = True, cap: Optional[Tuple[Sequence[np.ndarray], float]] = None,
              exclude_plane: Optional[Tuple[np.ndarray, np.ndarray, float]] = None,
-             grid_points: Optional[np.ndarray] = None) -> ProjectedView:
+             grid_points: Optional[np.ndarray] = None, paper_scale: Optional[float] = None,
+             time_budget_s: Optional[float] = None) -> ProjectedView:
     """Shared body of ``project_mesh`` and the section body projection.
 
     ``cap`` = (loops in view coords, depth) is filled into the depth buffer
@@ -462,10 +460,12 @@ def _project(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: b
     ``exclude_plane`` = (point, unit normal, tol) drops candidate edges whose
     two endpoints lie on that plane (the cut outline, drawn from the section
     loops instead). ``grid_points`` (m, 2) extra view points that the raster
-    must cover.
+    must cover. ``paper_scale`` / ``time_budget_s``: see ``project_mesh``.
     """
     t_start = time.perf_counter()
-    stats: Dict[str, object] = {"raster_px": int(raster_px), "organic": bool(organic)}
+    deadline = None if time_budget_s is None else t_start + float(time_budget_s)
+    stats: Dict[str, object] = {"raster_px": int(raster_px), "organic": bool(organic),
+                                "hidden_dropped": False, "interior_silhouettes_omitted": False}
     verts = np.array(mesh.vertices, dtype=np.float64)
     faces = np.asarray(mesh.faces, dtype=np.int64)
     if len(verts) == 0 or len(faces) == 0:
@@ -488,9 +488,18 @@ def _project(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: b
     mask = np.isfinite(buf)
     stats["raster_s"] = time.perf_counter() - t0
     stats.update(px=grid["px"], W=grid["W"], H=grid["H"])
+    px = float(grid["px"])
+    span = float(np.max(xy.max(axis=0) - xy.min(axis=0))) or 1.0
+    scale = (float(paper_scale) if paper_scale is not None and float(paper_scale) > 0.0
+             else _DEFAULT_VIEW_PAPER_MM / span)
+    stats["paper_scale"] = scale
 
     t0 = time.perf_counter()
-    cand, counts = candidate_edges(mesh, spec.n, feature_angle_deg, silhouettes=not organic)
+    sil = True
+    if organic and len(faces) > _MAX_ORGANIC_SILHOUETTE_FACES:
+        sil = False                       # silhouettes of huge scans: too costly, disclosed below
+        stats["interior_silhouettes_omitted"] = True
+    cand, counts = candidate_edges(mesh, spec.n, feature_angle_deg, silhouettes=sil)
     if exclude_plane is not None and len(cand):
         p0, nrm, ptol = exclude_plane
         dist = np.abs((verts - np.asarray(p0, float)) @ np.asarray(nrm, float))
@@ -501,25 +510,50 @@ def _project(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: b
     stats["candidates"] = int(len(cand))
     stats.update({f"n_{k}": v for k, v in counts.items()})
     vis, hid = edge_visibility(V[cand], buf, grid, tol_px=1.5, nbhd=1)
-    tol = CLEANUP_TOL_PX * grid["px"]
-    vis = _clean_segments(vis, tol)
-    if hidden and len(hid):
-        hid = premerge_collinear(hid, tol)
-        hid = subtract_covered(hid, vis, tol)
-        hid = _clean_segments(hid, tol)
-    else:
-        hid = np.zeros((0, 2, 2))
-    visible = dedupe_primitives(_segments_to_prims(vis, LineStyle.VISIBLE), tol)
-    hidden_prims = dedupe_primitives(_segments_to_prims(hid, LineStyle.HIDDEN), tol) if hidden else []
-    stats["visibility_s"] = time.perf_counter() - t0
+    tol = CLEANUP_TOL_PX * px
 
+    loops: list = []
     if organic:
-        t0 = time.perf_counter()
+        t1 = time.perf_counter()
         cold = not _SKIMAGE_WARM["done"]
         loops = mask_outline(mask, grid)
-        stats["outline_s"] = time.perf_counter() - t0
+        stats["outline_s"] = time.perf_counter() - t1
         stats["outline_warmup"] = bool(cold)
         stats["outline_loops"] = len(loops)
+        stats["outline_vertices"] = int(sum(len(L) for L in loops))
+    outline_edges = _loop_edges(loops)
+    if len(outline_edges) and len(vis):
+        # silhouette/sharp runs on the coverage outline are drawn by the outline itself
+        # (length floor = the 0.5 px clean-up tol, not the 3 px cover tol: runs of a fine
+        # tessellation are shorter than 3 px and were all deleted, F1 review)
+        vis = subtract_covered(vis, outline_edges, _OUTLINE_COVER_PX * px, loose=True, min_len=tol)
+    vis = _clean_segments(vis, tol)
+    short_len = _DASH_PERIOD_PAPER_MM / scale
+    min_chain = max(_MIN_CHAIN_PX * px, (_ORGANIC_MIN_CHAIN_PAPER_MM / scale) if organic else 0.0)
+    stats["min_chain_len"] = min_chain
+    visible = chain_to_primitives(vis, LineStyle.VISIBLE, tol, short_len=short_len,
+                                  min_chain_len=min_chain)
+    hidden_prims: list = []
+    if hidden and len(hid):
+        try:
+            _check(deadline)
+            hid = premerge_collinear(hid, tol)
+            cover = np.concatenate([vis, outline_edges]) if len(outline_edges) else vis
+            hid = subtract_covered(hid, cover, tol, loose=True, deadline=deadline)
+            if len(outline_edges) and len(hid):
+                hid = subtract_covered(hid, outline_edges, _OUTLINE_COVER_PX * px, loose=True,
+                                       deadline=deadline, min_len=tol)
+            hid = _clean_segments(hid, tol, deadline)
+            hidden_prims = chain_to_primitives(hid, LineStyle.HIDDEN, tol, short_len=short_len,
+                                               min_chain_len=min_chain, deadline=deadline)
+        except TimeoutError:
+            hidden_prims = []
+            stats["hidden_dropped"] = True
+            stats["hidden_dropped_reason"] = "time_budget"
+    visible = dedupe_primitives(visible, tol)
+    hidden_prims = dedupe_primitives(hidden_prims, tol) if hidden else []
+    stats["visibility_s"] = time.perf_counter() - t0
+    if loops:
         visible = [Polyline(L, closed=True, style=LineStyle.VISIBLE) for L in loops] + visible
 
     bbox = BBox2D.from_points(xy)
@@ -532,20 +566,43 @@ def _project(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: b
                          algorithm="depth_buffer", stats=stats)
 
 
+def _check(deadline: Optional[float]) -> None:
+    if deadline is not None and time.perf_counter() > deadline:
+        raise TimeoutError("mesh view: time budget exceeded")
+
+
 def project_mesh(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: bool,
-                 hidden: bool = True) -> ProjectedView:
+                 hidden: bool = True, paper_scale: Optional[float] = None,
+                 time_budget_s: Optional[float] = None) -> ProjectedView:
     """Visible/hidden line view of a triangle mesh (``algorithm="depth_buffer"``).
 
-    Prismatic meshes: sharp + boundary + silhouette edges, split by the depth
-    buffer into visible Segments and hidden Segments (hidden runs lying on
-    visible ones removed, collinear runs merged, duplicates dropped).
-    Organic meshes: the outline loops of the coverage mask as closed
-    Polylines plus the sharp/boundary edges (no silhouette edges). ``bbox``
-    is the exact extent of the projected vertices. ``stats`` carries ``px``
-    (pixel size in model mm) and the timings.
+    Sharp + boundary + silhouette edges are split by the depth buffer into
+    visible and hidden runs (hidden runs lying on visible ones removed,
+    collinear runs merged, duplicates dropped) and chained: chains holding
+    two or more chords shorter than one hidden dash (3 mm on paper) become Polylines,
+    chains of long edges stay Segments (QA issue 6), and chains shorter than
+    2 px are dropped (noise, QA issue 24). Organic meshes add the outline
+    loops of the coverage mask as closed Polylines; their silhouette runs on
+    that outline are removed, the interior and hidden silhouettes (through
+    holes, overlapping lobes) are kept when their chain is at least
+    ``_ORGANIC_MIN_CHAIN_PAPER_MM`` (3 mm) long on paper (QA issue 13). The
+    outline subtraction uses a 3 px cover tolerance but only the 0.5 px
+    clean-up tolerance as its length floor, so the short runs of a fine
+    tessellation survive until they are chained. For organic meshes above
+    ``_MAX_ORGANIC_SILHOUETTE_FACES`` faces the silhouettes are skipped and
+    ``stats["interior_silhouettes_omitted"]`` is True.
+
+    ``paper_scale`` (paper mm per model mm) sets those paper lengths; the
+    default guesses that the view's long side spans 120 mm on paper.
+    ``time_budget_s``: when passed before or during the hidden clean-up,
+    the view is returned without hidden lines and
+    ``stats["hidden_dropped"]`` is True. ``bbox`` is the exact extent of the
+    projected vertices. ``stats`` carries ``px`` (pixel size in model mm)
+    and the timings.
     """
     return _project(mesh, spec, raster_px=raster_px, feature_angle_deg=feature_angle_deg,
-                    organic=organic, hidden=hidden)
+                    organic=organic, hidden=hidden, paper_scale=paper_scale,
+                    time_budget_s=time_budget_s)
 
 
 __all__ = ["project_mesh", "raster_span", "edge_visibility", "mask_outline", "candidate_edges",

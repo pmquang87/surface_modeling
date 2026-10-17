@@ -22,7 +22,16 @@ Two modes:
   environment). The child's outputs are moved to OUT_DIR, the ``sandbox``
   section is merged into the result and into ``<stem>.report.json``, and
   the parent exits with the child's code (1 when the child was killed,
-  timed out, breached a limit or printed no RESULT line).
+  timed out, breached a limit or printed no RESULT line). The child writes
+  ``<work>/progress.json`` at every stage boundary
+  (``report.PROGRESS_FILENAME``); a child without RESULT gets a failure
+  report with its last stage, unit, geometry and flags merged in, the
+  breach flag (``sandbox_timeout`` ...) and its wall time (QA issue 17); a
+  STEP child that left no unit (killed before its first snapshot) gets the
+  parent's ``brep_load.step_unit_sniff`` of the Part 21 text.
+  Empty and truncated STL inputs are rejected in the parent with their own
+  error texts (``pipeline.input_error_text`` = ``sniff.unreadable_reason``,
+  QA issue 25).
 * ``--no-sandbox``: ``pipeline.run`` in this process; the report says
   ``sandbox.enabled false``.
 
@@ -42,8 +51,8 @@ import sys
 import tempfile
 from typing import List, Optional
 
-from .options import (FORMATS, ORIENTS, PROJECTIONS, SECTIONS, SHEET_CHOICES, STL_TO_STEP, UPS,
-                      VIEW_NAMES, DrawingOptions)
+from .options import (FORMATS, ORIENTS, PROJECTIONS, SECTIONS, SHEET_CHOICES, STL_TO_STEP,
+                      STL_UNITS, UPS, VIEW_NAMES, DrawingOptions)
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +80,23 @@ def _csv(allowed):
     return parse
 
 
+_NO_CAP = "none"
+
+
+def _cap(text: str):
+    """``--max-hidden-primitives``: a non-negative integer, or 'none' (no cap)."""
+    t = str(text).strip().lower()
+    if t in ("none", "off"):
+        return _NO_CAP
+    try:
+        n = int(t)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer or 'none', got {text!r}") from None
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0 or 'none', got {n}")
+    return n
+
+
 def build_parser() -> _Parser:
     p = _Parser(prog="python -m src.drawing",
                 description="STEP / STL to a 2D engineering drawing (PDF, SVG, DXF) plus a "
@@ -92,6 +118,13 @@ def build_parser() -> _Parser:
     p.add_argument("--up", choices=UPS, default=None, help="up axis of the file (default z)")
     p.add_argument("--stl-to-step", dest="stl_to_step", choices=STL_TO_STEP, default=None,
                    help="STL route: auto (faceted STEP for prismatic meshes), faceted, nurbs, off")
+    p.add_argument("--stl-unit", dest="stl_unit", choices=STL_UNITS, default=None,
+                   help="unit of an STL file (STL carries none; default: read as mm and "
+                        "flagged unit_assumed_mm); the mesh is scaled to mm")
+    p.add_argument("--max-hidden-primitives", dest="max_hidden_primitives", type=_cap,
+                   default=None, metavar="N",
+                   help="drop the hidden lines of a B-rep view with more than N raw hidden "
+                        "primitives (flag hidden_lines_dropped; default 20000; 'none' = no cap)")
     p.add_argument("--no-hidden", dest="no_hidden", action="store_true", help="no hidden lines")
     p.add_argument("--no-hole-positions", dest="no_hole_positions", action="store_true",
                    help="no hole position dimensions")
@@ -119,10 +152,11 @@ def options_from_args(args, parser: _Parser) -> DrawingOptions:
             parser.error(f"--options-json: {exc}")
     kw = {}
     for name in ("formats", "views", "section", "sheet", "projection", "orient", "up",
-                 "stl_to_step", "title", "owner", "timeout_s", "memory_limit_mb"):
+                 "stl_to_step", "title", "owner", "timeout_s", "memory_limit_mb", "stl_unit",
+                 "max_hidden_primitives"):
         v = getattr(args, name)
         if v is not None:
-            kw[name] = v
+            kw[name] = None if (name == "max_hidden_primitives" and v == _NO_CAP) else v
     if args.no_hidden:
         kw["hidden_lines"] = False
     if args.no_hole_positions:
@@ -163,9 +197,36 @@ def _emit(result: dict, stdout) -> None:
     stdout.flush()
 
 
+def _parent_step_unit(input_path: str, sniffed, current) -> Optional[str]:
+    """The STEP unit for a killed child's report when its progress gave none.
+
+    Only for a sniffed STEP input whose ``source_unit`` is still unset
+    (a child that died before its first progress snapshot, e.g. during the
+    library imports): ``brep_load.step_unit_sniff`` (Part 21 text, OCP-free;
+    the module pulls numpy, so it is imported only on this failure path).
+    None when not applicable or when the sniff fails (QA issue 17 step 2).
+    """
+    if current not in (None, "", "unknown") or getattr(sniffed, "kind", None) != "step":
+        return None
+    try:
+        from .brep_load import step_unit_sniff
+        return step_unit_sniff(input_path)
+    except Exception as exc:                   # never lose the failure report over it
+        logger.error("STEP unit sniff failed: %s", exc)
+        return None
+
+
 def _fail_report(input_path: str, out_dir: str, opts: DrawingOptions, error: str,
-                 sniffed=None, sandbox: Optional[dict] = None):
-    """A failure report built in the parent (no geometry library imported)."""
+                 sniffed=None, sandbox: Optional[dict] = None, progress: Optional[dict] = None,
+                 merge_progress: bool = False):
+    """A failure report built in the parent (no geometry library imported).
+
+    ``merge_progress`` (a sandboxed child that printed no RESULT): the
+    child's last progress snapshot ``progress`` (None when it wrote none) is
+    merged with ``Report.merge_progress``: stage, unit, geometry, flags,
+    the breach flag (``sandbox_timeout`` ...) with the last stage, and
+    ``timing.total_s`` = the child's wall time (QA issue 17).
+    """
     from .report import Report
     rep = Report(input_path, out_dir, opts)
     if sniffed is not None:
@@ -175,6 +236,14 @@ def _fail_report(input_path: str, out_dir: str, opts: DrawingOptions, error: str
                                  extension=sniffed.extension or None)
     if sandbox is not None:
         rep.data["sandbox"] = dict(sandbox)
+    if merge_progress:
+        try:
+            rep.merge_progress(progress, sandbox)
+        except Exception as exc:               # never lose the failure report over it
+            logger.error("progress merge failed: %s", exc)
+        unit = _parent_step_unit(input_path, sniffed, rep.data["input"].get("source_unit"))
+        if unit is not None:
+            rep.data["input"]["source_unit"] = unit
     code, data = rep.finish(False, error)
     try:
         rep.write(os.path.join(out_dir, f"{rep.stem}.report.json"))
@@ -207,8 +276,28 @@ def _move_outputs(result: dict, out_dir: str, staging: str) -> None:
             outputs[key] = None
 
 
+_BREACHES = (("timed_out", "sandbox_timeout"), ("memory_exceeded", "sandbox_memory_exceeded"),
+             ("cpu_exceeded", "sandbox_cpu_exceeded"), ("output_exceeded", "sandbox_output_exceeded"),
+             ("killed", "sandbox_killed"))
+
+
+def _add_breach_flag(quality: dict, box: dict) -> None:
+    """A child that printed RESULT but breached a limit: add the breach flag once."""
+    from .report import FLAGS
+    flags = quality.setdefault("flags", [])
+    if not isinstance(flags, list):
+        return
+    for key, code in _BREACHES:
+        if box.get(key):
+            if not any(isinstance(f, dict) and f.get("code") == code for f in flags):
+                flags.append({"code": code, "severity": FLAGS.get(code, "warning"),
+                              "detail": f"limit breached after the RESULT line ({key})"})
+            return
+
+
 def _run_sandboxed(input_path: str, out_dir: str, opts: DrawingOptions, stderr) -> tuple:
-    from .report import write_report_json
+    from .pipeline import input_error_text          # standard library only at import
+    from .report import PROGRESS_FILENAME, write_report_json
     from .sniff import check_limits, sniff
 
     if not os.path.isfile(input_path):
@@ -217,9 +306,8 @@ def _run_sandboxed(input_path: str, out_dir: str, opts: DrawingOptions, stderr) 
         s = sniff(input_path, max_bytes=int(opts.max_input_mb * 2 ** 20))
     except OSError as exc:
         return _fail_report(input_path, out_dir, opts, f"input unreadable: {exc}")
-    err = check_limits(s, opts.max_input_mb, opts.max_triangles)
-    if err is None and s.kind == "unknown":
-        err = "unsupported or corrupt input (neither STEP nor STL by content)"
+    # empty / truncated STL get their own text (QA issue 25), the rest the generic one
+    err = check_limits(s, opts.max_input_mb, opts.max_triangles) or input_error_text(s)
     if err:
         return _fail_report(input_path, out_dir, opts, err, sniffed=s)
 
@@ -244,7 +332,8 @@ def _run_sandboxed(input_path: str, out_dir: str, opts: DrawingOptions, stderr) 
         res = sb.run_sandboxed(argv, work, timeout_s=float(opts.timeout_s),
                                memory_limit_mb=int(opts.memory_limit_mb),
                                cpu_limit_s=2.0 * float(opts.timeout_s),
-                               output_cap_mb=int(opts.output_cap_mb), env=env)
+                               output_cap_mb=int(opts.output_cap_mb), env=env,
+                               progress_file=PROGRESS_FILENAME)
         box = dict(res.sandbox or {})
         box["enabled"] = True
         if not opts.quiet and res.stderr_tail:
@@ -259,8 +348,10 @@ def _run_sandboxed(input_path: str, out_dir: str, opts: DrawingOptions, stderr) 
                                          "output_exceeded", "killed"))):
             reason = None
         if result is None:
+            # the child was killed or crashed: keep what its progress file says
             return _fail_report(input_path, out_dir, opts, f"sandbox: {reason or 'no RESULT'}",
-                                sniffed=s, sandbox=box)
+                                sniffed=s, sandbox=box, progress=getattr(res, "progress", None),
+                                merge_progress=True)
         _move_outputs(result, out_dir, staging)
         result.setdefault("input", {})["path"] = os.path.abspath(input_path)
         result["sandbox"] = box
@@ -270,7 +361,9 @@ def _run_sandboxed(input_path: str, out_dir: str, opts: DrawingOptions, stderr) 
             result["ok"] = False
             result["error"] = f"sandbox: {reason}" + (f"; child: {child_err}" if child_err else "")
             result["exit_code"] = code = 1
-            result.setdefault("quality", {})["level"] = "none"
+            q = result.setdefault("quality", {})
+            q["level"] = "none"
+            _add_breach_flag(q, box)
         elif code != int(result.get("exit_code", code)):
             logger.warning("child exit code %s differs from its RESULT exit_code %s",
                            code, result.get("exit_code"))

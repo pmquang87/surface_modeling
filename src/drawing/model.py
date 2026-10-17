@@ -10,10 +10,13 @@ vocabulary. Conventions (spec 3.1, plan "Shared interfaces"):
 * ``transform_primitive`` maps a view primitive onto the sheet
   (``p_sheet = offset + scale * p_view``). Text height is NOT scaled: text
   stays sheet-sized (3.5 mm on the sheet whatever the drawing scale).
-* ``BBox2D.of_primitives`` uses the FULL circle extent for an ``Arc``. That
-  over-estimates the box of a short arc by at most the radius; the layout
-  only needs a conservative box, and the full-circle rule keeps the
-  function free of angle-wrapping cases.
+* ``BBox2D.of_primitives`` boxes an ``Arc`` by its two end points plus
+  the axis quadrant points (0 / 90 / 180 / 270 degrees) that lie inside its
+  counter-clockwise sweep (``arc_extreme_points``); only a ``Circle`` (or
+  an arc whose start equals its end, the DXF full-circle rule) gets the
+  full circle box. The old full-circle rule for every arc inflated the
+  view boxes (QA round 1: a screw-head dome R 55 boxed 109.75 mm instead
+  of 42.3 mm), and the dimension values and the scale came from them.
 * Text is boxed by an ESTIMATE (``text_corners``): advance
   ``TEXT_ADVANCE * height`` per character (ISO 3098 type B is about 0.6 h
   on average, wide glyphs included), and the line spans from
@@ -121,6 +124,10 @@ class Dimension:                  # semantic; coordinates in the space stated by
     leader_angle_deg: float = 45.0  # diameter: leader direction
     view: str = ""                # name of the view it belongs to
     count: int = 1
+    # linear: shift of the value text along the dimension line (sheet mm, signed, in the
+    # direction p1 -> p2 projected on the line); the layout sets it when the centred text
+    # would sit on a section cutting line (dimensions.linear_text_position gives the result)
+    text_offset: float = 0.0
 
 
 Primitive2D = Union[Segment, Polyline, Circle, Arc]
@@ -132,6 +139,33 @@ def _as_points(pts) -> np.ndarray:
     if arr.size == 0:
         return arr.reshape(0, 2)
     return arr.reshape(-1, 2)
+
+
+def arc_sweep_deg(start_deg: float, end_deg: float) -> float:
+    """CCW sweep in degrees; start == end (mod 360) means a full circle (DXF rule)."""
+    sweep = float(np.mod(float(end_deg) - float(start_deg), 360.0))
+    if sweep < 1e-9 or sweep > 360.0 - 1e-9:
+        return 360.0
+    return sweep
+
+
+def arc_extreme_points(center: Point, radius: float, start_deg: float, end_deg: float) -> np.ndarray:
+    """(k, 2) points that bound an arc: both end points plus every axis
+    quadrant point (0, 90, 180, 270 degrees) inside the CCW sweep. A full
+    sweep gives the four quadrant points."""
+    cx, cy = float(center[0]), float(center[1])
+    r = abs(float(radius))
+    sweep = arc_sweep_deg(start_deg, end_deg)
+    if sweep >= 360.0:
+        angs = [0.0, 90.0, 180.0, 270.0]
+    else:
+        s0 = float(np.mod(float(start_deg), 360.0))
+        angs = [s0, s0 + sweep]
+        for q in (0.0, 90.0, 180.0, 270.0):
+            if float(np.mod(q - s0, 360.0)) <= sweep + 1e-12:
+                angs.append(q)
+    a = np.deg2rad(np.asarray(angs, dtype=np.float64))
+    return np.column_stack([cx + r * np.cos(a), cy + r * np.sin(a)])
 
 
 TEXT_ADVANCE = 0.6   # estimated character advance, fraction of the text height
@@ -189,16 +223,19 @@ class BBox2D:
     def of_primitives(cls, prims: Sequence) -> Optional["BBox2D"]:
         """Box of Segment/Polyline/Circle/Arc/Polygon/HatchLines/Text items.
 
-        Circle and Arc use the full circle extent (conservative, see the
-        module docstring). Text contributes the four corners of its
-        estimated extent (see ``text_corners``). Returns None for an empty
-        sequence or one without any point.
+        A Circle uses its full extent; an Arc its end points plus the
+        quadrant points inside its sweep (exact, see the module docstring).
+        Text contributes the four corners of its estimated extent (see
+        ``text_corners``). Returns None for an empty sequence or one without
+        any point.
         """
         chunks: List[np.ndarray] = []
         for p in prims:
             if isinstance(p, Segment):
                 chunks.append(_as_points([p.a, p.b]))
-            elif isinstance(p, (Circle, Arc)):
+            elif isinstance(p, Arc):
+                chunks.append(arc_extreme_points(p.center, p.radius, p.start_deg, p.end_deg))
+            elif isinstance(p, Circle):
                 cx, cy = float(p.center[0]), float(p.center[1])
                 r = abs(float(p.radius))
                 chunks.append(np.array([[cx - r, cy - r], [cx + r, cy + r]]))

@@ -57,6 +57,14 @@ Measured facts it relies on (sandbox probe, Windows 11 26200, Python 3.14):
   ``TransferRoots`` after a failed STEP read); it is reported as unreadable
   input.
 
+* ezdxf rebuilds its font cache (``<XDG_CACHE_HOME>/ezdxf``) in every fresh
+  work dir: 0.6 s per job and a fontTools ERROR line about a malformed
+  system font in ``stderr_tail``. The parent seeds a copy of a persistent
+  cache into the work dir before the spawn (``seed_font_cache``).
+* A killed child prints no RESULT; with ``progress_file`` its last progress
+  snapshot (written by the pipeline at stage boundaries) is returned as
+  ``SandboxResult.progress`` so the failure report can say where it stopped.
+
 The POSIX branch (``_posix_run``) is written but UNVERIFIED (no Linux host):
 it starts the child in its own session, passes the rlimits in the
 environment variable ``RLIMIT_ENV`` (the child applies them itself with
@@ -94,6 +102,12 @@ NO_RESULT_ERROR = "no RESULT line"
 BAD_RESULT_ERROR = "bad RESULT json"
 
 RLIMIT_ENV = "SRC_DRAWING_RLIMITS"   # POSIX: JSON limits the child applies to itself
+PROGRESS_ENV = "SRC_DRAWING_PROGRESS_FILE"   # same name as report.PROGRESS_ENV
+PROGRESS_MAX_BYTES = 1 << 20                 # a bigger progress file is ignored
+FONT_CACHE_FILE = "font_manager_cache.json"  # ezdxf's font cache, <XDG_CACHE_HOME>/ezdxf/
+FONT_CACHE_BUILD_TIMEOUT_S = 180.0
+_FONT_CACHE_FAILED: Dict[str, str] = {}      # cache dir -> error (one build attempt per process)
+_FONT_CACHE_LOCK = threading.Lock()
 
 # Fallback-only heuristics (no completion port). The stderr pattern is anchored
 # to the start of a line, so it matches a traceback's last line
@@ -113,6 +127,9 @@ class SandboxResult:
     sandbox: dict                  # the report's "sandbox" section
     stdout_tail: str
     stderr_tail: str
+    # the child's last progress snapshot (``progress_file``), read only when
+    # it produced no RESULT; untrusted data (see ``read_progress``)
+    progress: Optional[dict] = None
 
     def failure_reason(self) -> Optional[str]:
         """Why the run counts as failed, or None when the child's own verdict stands."""
@@ -167,6 +184,9 @@ def sanitized_env(work_dir: str, repo_root: str) -> dict:
         "MPLCONFIGDIR": work_dir,
         "TEMP": work_dir,
         "TMP": work_dir,
+        # ezdxf's font cache lives in <XDG_CACHE_HOME>/ezdxf (also on Windows);
+        # run_sandboxed seeds it from the persistent cache (seed_font_cache)
+        "XDG_CACHE_HOME": os.path.join(work_dir, ".cache"),
     }
     if IS_WINDOWS:
         systemroot = os.environ.get("SYSTEMROOT", r"C:\Windows")
@@ -181,6 +201,149 @@ def sanitized_env(work_dir: str, repo_root: str) -> dict:
         env["TMPDIR"] = work_dir
         env["PATH"] = os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"])
     return env
+
+
+# ------------------------------------------------------------ font cache --
+#
+# ezdxf loads <XDG_CACHE_HOME>/ezdxf/font_manager_cache.json at import and
+# rescans every system font through fontTools when the file is missing. In a
+# fresh work dir that rescan cost 0.6 s per job (measured: ezdxf import +
+# new() 1.3-1.6 s unseeded vs 0.74-0.87 s seeded) and one malformed system
+# font logged an ERROR into every report's stderr_tail. The persistent cache
+# is built ONCE by a trusted child that only imports ezdxf (no input file),
+# and each job gets a COPY in its own work dir: the sandboxed child never
+# gets write access to the persistent file.
+
+#: Environment override of ``default_font_cache_dir`` (tests point it into
+#: their temp dir so a CLI run leaves nothing in the user profile).
+FONT_CACHE_DIR_ENV = "SURFACE_MODELING_DRAWING_FONT_CACHE_DIR"
+
+
+def default_font_cache_dir() -> str:
+    """Persistent per-user directory of the sandbox's ezdxf font cache.
+
+    ``$SURFACE_MODELING_DRAWING_FONT_CACHE_DIR`` (``FONT_CACHE_DIR_ENV``)
+    overrides it when set and non-empty.
+    """
+    override = os.environ.get(FONT_CACHE_DIR_ENV, "").strip()
+    if override:
+        return os.path.abspath(override)
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"),
+                                                              "AppData", "Local")
+        return os.path.join(base, "surface_modeling", "drawing", "font_cache")
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "surface_modeling_drawing", "font_cache")
+
+
+def _valid_font_cache(path: str) -> bool:
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) > 64 * 2**20:
+            return False
+        with open(path, "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+        return isinstance(obj, dict) and "version" in obj and isinstance(obj.get("font-faces"), list)
+    except (OSError, ValueError):
+        return False
+
+
+def ensure_font_cache(cache_dir: Optional[str] = None,
+                      timeout_s: float = FONT_CACHE_BUILD_TIMEOUT_S) -> Optional[str]:
+    """Path of a valid persistent ezdxf font cache file; built once when missing.
+
+    The build runs ``python -c "import ezdxf"`` (ezdxf writes the cache at
+    import) with ``XDG_CACHE_HOME`` pointing into a temp dir, then moves the
+    file into ``cache_dir`` (default ``default_font_cache_dir()``) with an
+    atomic replace. Returns None when ezdxf or the build is unavailable; a
+    failed build is not retried in this process. Never raises. Delete the
+    directory to rebuild after installing fonts.
+    """
+    cache_dir = os.path.abspath(cache_dir or default_font_cache_dir())
+    target = os.path.join(cache_dir, "ezdxf", FONT_CACHE_FILE)
+    if _valid_font_cache(target):
+        return target
+    with _FONT_CACHE_LOCK:
+        if _valid_font_cache(target):
+            return target
+        if cache_dir in _FONT_CACHE_FAILED:
+            return None
+        import shutil
+        import tempfile
+        tmp = None
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            tmp = tempfile.mkdtemp(prefix="fontcache_", dir=os.path.dirname(target))
+            env = sanitized_env(tmp, _DEFAULT_REPO_ROOT)
+            code = ("import logging; logging.disable(logging.CRITICAL)\n"
+                    "import ezdxf\n")
+            kw = {}
+            if IS_WINDOWS:
+                kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+            r = subprocess.run([sys.executable, "-c", code], cwd=tmp, env=env,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=timeout_s, **kw)
+            built = os.path.join(env["XDG_CACHE_HOME"], "ezdxf", FONT_CACHE_FILE)
+            if r.returncode != 0 or not _valid_font_cache(built):
+                raise RuntimeError("font cache build exited %s, file valid: %s"
+                                   % (r.returncode, _valid_font_cache(built)))
+            os.replace(built, target)
+            logger.info("ezdxf font cache built in %s", cache_dir)
+            return target
+        except Exception as exc:
+            _FONT_CACHE_FAILED[cache_dir] = str(exc)
+            logger.warning("ezdxf font cache unavailable (%s); each sandboxed job rebuilds it", exc)
+            return None
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+
+def seed_font_cache(xdg_cache_home: str, cache_dir: Optional[str] = None) -> bool:
+    """Copy the persistent font cache to ``<xdg_cache_home>/ezdxf/``; True on success."""
+    src = ensure_font_cache(cache_dir)
+    if src is None:
+        return False
+    try:
+        import shutil
+        dst_dir = os.path.join(str(xdg_cache_home), "ezdxf")
+        os.makedirs(dst_dir, exist_ok=True)
+        shutil.copyfile(src, os.path.join(dst_dir, FONT_CACHE_FILE))
+        return True
+    except OSError as exc:
+        logger.warning("font cache not copied to the work dir: %s", exc)
+        return False
+
+
+def _inside(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == \
+            os.path.abspath(root)
+    except ValueError:
+        return False
+
+
+# -------------------------------------------------------------- progress --
+
+def read_progress(path: str, max_bytes: int = PROGRESS_MAX_BYTES) -> Tuple[Optional[dict], Optional[str]]:
+    """``(snapshot, None)`` or ``(None, reason)``; the file is untrusted child output.
+
+    Only a JSON object no bigger than ``max_bytes`` is accepted; the caller
+    (``report.Report.merge_progress``) takes known keys with plain types only.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None, "no progress file"
+    if size > max_bytes:
+        return None, "progress file too big (%d bytes)" % size
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return None, "progress file unreadable: %s" % exc
+    if not isinstance(obj, dict):
+        return None, "progress file is not a JSON object"
+    return obj, None
 
 
 # ------------------------------------------------------- capped reader --
@@ -537,7 +700,8 @@ def apply_rlimits_from_env(environ: Optional[dict] = None) -> dict:
 
 
 def _posix_run(argv, work_dir, *, timeout_s, memory_limit_mb, cpu_limit_s, output_cap_mb,
-               env=None, poll_s=0.1, watch_dirs=None) -> SandboxResult:
+               env=None, poll_s=0.1, watch_dirs=None, progress_file=None,
+               font_cache=True) -> SandboxResult:
     """POSIX sandbox (UNVERIFIED: written, never run on Linux/macOS).
 
     Own session (``killpg`` reaches the tree unless a descendant calls setsid
@@ -547,14 +711,16 @@ def _posix_run(argv, work_dir, *, timeout_s, memory_limit_mb, cpu_limit_s, outpu
     """
     return _run_core(argv, work_dir, posix=True, timeout_s=timeout_s, memory_limit_mb=memory_limit_mb,
                      cpu_limit_s=cpu_limit_s, output_cap_mb=output_cap_mb, env=env, poll_s=poll_s,
-                     watch_dirs=watch_dirs)
+                     watch_dirs=watch_dirs, progress_file=progress_file, font_cache=font_cache)
 
 
 # ------------------------------------------------------------ the worker --
 
 def run_sandboxed(argv: List[str], work_dir: str, *, timeout_s: float, memory_limit_mb: int,
                   cpu_limit_s: float, output_cap_mb: int, env: Optional[dict] = None,
-                  poll_s: float = 0.1, watch_dirs: Optional[List[str]] = None) -> SandboxResult:
+                  poll_s: float = 0.1, watch_dirs: Optional[List[str]] = None,
+                  progress_file: Optional[str] = None,
+                  font_cache=True) -> SandboxResult:
     """Run ``argv`` with cwd ``work_dir`` under the limits; never raises for child failures.
 
     ``env`` defaults to ``sanitized_env(work_dir, <repo root>)``. ``watch_dirs``
@@ -563,14 +729,28 @@ def run_sandboxed(argv: List[str], work_dir: str, *, timeout_s: float, memory_li
     GROWTH of all watched dirs: their total size just before the spawn is the
     baseline, so pre-placed input files and older outputs do not count. A
     limit of 0 / None disables that limit.
+
+    ``progress_file`` (relative paths are taken in ``work_dir``): a stale
+    file is removed before the spawn, its absolute path is passed to the
+    child in ``PROGRESS_ENV``, and when the child produced no RESULT the
+    file is read (``read_progress``) into ``SandboxResult.progress``
+    (``sandbox["progress_error"]`` says why it is None).
+
+    ``font_cache``: True (default) seeds ezdxf's font cache into the child's
+    ``XDG_CACHE_HOME`` when that lies inside ``work_dir`` (``sanitized_env``
+    sets it), from the persistent cache (``ensure_font_cache``, built once);
+    a string is the persistent cache directory to use; False disables it.
+    ``sandbox["font_cache"]`` is ``"seeded"``, ``"unavailable"`` or
+    ``"disabled"``.
     """
     if not IS_WINDOWS:
         return _posix_run(argv, work_dir, timeout_s=timeout_s, memory_limit_mb=memory_limit_mb,
                           cpu_limit_s=cpu_limit_s, output_cap_mb=output_cap_mb, env=env,
-                          poll_s=poll_s, watch_dirs=watch_dirs)
+                          poll_s=poll_s, watch_dirs=watch_dirs, progress_file=progress_file,
+                          font_cache=font_cache)
     return _run_core(argv, work_dir, posix=False, timeout_s=timeout_s, memory_limit_mb=memory_limit_mb,
                      cpu_limit_s=cpu_limit_s, output_cap_mb=output_cap_mb, env=env, poll_s=poll_s,
-                     watch_dirs=watch_dirs)
+                     watch_dirs=watch_dirs, progress_file=progress_file, font_cache=font_cache)
 
 
 def _new_section(timeout_s, memory_limit_mb, cpu_limit_s, output_cap_mb) -> dict:
@@ -585,13 +765,40 @@ def _new_section(timeout_s, memory_limit_mb, cpu_limit_s, output_cap_mb) -> dict
 
 
 def _run_core(argv, work_dir, *, posix, timeout_s, memory_limit_mb, cpu_limit_s, output_cap_mb,
-              env, poll_s, watch_dirs) -> SandboxResult:
+              env, poll_s, watch_dirs, progress_file=None, font_cache=True) -> SandboxResult:
     work_dir = os.path.abspath(str(work_dir))
     os.makedirs(work_dir, exist_ok=True)
     sb = _new_section(timeout_s, memory_limit_mb, cpu_limit_s, output_cap_mb)
     if env is None:
         env = sanitized_env(work_dir, _DEFAULT_REPO_ROOT)
     env = dict(env)
+
+    # seeded before the output-cap baseline is measured, so the copy does not count
+    xdg = env.get("XDG_CACHE_HOME")
+    if font_cache is False or font_cache is None:
+        sb["font_cache"] = "disabled"
+    elif xdg and _inside(xdg, work_dir):
+        cache_dir = font_cache if isinstance(font_cache, str) else None
+        sb["font_cache"] = "seeded" if seed_font_cache(xdg, cache_dir) else "unavailable"
+    else:
+        sb["font_cache"] = "disabled"          # never write into a cache outside the work dir
+
+    progress_path = None
+    if progress_file:
+        progress_path = str(progress_file)
+        if not os.path.isabs(progress_path):
+            progress_path = os.path.join(work_dir, progress_path)
+        progress_path = os.path.abspath(progress_path)
+        try:
+            os.remove(progress_path)           # a stale snapshot must not be mistaken for this run's
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("stale progress file %s not removed: %s", progress_path, exc)
+        env[PROGRESS_ENV] = progress_path
+        # every exit path below reports both keys when a progress file was asked for
+        sb["progress_error"] = None
+        sb["last_stage"] = None
     mem_bytes = int(memory_limit_mb) * 2**20 if memory_limit_mb else 0
     cap_bytes = int(output_cap_mb) * 2**20 if output_cap_mb else 0
     dirs = [work_dir] + [os.path.abspath(str(d)) for d in (watch_dirs or [])]
@@ -623,6 +830,8 @@ def _run_core(argv, work_dir, *, posix, timeout_s, memory_limit_mb, cpu_limit_s,
         if job is not None:
             job.close()
         sb["result_error"] = "spawn failed: %s" % exc
+        if progress_path is not None:
+            sb["progress_error"] = "spawn failed"
         sb["exit_code"] = 1
         sb["wall_s"] = round(time.perf_counter() - t0, 3)
         return SandboxResult(exit_code=1, result=None, sandbox=sb, stdout_tail="", stderr_tail="")
@@ -809,12 +1018,23 @@ def _run_core(argv, work_dir, *, posix, timeout_s, memory_limit_mb, cpu_limit_s,
         if rc == -getattr(signal, "SIGXFSZ", -10_000):
             sb["output_exceeded"] = True
 
+    progress = None
+    if progress_path is not None:
+        if result is None:
+            progress, perr = read_progress(progress_path)
+            sb["progress_error"] = perr
+            if progress is not None:
+                stage = progress.get("stage")
+                sb["last_stage"] = stage[:200] if isinstance(stage, str) else None
+        else:
+            sb["progress_error"] = None
+
     stderr_tail = re_.tail_text()
     sb["stderr_tail"] = stderr_tail
     logger.info("sandbox: exit %s, wall %.2f s, isolation %s, result_error %s",
                 rc, sb["wall_s"], sb["isolation"], result_error)
     return SandboxResult(exit_code=int(rc), result=result, sandbox=sb,
-                         stdout_tail=ro.tail_text(), stderr_tail=stderr_tail)
+                         stdout_tail=ro.tail_text(), stderr_tail=stderr_tail, progress=progress)
 
 
 def _psutil_kill(psutil, root, seen: Dict[int, float]) -> None:

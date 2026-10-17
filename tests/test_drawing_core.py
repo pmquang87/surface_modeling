@@ -73,7 +73,8 @@ def _all_non_default():
         exact_hlr_max_faces=100, hlr_time_budget_s=30.0,
         classifier_threshold=0.2, max_input_mb=50.0, max_triangles=1000,
         timeout_s=60.0, memory_limit_mb=1024, output_cap_mb=50,
-        title="Bracket Ø20", owner="ACME", quiet=True)
+        title="Bracket Ø20", owner="ACME", quiet=True,
+        stl_unit="in", max_hidden_primitives=5000)
 
 
 def test_json_round_trip_every_field():
@@ -123,11 +124,16 @@ def test_bbox_of_circle_and_segment():
     assert bb.width == 15 and bb.height == 10
 
 
-def test_bbox_arc_uses_full_circle():
-    # a 0..10 degree arc: true extent is tiny in y, the documented rule
-    # (full circle) gives the whole circle
+def test_bbox_arc_is_exact_not_full_circle():
+    # QA round 1 issue 2: a 0..10 degree arc used to be boxed as the whole
+    # circle (-2, -1, 4, 5); the box is now its end points (0 deg is a quadrant point)
     bb = BBox2D.of_primitives([Arc((1, 2), 3, 0.0, 10.0)])
-    assert (bb.xmin, bb.ymin, bb.xmax, bb.ymax) == (-2, -1, 4, 5)
+    c10, s10 = np.cos(np.radians(10.0)), np.sin(np.radians(10.0))
+    np.testing.assert_allclose([bb.xmin, bb.ymin, bb.xmax, bb.ymax],
+                               [1 + 3 * c10, 2.0, 4.0, 2 + 3 * s10], atol=1e-12)
+    # start == end is the DXF full-circle rule: full box
+    full = BBox2D.of_primitives([Arc((1, 2), 3, 30.0, 390.0)])
+    np.testing.assert_allclose([full.xmin, full.ymin, full.xmax, full.ymax], [-2, -1, 4, 5], atol=1e-12)
 
 
 def test_bbox_empty_is_none_and_polyline_box():
@@ -302,7 +308,10 @@ def test_sniff_ascii_stl(tmpdir_path):
     assert s.extension == ".stl" and not s.extension_mismatch
 
 
-def test_sniff_truncated_binary_is_unknown(tmpdir_path):
+def test_sniff_truncated_binary_is_named(tmpdir_path):
+    # QA issue 25: a truncated binary STL is named, with its declared count
+    # (it used to be 'unknown' and got the generic 'neither STEP nor STL')
+    from src.drawing.sniff import unreadable_reason
     p = os.path.join(tmpdir_path, "trunc.stl")
     _box().export(p)
     full = os.path.getsize(p)
@@ -310,7 +319,11 @@ def test_sniff_truncated_binary_is_unknown(tmpdir_path):
         fh.truncate(full - 10)
     assert os.path.getsize(p) == full - 10   # precondition
     s = sniff(p)
-    assert s.kind == "unknown" and s.triangles is None
+    assert s.kind == "stl_binary_truncated" and s.triangles == 12
+    assert s.extension_mismatch is False      # still the stl family
+    msg = unreadable_reason(s)
+    assert "truncated" in msg and "12 triangles" in msg
+    assert f"{full} bytes" in msg and f"file is {full - 10} bytes" in msg
 
 
 def test_sniff_step_text_in_stl_file(tmpdir_path):
@@ -398,6 +411,67 @@ def test_check_limits(tmpdir_path):
     assert check_limits(step, max_input_mb=1.0, max_triangles=100) is None
 
 
+def test_sniff_empty_ascii_stl_is_named(tmpdir_path):
+    # QA issue 25: 'solid' + 'endsolid' without any facet is an empty STL
+    from src.drawing.sniff import unreadable_reason
+    p = os.path.join(tmpdir_path, "empty.stl")
+    with open(p, "wb") as fh:
+        fh.write(b"solid Empty\nendsolid Empty")
+    s = sniff(p)
+    assert s.kind == "stl_ascii" and s.triangles == 0 and s.empty is True
+    assert "empty STL" in unreadable_reason(s)
+    # the oversized path (no full scan) must not invent an empty flag
+    big = sniff(p, max_bytes=5)
+    assert big.empty is False and big.triangles is None
+    # control: a real ASCII STL is not empty and has no unreadable reason
+    q = os.path.join(tmpdir_path, "box_ascii.stl")
+    _box().export(q, file_type="stl_ascii")
+    r = sniff(q)
+    assert r.kind == "stl_ascii" and r.empty is False and r.triangles == 12
+    assert unreadable_reason(r) is None
+    # 'solid' with neither facet nor endsolid stays unknown
+    u = os.path.join(tmpdir_path, "solid_only.stl")
+    with open(u, "wb") as fh:
+        fh.write(b"solid nothing here\n")
+    assert sniff(u).kind == "unknown"
+
+
+def test_sniff_truncated_binary_variants(tmpdir_path):
+    from src.drawing.sniff import unreadable_reason
+    import trimesh
+    p = os.path.join(tmpdir_path, "sphere.stl")
+    trimesh.creation.icosphere(subdivisions=2).export(p)
+    data = open(p, "rb").read()
+    n = 320
+    assert len(data) == 84 + 50 * n               # precondition: full binary
+    # cut at a record boundary (40 records missing) and mid-record
+    for cut in (50 * 40, 1, 777):
+        q = os.path.join(tmpdir_path, f"cut{cut}.stl")
+        with open(q, "wb") as fh:
+            fh.write(data[:-cut])
+        s = sniff(q)
+        assert s.kind == "stl_binary_truncated" and s.triangles == n, cut
+    # most of the data missing: not called truncated (too little evidence)
+    q = os.path.join(tmpdir_path, "stub.stl")
+    with open(q, "wb") as fh:
+        fh.write(data[:84 + 50 * 10])
+    assert sniff(q).kind == "unknown"
+    # random bytes and an STL-sized random file with a forged count stay unknown
+    rng = np.random.default_rng(11)
+    hits = 0
+    for i in range(200):
+        blob = bytearray(rng.integers(0, 256, 84 + 50 * 30 - 7, dtype=np.uint8).tobytes())
+        blob[80:84] = (30).to_bytes(4, "little")        # count fits the length test
+        r = os.path.join(tmpdir_path, f"rnd{i}.stl")
+        with open(r, "wb") as fh:
+            fh.write(bytes(blob))
+        s = sniff(r, compute_hash=False)
+        hits += s.kind != "unknown"
+        if s.kind == "unknown":
+            assert "neither STEP nor STL" in unreadable_reason(s)
+    assert hits == 0
+
+
 # --------------------------------------------------------------- package --
 
 def test_package_import_is_light():
@@ -412,3 +486,36 @@ def test_package_import_is_light():
                          text=True, env=env, timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.split() == ["0.1.0", "True", "False", "False", "False"]
+
+
+# ------------------------------------------- QA round 1 (F3): arc boxes --
+
+def test_bbox_arc_across_zero_uses_end_points_and_quadrants():
+    # QA issue 2 test: Arc(-30..30, r 10): xmax = 10 (0 deg quadrant), xmin = 10 cos 30,
+    # |y| <= 5; the old full-circle rule gave (-10, -10, 10, 10)
+    bb = BBox2D.of_primitives([Arc((0, 0), 10.0, -30.0, 30.0)])
+    np.testing.assert_allclose([bb.xmin, bb.ymin, bb.xmax, bb.ymax],
+                               [10 * np.cos(np.radians(30)), -5.0, 10.0, 5.0], atol=1e-12)
+    # a 300 degree arc from 60 to 0 (CCW through 90, 180, 270): only the 0..60 gap is missing
+    bb2 = BBox2D.of_primitives([Arc((0, 0), 10.0, 60.0, 0.0)])
+    np.testing.assert_allclose([bb2.xmin, bb2.ymin, bb2.xmax, bb2.ymax], [-10, -10, 10, 10], atol=1e-12)
+    # a quarter arc 100..170: neither 90 nor 180 is inside, the box is the two end points
+    bb3 = BBox2D.of_primitives([Arc((0, 0), 10.0, 100.0, 170.0)])
+    a, b = np.radians(100.0), np.radians(170.0)
+    np.testing.assert_allclose([bb3.xmin, bb3.ymin, bb3.xmax, bb3.ymax],
+                               [10 * np.cos(b), 10 * np.sin(b), 10 * np.cos(a), 10 * np.sin(a)], atol=1e-12)
+
+
+def test_arc_extreme_points_and_sweep():
+    from src.drawing.model import arc_extreme_points, arc_sweep_deg
+    assert arc_sweep_deg(350.0, 10.0) == pytest.approx(20.0)
+    assert arc_sweep_deg(0.0, 360.0) == 360.0 and arc_sweep_deg(45.0, 45.0) == 360.0
+    pts = arc_extreme_points((1.0, 1.0), 2.0, 350.0, 10.0)
+    assert pts.shape == (3, 2)                       # two ends + the 0 degree point
+    assert pts[:, 0].max() == pytest.approx(3.0)
+
+
+def test_dimension_text_offset_defaults_to_zero():
+    d = Dimension("linear", "10", 10.0)
+    assert d.text_offset == 0.0
+    assert dataclasses.replace(d, text_offset=4.5).text_offset == 4.5

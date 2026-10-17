@@ -45,8 +45,20 @@ REPORT-brep-analysis.md):
   top disc. Such a plane (checked on the planar faces before cutting,
   ``stats["coplanar"]`` = number of faces in it) and a plane with zero
   closed loops are nudged once by 1 % of ``depth_extent`` along the normal
-  toward the shape's bbox centre (``stats["nudged"]``); still empty ->
-  ``loops == []`` and no body (the pipeline flags ``section_empty``).
+  toward the shape's bbox centre (``stats["nudged"]``); a plane inside the
+  bbox that is still empty (a gap between bodies) is moved through the
+  centroid of the largest body (``stats["retried_at_body"]``); still empty
+  -> ``loops == []`` and no body (the pipeline flags ``section_empty``).
+* QA round 1 (assembly as1_pe_203, plate + bolts + nuts): ONE
+  ``BRepAlgoAPI_Cut`` of the whole compound against the half-space kept
+  whole bolts and nuts from the removed half (IsDone True, no error), and
+  one ``BRepAlgoAPI_Section`` of the compound merged the coincident wires
+  of a bolt and its hole into open wires. Synthetic plate + bolt + nut cut
+  at y = 10: kept solids reached ymin 5 and 2, 1 merged loop with 2 open
+  wires; per body: every kept solid at ymin 10, 4 closed loops. Both the
+  loops and the body are therefore built body by body, and bodies entirely
+  on one side of the plane are kept or dropped by their bbox without a
+  boolean.
 """
 from __future__ import annotations
 
@@ -66,6 +78,13 @@ log = logging.getLogger(__name__)
 # Behaviour switch, module-level so the negative-control test can turn it off.
 _RECOVER_OPEN = True       # recover closed loops inside open wires (tangent planes)
 _NUDGE_COPLANAR = True     # nudge a plane that lies in a planar face before cutting
+_SECTION_PER_BODY = True   # section and half-space-cut each solid / shell on its own
+_RETRY_AT_BODY = True      # an empty plane is retried through the centroid of a body
+
+_SIDE_TOL_MIN = 1e-6       # mm; a body this close to the plane counts as on it
+_SIDE_TOL_REL = 1e-9       # x bbox diagonal
+_RETRY_BODIES = 3          # largest bodies tried by the empty-plane retry
+_EXCESS_TOL_REL = 1e-4     # x bbox diagonal: a cut body may overshoot the plane by this
 
 _WIRE_TOL = 1e-4           # ConnectEdgesToWires tolerance (probe value)
 _NUDGE_FRACTION = 0.01
@@ -75,6 +94,8 @@ _COPLANAR_DIST_TOL = 1e-6  # mm; the face tolerance is used when larger
 # mode -> (section view name, marker view name)
 _MODES = {"auto": ("front", "top"), "front": ("front", "top"),
           "top": ("top", "front"), "right": ("right", "front")}
+_PERP_TOL = 1e-6           # |axis . normal| below this -> the hole axis lies in the plane
+_THIN_RATIO = 0.1          # auto: depth < this x min(width, height) -> thin part, top plane
 
 
 # ----------------------------------------------------------------- plane choice
@@ -96,6 +117,30 @@ def _exact_bbox(shape) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         return None
 
 
+def _fast_bbox(shape) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Conservative bbox by ``BRepBndLib.Add_s`` (control hull / existing
+    triangulation, enlarged by the shape tolerance): never smaller than the
+    shape, much cheaper than ``AddOptimal_s`` on B-spline bodies. Measured on
+    the 211-solid, 10665-face QA assembly (RC buggy suspension): the exact
+    box of every body took 32 s per pass, which made the per-body section
+    run out of time; classification only needs a box that is never too
+    small (a body wrongly seen as straddling is just cut, correctly)."""
+    try:
+        from OCP.Bnd import Bnd_Box
+        from OCP.BRepBndLib import BRepBndLib
+        if shape is None or shape.IsNull():
+            return None
+        box = Bnd_Box()
+        BRepBndLib.Add_s(shape, box, True)
+        if box.IsVoid():
+            return None
+        x0, y0, z0, x1, y1, z1 = box.Get()
+        return np.array([x0, y0, z0], float), np.array([x1, y1, z1], float)
+    except Exception as exc:
+        log.debug("fast bbox failed: %s", exc)
+        return None
+
+
 def _model_bbox(model) -> Tuple[np.ndarray, np.ndarray]:
     census = getattr(model, "census", None) or {}
     lo, hi = census.get("bbox_min"), census.get("bbox_max")
@@ -110,39 +155,118 @@ def _model_bbox(model) -> Tuple[np.ndarray, np.ndarray]:
     return bb
 
 
-def choose_section_plane_brep(model, features: Sequence[CylFeature], mode: str
-                              ) -> Tuple[np.ndarray, np.ndarray, str]:
-    """(point, normal, marker_view) of the cutting plane.
+_SECTION_HOLE_KINDS = ("hole", "filled_hole")   # filled_hole: a fastener in an assembly hole
 
-    ``mode``: "auto" / "front" (normal = front view n = (0,-1,0), cutting
-    line shown in the top view), "top" (normal (0,0,1), shown in the front
-    view), "right" (normal (1,0,0), shown in the front view). The plane goes
-    through the axis of the largest hole (``kind == "hole"``) whose axis is
-    perpendicular to the normal (the point is the hole centre); without one
-    it goes through the bbox centre. ``model`` needs ``census["bbox_min"/
-    "bbox_max"]`` or a ``shape`` (exact ``AddOptimal_s`` bbox then).
-    """
-    if mode not in _MODES:
-        raise ValueError(f"section mode must be one of {sorted(_MODES)}, got {mode!r}")
-    view_name, marker = _MODES[mode]
-    normal = np.array(VIEWS[view_name].n, dtype=float)
-    lo, hi = _model_bbox(model)
-    centre = 0.5 * (lo + hi)
-    best = None
+
+def _holes_by_size(features: Sequence[CylFeature], centre: np.ndarray, with_kind: bool = False
+                   ) -> List[Tuple]:
+    """(unit axis, centre, radius) of the hole features (``kind`` "hole" and
+    "filled_hole", see ``_SECTION_HOLE_KINDS``), largest first; a filled hole
+    comes after a real hole of the same radius; then nearest the bbox centre
+    first. ``with_kind=True`` appends the kind to each tuple.
+
+    A hole filled by a bolt or pin of another solid (``brep_features``
+    marks it "filled_hole" in an assembly) is a valid section axis: the cut
+    through the fastener axis is the standard section of a bolted joint, and
+    the per-body cut sections it cleanly (QA as1_pe_203: 13 closed loops over
+    7 bodies, 0 open wires, against 2 loops on the bbox-centre fallback)."""
+    out = []
     for f in features or ():
-        if getattr(f, "kind", "") != "hole":
+        kind = getattr(f, "kind", "")
+        if kind not in _SECTION_HOLE_KINDS:
             continue
         axis = np.asarray(f.axis, float).reshape(3)
         na = float(np.linalg.norm(axis))
-        if na < 1e-12 or abs(float(np.dot(axis / na, normal))) > 1e-6:
+        if na < 1e-12:
             continue
         c = np.asarray(f.center, float).reshape(3)
-        key = (float(f.radius), -float(np.linalg.norm(c - centre)))
-        if best is None or key > best[0]:
-            best = (key, c)
-    point = best[1].copy() if best is not None else centre
+        out.append((axis / na, c, float(f.radius), kind))
+    out.sort(key=lambda h: (-round(h[2], 6), h[3] != "hole", float(np.linalg.norm(h[1] - centre))))
+    return out if with_kind else [h[:3] for h in out]
+
+
+def _perpendicular(axis: np.ndarray, normal: np.ndarray) -> bool:
+    return abs(float(np.dot(axis, normal))) <= _PERP_TOL
+
+
+def choose_section_plane_brep_info(model, features: Sequence[CylFeature], mode: str
+                                   ) -> Tuple[np.ndarray, np.ndarray, str, dict]:
+    """``(point, normal, marker_view, info)`` of the cutting plane.
+
+    Explicit modes: "front" (normal = front view n = (0,-1,0), cutting line
+    shown in the top view), "top" (normal (0,0,1), shown in the front view),
+    "right" (normal (1,0,0), shown in the front view). The plane goes through
+    the axis of the largest hole (``kind == "hole"``) whose axis is
+    perpendicular to the normal (the point is the hole centre); without one
+    it goes through the bbox centre.
+
+    "auto" ranks the normals front, top, right. The holes are tried largest
+    first; the first normal perpendicular to the hole's axis wins, so a plate
+    whose big hole runs along the front normal (a washer, a flange seen face
+    on) is cut by the TOP plane through that hole and the cutting line shows
+    in the front view (a front plane would repeat the front outline). With no
+    usable hole a thin part (depth along the front normal < ``_THIN_RATIO``
+    x the smaller of the other two extents) is cut by the top plane through
+    the bbox centre; anything else by the front plane through it.
+
+    A "filled_hole" (a hole an assembly fastener fills) is a section axis
+    too, ranked after a real hole of the same radius (``_holes_by_size``).
+
+    ``info``: ``reason`` ("hole_axis" | "thin_part" | "bbox_centre_fallback"),
+    ``view`` (the section view name), ``mode``, ``hole_radius`` (None without
+    a hole), ``hole_kind`` ("hole" | "filled_hole" | None) and ``skip_hint``
+    ("no_solid" when ``census["solids"] == 0``: an open surface model gives
+    no closed section loop on any plane, so an auto section is pointless;
+    None otherwise; the plane is still returned). ``model`` needs
+    ``census["bbox_min"/"bbox_max"]`` or a ``shape`` (exact ``AddOptimal_s``
+    bbox then).
+    """
+    if mode not in _MODES:
+        raise ValueError(f"section mode must be one of {sorted(_MODES)}, got {mode!r}")
+    lo, hi = _model_bbox(model)
+    centre = 0.5 * (lo + hi)
+    holes = _holes_by_size(features, centre, with_kind=True)
+    names = ("front", "top", "right") if mode == "auto" else (_MODES[mode][0],)
+    chosen = None
+    for axis, c, r, kind in holes:
+        for name in names:
+            if _perpendicular(axis, np.asarray(VIEWS[name].n, float)):
+                chosen = (name, c.copy(), r, kind)
+                break
+        if chosen is not None:
+            break
+    hole_kind = None
+    if chosen is not None:
+        view_name, point, radius, hole_kind = chosen
+        reason = "hole_axis"
+    else:
+        radius = None
+        point = centre.copy()
+        view_name = names[0]
+        reason = "bbox_centre_fallback"
+        if mode == "auto":
+            ext = np.abs(hi - lo)
+            depth = float(abs(np.dot(ext, VIEWS["front"].n)))
+            others = [float(abs(np.dot(ext, VIEWS[k].n))) for k in ("top", "right")]
+            if min(others) > 0.0 and depth < _THIN_RATIO * min(others):
+                view_name, reason = "top", "thin_part"
+    normal = np.array(VIEWS[view_name].n, dtype=float)
+    marker = _MODES[view_name][1]
+    census = getattr(model, "census", None) or {}
+    solids = census.get("solids")
+    no_solid = isinstance(solids, (int, np.integer)) and not isinstance(solids, bool) and solids == 0
+    info = {"reason": reason, "view": view_name, "mode": mode, "hole_radius": radius,
+            "hole_kind": hole_kind, "skip_hint": "no_solid" if no_solid else None}
     log.debug("section plane %s: point %s normal %s (%s)", mode, point.tolist(), normal.tolist(),
-              "largest hole" if best is not None else "bbox centre")
+              reason)
+    return point, normal, marker, info
+
+
+def choose_section_plane_brep(model, features: Sequence[CylFeature], mode: str
+                              ) -> Tuple[np.ndarray, np.ndarray, str]:
+    """(point, normal, marker_view) of the cutting plane; see
+    ``choose_section_plane_brep_info`` for the rules and the reason."""
+    point, normal, marker, _ = choose_section_plane_brep_info(model, features, mode)
     return point, normal, marker
 
 
@@ -246,53 +370,164 @@ def _prune_dangling(segs: np.ndarray, tol: float) -> Tuple[np.ndarray, int]:
     return segs[alive], n_pruned
 
 
-def _section_loops(shape, point, normal, spec, deflection: float):
-    """Closed section loops in view 2D + stats for one plane."""
-    from OCP.BRep import BRep_Tool
+def _parts(shape) -> List:
+    """The bodies of ``shape`` that are sectioned and cut one by one: every
+    solid, every free shell (not in a solid), and ONE compound of all free
+    faces (not in a shell; a faceted or surface model can have thousands).
+    Loose edges and vertices carry no material and are left out. A null
+    shape gives []."""
+    from OCP.BRep import BRep_Builder
+    from OCP.TopAbs import TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopTools import TopTools_MapOfShape
+    from OCP.TopoDS import TopoDS_Compound
+    if shape is None or shape.IsNull():
+        return []
+
+    def explore(kind, avoid=None):
+        seen = TopTools_MapOfShape()
+        out = []
+        ex = TopExp_Explorer(shape, kind) if avoid is None else TopExp_Explorer(shape, kind, avoid)
+        while ex.More():
+            if seen.Add(ex.Current()):
+                out.append(ex.Current())
+            ex.Next()
+        return out
+
+    parts = explore(TopAbs_SOLID) + explore(TopAbs_SHELL, TopAbs_SOLID)
+    faces = explore(TopAbs_FACE, TopAbs_SHELL)
+    if faces:
+        b = BRep_Builder()
+        comp = TopoDS_Compound()
+        b.MakeCompound(comp)
+        for f in faces:
+            b.Add(comp, f)
+        parts.append(comp)
+    return parts
+
+
+def _box_range(bb, point, normal) -> Optional[Tuple[float, float]]:
+    if bb is None:
+        return None
+    lo, hi = bb
+    n = np.asarray(normal, float)
+    base = float(np.dot(np.asarray(point, float), n))
+    d_lo = float(np.dot(np.where(n >= 0, lo, hi), n)) - base
+    d_hi = float(np.dot(np.where(n >= 0, hi, lo), n)) - base
+    return d_lo, d_hi
+
+
+class _Bodies:
+    """The bodies of a shape (``_parts``) with their boxes cached, so the
+    loops, the nudge / retry planes and the body cut share them.
+
+    ``range(i, point, normal)`` is the (min, max) signed distance of body i
+    to the plane along ``normal`` (None for a void box). The cheap
+    conservative box (``_fast_bbox``) answers first; only when it straddles
+    the plane (beyond ``tol`` on both sides) is the exact ``AddOptimal_s``
+    box computed (once) and used, so only bodies near the plane pay for it.
+    ``tol`` is the on-the-plane tolerance and ``diag`` the bbox diagonal of
+    the whole shape (from the fast box).
+    """
+
+    def __init__(self, shape) -> None:
+        self.parts = _parts(shape)
+        self._fast = [_fast_bbox(p) for p in self.parts]
+        self._exact: List = [None] * len(self.parts)
+        self._has_exact = [False] * len(self.parts)
+        fb = _fast_bbox(shape)
+        self.diag = float(np.linalg.norm(fb[1] - fb[0])) if fb is not None else 0.0
+        self.tol = max(_SIDE_TOL_MIN, _SIDE_TOL_REL * self.diag)
+
+    def range(self, i: int, point, normal) -> Optional[Tuple[float, float]]:
+        rng = _box_range(self._fast[i], point, normal)
+        if rng is None or (rng[0] < -self.tol and rng[1] > self.tol):
+            if not self._has_exact[i]:
+                self._exact[i] = _exact_bbox(self.parts[i])
+                self._has_exact[i] = True
+            exact_rng = _box_range(self._exact[i], point, normal)
+            if exact_rng is not None:
+                return exact_rng
+        return rng
+
+
+def _section_part_edges(part, point, normal) -> List:
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Section
-    from OCP.ShapeAnalysis import ShapeAnalysis_FreeBounds
     from OCP.TopAbs import TopAbs_EDGE
     from OCP.TopExp import TopExp_Explorer
-    from OCP.TopTools import TopTools_HSequenceOfShape
-    from OCP.TopoDS import TopoDS
     from OCP.gp import gp_Dir, gp_Pln, gp_Pnt
-
-    stats = {"edges": 0, "wires": 0, "open_wires_dropped": 0, "dangling_segments_pruned": 0,
-             "loops_recovered": 0}
-    sec = BRepAlgoAPI_Section(shape, gp_Pln(gp_Pnt(*map(float, point)), gp_Dir(*map(float, normal))),
+    sec = BRepAlgoAPI_Section(part, gp_Pln(gp_Pnt(*map(float, point)), gp_Dir(*map(float, normal))),
                               False)
     sec.ComputePCurveOn1(True)
     sec.Approximation(True)
     sec.Build()
     if not sec.IsDone():
         raise RuntimeError("BRepAlgoAPI_Section did not finish")
-    edges = TopTools_HSequenceOfShape()
+    out = []
     ex = TopExp_Explorer(sec.Shape(), TopAbs_EDGE)
     while ex.More():
-        edges.Append(ex.Current())
+        out.append(ex.Current())
         ex.Next()
-    stats["edges"] = edges.Length()
+    return out
+
+
+def _section_loops(shape, point, normal, spec, deflection: float, bodies=None):
+    """Closed section loops in view 2D + stats for one plane.
+
+    Each body (``_parts``) whose bbox reaches the plane is sectioned on its
+    own and its edges are joined into wires on their own, so coincident
+    faces of touching bodies (a bolt in its hole, a nut on a bolt) do not
+    merge their wires into open ones. ``stats["bodies_sectioned"]`` counts
+    them. ``bodies`` (a ``_Bodies`` of ``shape``) shares the box cache."""
+    from OCP.BRep import BRep_Tool
+    from OCP.ShapeAnalysis import ShapeAnalysis_FreeBounds
+    from OCP.TopTools import TopTools_HSequenceOfShape
+    from OCP.TopoDS import TopoDS
+
+    stats = {"edges": 0, "wires": 0, "open_wires_dropped": 0, "dangling_segments_pruned": 0,
+             "loops_recovered": 0, "bodies_sectioned": 0}
+    groups: List[List] = []
+    if _SECTION_PER_BODY:
+        if bodies is None:
+            bodies = _Bodies(shape)
+        parts = bodies.parts
+    else:
+        parts = [shape]
+    for i, part in enumerate(parts):
+        if _SECTION_PER_BODY and len(parts) > 1:
+            rng = bodies.range(i, point, normal)
+            if rng is None or rng[0] > bodies.tol or rng[1] < -bodies.tol:
+                continue                      # the plane misses this body
+        edges = _section_part_edges(part, point, normal)
+        stats["bodies_sectioned"] += 1
+        if edges:
+            groups.append(edges)
     loops3: List[np.ndarray] = []
-    if edges.Length() == 0:
-        return [], stats
-    wires = TopTools_HSequenceOfShape()
-    ShapeAnalysis_FreeBounds.ConnectEdgesToWires_s(edges, _WIRE_TOL, False, wires)
-    stats["wires"] = wires.Length()
     open_segs = []
-    for i in range(1, wires.Length() + 1):
-        w = TopoDS.Wire_s(wires.Value(i))
-        if BRep_Tool.IsClosed_s(w):
-            try:
-                P = _wire_loop(w, deflection)
-            except Exception as exc:
-                log.debug("closed section wire skipped: %s", exc)
-                continue
-            if len(P) >= 3:
-                loops3.append(P)
-        else:
-            stats["open_wires_dropped"] += 1
-            if _RECOVER_OPEN:
-                open_segs.append(_wire_segments(w, deflection))
+    for edges in groups:
+        seq = TopTools_HSequenceOfShape()
+        for e in edges:
+            seq.Append(e)
+        stats["edges"] += seq.Length()
+        wires = TopTools_HSequenceOfShape()
+        ShapeAnalysis_FreeBounds.ConnectEdgesToWires_s(seq, _WIRE_TOL, False, wires)
+        stats["wires"] += wires.Length()
+        for i in range(1, wires.Length() + 1):
+            w = TopoDS.Wire_s(wires.Value(i))
+            if BRep_Tool.IsClosed_s(w):
+                try:
+                    P = _wire_loop(w, deflection)
+                except Exception as exc:
+                    log.debug("closed section wire skipped: %s", exc)
+                    continue
+                if len(P) >= 3:
+                    loops3.append(P)
+            else:
+                stats["open_wires_dropped"] += 1
+                if _RECOVER_OPEN:
+                    open_segs.append(_wire_segments(w, deflection))
+    if not groups:
+        return [], stats
     basis = np.stack([np.asarray(spec.x, float), np.asarray(spec.y, float)], axis=1)   # (3, 2)
     loops2 = [P @ basis for P in loops3]
     if open_segs:
@@ -349,7 +584,7 @@ def _coplanar_face_count(shape, point, normal) -> int:
 
 def _nudge_sign(shape, p, n) -> float:
     """+1 / -1: direction along ``n`` toward the shape's bbox centre (-1 on a tie)."""
-    bb = _exact_bbox(shape)
+    bb = _fast_bbox(shape)
     if bb is not None:
         d = float(np.dot(0.5 * (bb[0] + bb[1]) - p, n))
         if abs(d) > 1e-12:
@@ -367,20 +602,234 @@ def _normalise_loops(loops: List[np.ndarray]) -> List[np.ndarray]:
 
 # ----------------------------------------------------------------- body
 
-def _half_space_cut(shape, point, normal):
-    """Keep the material on the -normal side of the plane (the viewer is on +normal)."""
-    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+def _half_space_solid(p: np.ndarray, n: np.ndarray, removed: bool = True):
+    """Half-space solid bounded by the plane (p, n): the removed half (+n side)
+    by default, the kept half (-n side) with ``removed=False``."""
     from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
     from OCP.BRepPrimAPI import BRepPrimAPI_MakeHalfSpace
     from OCP.gp import gp_Dir, gp_Pln, gp_Pnt
-    p = np.asarray(point, float)
-    n = np.asarray(normal, float)
     face = BRepBuilderAPI_MakeFace(gp_Pln(gp_Pnt(*p), gp_Dir(*n))).Face()
-    ref = gp_Pnt(*(p + n))                        # a point inside the removed half
-    cut = BRepAlgoAPI_Cut(shape, BRepPrimAPI_MakeHalfSpace(face, ref).Solid())
+    ref = gp_Pnt(*(p + n)) if removed else gp_Pnt(*(p - n))
+    return BRepPrimAPI_MakeHalfSpace(face, ref).Solid()
+
+
+def _cut_one(part, removed_half):
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    cut = BRepAlgoAPI_Cut(part, removed_half)
     if not cut.IsDone():
         raise RuntimeError("half-space cut failed")
     return cut.Shape()
+
+
+def _common_one(part, kept_half):
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
+    com = BRepAlgoAPI_Common(part, kept_half)
+    if not com.IsDone():
+        raise RuntimeError("half-space common failed")
+    return com.Shape()
+
+
+def _half_space_cut(shape, point, normal, stats: Optional[dict] = None, bodies=None):
+    """Keep the material on the -normal side of the plane (the viewer is on +normal).
+
+    Each body (``_parts``: solid, free shell, the free faces) is classified
+    by its bbox against the plane (``_Bodies``; ``bodies`` shares the box
+    cache of the loops): entirely on the kept side -> kept
+    whole, entirely on the removed side -> dropped, straddling -> cut on its
+    own. One boolean of a whole assembly compound (bolts in holes, nuts on
+    bolts: coincident faces between arguments) kept whole solids from the
+    removed half. Every cut result is checked against the half-space; a
+    result that reaches past the plane by more than the tolerance is redone
+    with ``BRepAlgoAPI_Common`` against the kept half-space, and the better
+    of the two is kept. ``stats`` (optional dict) receives kept_whole,
+    dropped_whole, cut, common_retries, half_space_excess_mm (largest
+    distance a kept body reaches past the plane, checked on a triangulation
+    when the AddOptimal box says it overshoots, see ``_excess``; 0 when
+    clean), half_space_excess_tol_mm (the verification tolerance: tolerance
+    or 1e-4 x bbox diagonal) and excess_bodies (kept bodies still past the
+    plane by more than that after the Common retry; they are kept, so the
+    caller can flag an inexact cut when this is > 0).
+    """
+    from OCP.BRep import BRep_Builder
+    from OCP.TopoDS import TopoDS_Compound
+    p = np.asarray(point, float)
+    n = np.asarray(normal, float)
+    st = {"kept_whole": 0, "dropped_whole": 0, "cut": 0, "common_retries": 0,
+          "half_space_excess_mm": 0.0, "half_space_excess_tol_mm": 0.0, "excess_bodies": 0}
+    if not _SECTION_PER_BODY:
+        out = _cut_one(shape, _half_space_solid(p, n))
+        if stats is not None:
+            st["cut"] = 1
+            stats.update(st)
+        return out
+    if bodies is None:
+        bodies = _Bodies(shape)
+    tol = bodies.tol
+    vtol = max(tol, _EXCESS_TOL_REL * bodies.diag)   # verification: tolerance-sized overshoot is ok
+    st["half_space_excess_tol_mm"] = float(vtol)
+    removed = None
+    kept_half = None
+    kept = []
+    for i, part in enumerate(bodies.parts):
+        rng = bodies.range(i, p, n)
+        if rng is None:
+            continue
+        d_lo, d_hi = rng
+        if d_hi <= tol:
+            kept.append(part)
+            st["kept_whole"] += 1
+            continue
+        if d_lo >= -tol:
+            st["dropped_whole"] += 1
+            continue
+        if removed is None:
+            removed = _half_space_solid(p, n)
+        res = _cut_one(part, removed)
+        excess = _excess(res, p, n, vtol)
+        if excess > vtol:
+            if kept_half is None:
+                kept_half = _half_space_solid(p, n, removed=False)
+            st["common_retries"] += 1
+            try:
+                alt = _common_one(part, kept_half)
+                alt_excess = _excess(alt, p, n, vtol)
+                if alt_excess < excess:
+                    res, excess = alt, alt_excess
+            except Exception as exc:
+                log.debug("half-space common retry failed: %s", exc)
+            if excess > vtol:
+                st["excess_bodies"] += 1
+                log.info("section body: a cut body still reaches %.4g mm past the plane",
+                         excess)
+        st["half_space_excess_mm"] = max(st["half_space_excess_mm"], float(excess))
+        if res is not None and not res.IsNull():
+            kept.append(res)
+        st["cut"] += 1
+    b = BRep_Builder()
+    comp = TopoDS_Compound()
+    b.MakeCompound(comp)
+    for s in kept:
+        b.Add(comp, s)
+    if stats is not None:
+        stats.update(st)
+    return comp
+
+
+def _mesh_excess(shape, p, n, deflection: float, tol: Optional[float] = None
+                 ) -> Optional[float]:
+    """Reach past the plane of a triangulated copy of ``shape`` meshed with
+    ``deflection`` (the copy keeps the triangulation off the shape that is
+    projected later). First the
+    ``BRepBndLib.AddOptimal_s(useTriangulation=True, useShapeTolerance=False)``
+    box (C++; nodes enlarged by the stored triangulation deflection: about
+    2 x deflection above the true reach on a cut sphere, 0.0094 at 0.005).
+    When that is still above ``tol``, the nodes themselves are scanned and
+    their largest distance + ``deflection`` is used (the nodes lie on the
+    surfaces): on the RC buggy run a tolerance-enlarged box kept one cleanly
+    cut body 0.095 mm 'past' the plane and the deflection-enlarged one
+    0.049 mm (vtol 0.035), while its nodes at deflection 0.01 were all
+    behind the plane. None when meshing fails or a face gets no
+    triangulation."""
+    from OCP.BRep import BRep_Tool
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
+    try:
+        cp = BRepBuilderAPI_Copy(shape, False, False).Shape()
+        BRepMesh_IncrementalMesh(cp, float(deflection), False, 0.5, True)
+        tris = []
+        ex = TopExp_Explorer(cp, TopAbs_FACE)
+        while ex.More():
+            loc = TopLoc_Location()
+            tri = BRep_Tool.Triangulation_s(TopoDS.Face_s(ex.Current()), loc)
+            if tri is None or tri.NbNodes() == 0:
+                return None                    # the box would fall back to the surface
+            tris.append((tri, loc))
+            ex.Next()
+        box = Bnd_Box()
+        BRepBndLib.AddOptimal_s(cp, box, True, False)   # nodes + deflection, no tolerance
+        rng = _box_range(None if box.IsVoid() else
+                         (np.array(box.Get()[:3], float), np.array(box.Get()[3:], float)), p, n)
+        if rng is None:
+            return None
+        reach = float(rng[1])
+        if tol is None or reach <= tol:
+            return reach
+        px, py, pz = (float(v) for v in p)
+        nx, ny, nz = (float(v) for v in n)
+        best = -math.inf
+        for tri, loc in tris:
+            tr = loc.Transformation()
+            for i in range(1, tri.NbNodes() + 1):
+                q = tri.Node(i).Transformed(tr)
+                d = (q.X() - px) * nx + (q.Y() - py) * ny + (q.Z() - pz) * nz
+                if d > best:
+                    best = d
+        if math.isfinite(best):
+            reach = min(reach, best + float(deflection))
+        return reach
+    except Exception as exc:
+        log.debug("triangulated excess check failed: %s", exc)
+        return None
+
+
+def _excess(shape, p, n, tol, refine: bool = True) -> float:
+    """How far ``shape`` reaches past the plane on the removed (+n) side; 0
+    when it stays behind it (or is empty).
+
+    The fast box passing is proof. ``AddOptimal_s`` without triangulation
+    is NOT exact on trimmed faces: an analytic sphere r10 cut at y = -2
+    keeps its full-sphere box (8 mm 'past' the plane while every vertex and
+    triangulation node is behind it), and on the RC buggy assembly 6 of the
+    7 bodies reported 0.07 to 1.96 mm past the plane with their
+    triangulation (deflection 0.01) at 0.0. So an AddOptimal excess above
+    ``tol`` is checked (``refine``) on a triangulation of a copy with
+    deflection ``tol / 4`` (``_mesh_excess``: the triangulation box, then
+    the largest node distance + the deflection; a clean cut comes out at
+    or below tol / 2, a real overshoot such as the invalid RC body that
+    reached 1.97 mm at its vertices stays) and the smaller value is
+    returned."""
+    if shape is None or shape.IsNull():
+        return 0.0
+    rng = _box_range(_fast_bbox(shape), p, n)        # conservative: passing it is proof
+    if rng is not None and rng[1] <= tol:
+        return 0.0
+    rng = _box_range(_exact_bbox(shape), p, n)
+    if rng is None:
+        return 0.0
+    reach = max(0.0, float(rng[1]))
+    if refine and reach > tol and tol > 0.0:
+        m = _mesh_excess(shape, p, n, 0.25 * tol, tol=tol)
+        if m is not None:
+            reach = min(reach, max(0.0, m))
+    return reach
+
+
+def _body_centroids(shape, parts=None) -> List[np.ndarray]:
+    """Centroids of the bodies of ``shape`` (or of ``parts``), largest
+    (volume, or area for shells / faces) first."""
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    from OCP.TopAbs import TopAbs_SOLID
+    out = []
+    for part in (parts if parts is not None else _parts(shape)):
+        try:
+            props = GProp_GProps()
+            if part.ShapeType() == TopAbs_SOLID:
+                BRepGProp.VolumeProperties_s(part, props)
+            else:
+                BRepGProp.SurfaceProperties_s(part, props)
+            c = props.CentreOfMass()
+            out.append((abs(float(props.Mass())), np.array([c.X(), c.Y(), c.Z()], float)))
+        except Exception as exc:
+            log.debug("body centroid failed: %s", exc)
+    out.sort(key=lambda t: -t[0])
+    return [c for _, c in out]
 
 
 # ----------------------------------------------------------------- API
@@ -393,13 +842,22 @@ def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
     lies in a planar face of the shape (it would return that face's outline,
     e.g. a boss footprint as a hole) or that gives zero closed loops is
     nudged ONCE by 1 % of ``depth_extent`` toward the shape's bbox centre.
+    A plane that is still empty but lies inside the shape's bbox (a gap
+    between bodies) is moved through the centroid of the largest body, then
+    the next ones (up to ``_RETRY_BODIES``; ``stats["retried_at_body"]``).
+    Each body is sectioned and cut on its own (see ``_section_loops`` and
+    ``_half_space_cut``), so an assembly with touching or overlapping
+    solids keeps nothing of the removed half.
     Returns a ``SectionView`` with ``loops`` (view 2D, outers CCW then their
     holes CW), ``body`` (``project_brep`` of the half behind the plane with
     ``exact`` / ``deflection`` / ``hidden``; None when there are no loops;
     ``hidden=False`` leaves out the hidden lines behind the cut, as ISO
     section views usually do) and ``stats``: nudged, nudge_mm, coplanar
-    (faces in the original plane), open_wires_dropped, loops_recovered,
-    dangling_segments_pruned, edges, wires, seconds, seconds_body.
+    (faces in the original plane), retried_at_body, retry_mm,
+    open_wires_dropped, loops_recovered, dangling_segments_pruned, edges,
+    wires, bodies_sectioned, kept_whole, dropped_whole, cut, common_retries,
+    half_space_excess_mm, half_space_excess_tol_mm, excess_bodies, seconds,
+    seconds_body.
     """
     from .brep_views import project_brep
 
@@ -427,7 +885,8 @@ def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
         nudged = True
         log.info("section plane lies in %d planar face(s); nudged by %.4g mm", coplanar, nudge_mm)
     try:
-        loops, lstats = _section_loops(shape, p, n, spec, deflection)
+        bodies = _Bodies(shape) if _SECTION_PER_BODY else None
+        loops, lstats = _section_loops(shape, p, n, spec, deflection, bodies=bodies)
     except Exception as exc:
         raise RuntimeError(f"section failed: {exc}") from exc
     loops = _normalise_loops(loops)
@@ -436,26 +895,56 @@ def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
         p = p + nudge_mm * n
         nudged = True
         try:
-            loops, lstats = _section_loops(shape, p, n, spec, deflection)
+            loops, lstats = _section_loops(shape, p, n, spec, deflection, bodies=bodies)
         except Exception as exc:
             raise RuntimeError(f"section failed after nudge: {exc}") from exc
         loops = _normalise_loops(loops)
         log.info("section plane had no closed loop; nudged by %.4g mm -> %d loop(s)",
                  nudge_mm, len(loops))
 
+    retried = False
+    retry_mm = 0.0
+    whole = _box_range(_fast_bbox(shape), p, n) if (not loops and _RETRY_AT_BODY) else None
+    if whole is not None and whole[0] < 0.0 < whole[1]:
+        # the plane runs through a gap inside the bbox (between bodies): move it
+        # through the centroid of the largest bodies, one after the other. A
+        # plane outside the bbox is the caller's choice and stays empty.
+        for c in _body_centroids(shape, bodies.parts if bodies else None)[:_RETRY_BODIES]:
+            d = float(np.dot(c - p, n))
+            if abs(d) <= max(_SIDE_TOL_MIN, 1e-9 * step):
+                continue
+            q = p + d * n
+            if _NUDGE_COPLANAR and _coplanar_face_count(shape, q, n):
+                q = q + _nudge_sign(shape, q, n) * step * n
+            try:
+                cand, cstats = _section_loops(shape, q, n, spec, deflection, bodies=bodies)
+            except Exception as exc:
+                log.debug("section retry at a body failed: %s", exc)
+                continue
+            cand = _normalise_loops(cand)
+            if cand:
+                retry_mm = float(np.dot(q - p, n))
+                p, loops, lstats, retried = q, cand, cstats, True
+                log.info("section plane moved %.4g mm to a body centroid -> %d loop(s)",
+                         retry_mm, len(loops))
+                break
+
     body = None
     t_body = 0.0
+    hs: dict = {}
     if loops:
         t1 = time.perf_counter()
         try:
-            kept = _half_space_cut(shape, p, n)
+            kept = _half_space_cut(shape, p, n, stats=hs, bodies=bodies)
         except Exception as exc:
             raise RuntimeError(f"section body cut failed: {exc}") from exc
         body = project_brep(kept, spec, exact=exact, deflection=deflection, hidden=bool(hidden))
         t_body = time.perf_counter() - t1
 
     stats = dict(lstats)
+    stats.update(hs)
     stats.update(nudged=nudged, nudge_mm=nudge_mm, coplanar=int(coplanar), loops=len(loops),
+                 retried_at_body=retried, retry_mm=retry_mm,
                  seconds=round(time.perf_counter() - t0, 6), seconds_body=round(t_body, 6))
     marker = {"front": "top", "back": "top", "top": "front", "bottom": "front",
               "right": "front", "left": "front"}.get(spec.name, "top")
@@ -463,4 +952,4 @@ def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
                        marker_view=marker, stats=stats)
 
 
-__all__ = ["choose_section_plane_brep", "section_brep"]
+__all__ = ["choose_section_plane_brep", "choose_section_plane_brep_info", "section_brep"]

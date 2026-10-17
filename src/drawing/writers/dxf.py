@@ -67,9 +67,12 @@ primitives are kept.
 """
 from __future__ import annotations
 
+import datetime
+import hashlib
 import logging
 import math
 import os
+import re
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -78,8 +81,25 @@ from ..model import (Arc, Circle, Dimension, HatchLines, LineStyle, Polygon, Pol
                      Sheet, Text)
 from ..style import DEFAULT_STYLE, SheetStyle
 from . import CAP_HEIGHT, arc_span, clean_text, valid_item
+from .svg import polyline_points
 
 log = logging.getLogger(__name__)
+
+# ezdxf scans the system fonts through fontTools when its font cache is missing
+# (a fresh USERPROFILE in the sandbox); one malformed system font then logs an
+# ERROR that ends up in every report's stderr_tail. The message is about a
+# font this module never uses (text is written as plain TEXT entities).
+logging.getLogger("fontTools").setLevel(logging.CRITICAL)
+
+LWPOLYLINE_PLINEGEN = 128      # LWPOLYLINE flag: continuous linetype pattern over vertices
+_DATE_VARS = (b"$TDCREATE", b"$TDUCREATE", b"$TDUPDATE", b"$TDUUPDATE")
+_GUID_VARS = (b"$FINGERPRINTGUID", b"$VERSIONGUID")
+_EZDXF_MARKER = re.compile(rb"^\d+\.\d+\.\d+\S* @ \d{4}-\d\d-\d\dT\S*$")
+# DXF/AutoCAD Julian date of 2000-01-01 00:00. DXF days start at midnight
+# (ezdxf.tools.juliandate.juliandate(datetime(2000, 1, 1)) == 2451545.0);
+# the astronomical 2451544.5 (days from noon) decodes as 12:00 the day before.
+_JD_2000 = 2451545.0
+_EZDXF_MARKER_NAMES = (b"CREATED_BY_EZDXF", b"WRITTEN_BY_EZDXF")
 
 # name, ACI colour, linetype, lineweight (1/100 mm)
 LAYERS: Dict[LineStyle, Tuple[str, int, str, int]] = {
@@ -318,8 +338,10 @@ def _add_item(msp, item, sheet_style: SheetStyle) -> int:
         msp.add_line(tuple(map(float, item.a)), tuple(map(float, item.b)), dxfattribs=attribs)
         return 1
     if isinstance(item, Polyline):
-        pts = [tuple(p) for p in np.asarray(item.points, float).reshape(-1, 2)]
-        msp.add_lwpolyline(pts, close=bool(item.closed), dxfattribs=attribs)
+        pts = [tuple(map(float, p)) for p in polyline_points(item)]
+        # PLINEGEN: the linetype pattern runs continuously over all vertices
+        msp.add_lwpolyline(pts, close=bool(item.closed),
+                           dxfattribs=dict(attribs, flags=LWPOLYLINE_PLINEGEN))
         return 1
     if isinstance(item, Circle):
         msp.add_circle(tuple(map(float, item.center)), float(item.radius), dxfattribs=attribs)
@@ -387,16 +409,125 @@ def _add_dimension(msp, dim: Dimension, override: dict) -> bool:
     return True
 
 
-def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE) -> dict:
+def _drawing_date(date, sheet: Sheet) -> datetime.date:
+    """The date stamped into the DXF: ``date``, else ``sheet.meta["date"]``, else today."""
+    for cand in (date, sheet.meta.get("date") if isinstance(sheet.meta, dict) else None):
+        if cand is None:
+            continue
+        if isinstance(cand, datetime.datetime):
+            return cand.date()
+        if isinstance(cand, datetime.date):
+            return cand
+        try:
+            return datetime.date.fromisoformat(str(cand).strip()[:10])
+        except ValueError:
+            log.debug("dxf: date %r is not ISO YYYY-MM-DD; ignored", cand)
+    return datetime.date.today()
+
+
+def _sort_classes(doc) -> None:
+    """Register the CLASSES section entries now, in a fixed order.
+
+    ezdxf adds the classes of the entity types in use at save time by
+    iterating a ``set`` of type names, so their order follows the string
+    hash seed (measured: 8 interpreters with PYTHONHASHSEED 1..8 wrote two
+    different files, LAYOUT and ACDBPLACEHOLDER swapped). Registered here
+    and sorted, the save adds nothing new and the order is stable.
+    """
+    try:
+        doc.classes.add_required_classes(doc.dxfversion)
+        ordered = sorted(doc.classes.classes.items(), key=lambda kv: tuple(map(str, kv[0])))
+        doc.classes.classes.clear()
+        doc.classes.classes.update(ordered)
+    except Exception as exc:  # cosmetic (reproducibility only)
+        log.debug("dxf: could not sort the CLASSES section: %s", exc)
+
+
+def _guid(digest: bytes, salt: bytes) -> str:
+    h = hashlib.sha256(salt + digest).hexdigest().upper()
+    return "{%s-%s-%s-%s-%s}" % (h[:8], h[8:12], h[12:16], h[16:20], h[20:32])
+
+
+def stabilise_dxf(path: str, date: datetime.date, version: str = "") -> str:
+    """Make a written ASCII DXF reproducible; returns the ``$FINGERPRINTGUID``.
+
+    ezdxf stamps the current time into ``$TDCREATE``/``$TDUPDATE`` (and the
+    UTC twins) and into its ``CREATED_BY_EZDXF``/``WRITTEN_BY_EZDXF``
+    markers, and writes random ``$FINGERPRINTGUID``/``$VERSIONGUID``. This
+    rewrites the dates to ``date`` at 00:00 and both GUIDs to values derived
+    from a SHA-256 of the file with those volatile values blanked, so the
+    same sheet on the same date gives byte-identical files (measured: two
+    interpreters with different hash seeds differed in exactly these 6
+    values, handles and object order were already stable). Group codes and
+    every other value are left untouched.
+    """
+    with open(path, "rb") as fh:
+        lines = fh.read().split(b"\n")
+    n = len(lines)
+    targets: Dict[int, str] = {}           # line index -> kind ("date" | guid var | "marker")
+    # handles of the DICTIONARYVAR objects the ezdxf marker names point to
+    # (dictionary entry: 3 <name> / 350|360 <handle>)
+    marker_handles = set()
+    for i in range(0, n - 3, 2):
+        if (lines[i].strip() == b"3" and lines[i + 1].rstrip(b"\r") in _EZDXF_MARKER_NAMES
+                and lines[i + 2].strip() in (b"350", b"360")):
+            marker_handles.add(lines[i + 3].strip().upper())
+    obj_type, obj_handle = b"", b""
+    for i in range(0, n - 1, 2):
+        code = lines[i].strip()
+        val = lines[i + 1].rstrip(b"\r")
+        if code == b"0":
+            obj_type, obj_handle = val, b""
+        elif code == b"5":
+            obj_handle = val.strip().upper()
+        if code == b"9" and i + 3 < n:
+            if val in _DATE_VARS:
+                targets[i + 3] = "date"
+            elif val in _GUID_VARS:
+                targets[i + 3] = val.decode("ascii")
+        # only the group-1 value of the marker DICTIONARYVARs; a TEXT whose
+        # content happens to look like "x.y.z @ <iso time>" stays untouched
+        if (code == b"1" and obj_type == b"DICTIONARYVAR" and obj_handle in marker_handles
+                and _EZDXF_MARKER.match(val)):
+            targets[i + 1] = "marker"
+    h = hashlib.sha256()
+    for i, ln in enumerate(lines):
+        h.update(b"" if i in targets else ln)
+        h.update(b"\n")
+    digest = h.digest()
+    jd = repr(_JD_2000 + float((date - datetime.date(2000, 1, 1)).days)).encode("ascii")
+    marker = f"{version} @ {date.isoformat()}T00:00:00+00:00".encode("ascii")
+    values = {"date": jd, "marker": marker,
+              "$FINGERPRINTGUID": _guid(digest, b"fingerprint").encode("ascii"),
+              "$VERSIONGUID": _guid(digest, b"version").encode("ascii")}
+    for i, kind in targets.items():
+        cr = b"\r" if lines[i].endswith(b"\r") else b""
+        lines[i] = values[kind] + cr
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(b"\n".join(lines))
+    os.replace(tmp, path)
+    return values["$FINGERPRINTGUID"].decode("ascii")
+
+
+def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE, *,
+              date=None) -> dict:
     """Write ``sheet`` as an R2010 DXF in model space (sheet mm).
 
     Returns ``{"bytes", "entities", "layers": {name: count}, "dimensions",
     "dimensions_skipped", "dimension_items_replaced", "dimension_match",
-    "skipped", "audit_errors", "audit_fixes"}``; ``dimension_match`` is
-    ``"exact"`` (``meta["dimension_items"]``) or ``"geometric"``; ``skipped``
-    counts skipped items plus skipped dimensions; the audit numbers come from
-    re-reading the written file.
+    "skipped", "audit_errors", "audit_fixes", "fingerprint_guid"}``;
+    ``dimension_match`` is ``"exact"`` (``meta["dimension_items"]``) or
+    ``"geometric"``; ``skipped`` counts skipped items plus skipped
+    dimensions; the audit numbers come from re-reading the written file.
+
+    Reproducible output: ``date`` (``datetime.date`` or ISO ``YYYY-MM-DD``;
+    default ``sheet.meta["date"]``, the title-block date, else today) is
+    stamped into the header dates, and the GUIDs are derived from the
+    content (``stabilise_dxf``), so the same sheet and date give the same
+    bytes.
     """
+    logging.getLogger("fontTools").setLevel(logging.CRITICAL)
     import ezdxf
 
     doc = ezdxf.new("R2010", setup=True)
@@ -460,7 +591,14 @@ def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE) 
         doc.set_modelspace_vport(height=H * 1.05, center=(W / 2.0, H / 2.0))
     except Exception as exc:  # cosmetic only
         log.debug("dxf: set_modelspace_vport failed: %s", exc)
+    _sort_classes(doc)
     doc.saveas(path)
+    fingerprint = None
+    try:
+        fingerprint = stabilise_dxf(path, _drawing_date(date, sheet),
+                                    str(getattr(ezdxf, "__version__", "")))
+    except Exception as exc:  # the file stays valid, only not reproducible
+        log.warning("dxf: could not fix the dates/GUIDs for reproducibility: %s", exc)
 
     layers: Dict[str, int] = {}
     entities = 0
@@ -481,4 +619,5 @@ def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE) 
             "dimension_items_replaced": replaced,
             "dimension_match": "exact" if exact is not None else "geometric",
             "skipped": skipped + dims_skipped,
-            "audit_errors": audit_errors, "audit_fixes": audit_fixes}
+            "audit_errors": audit_errors, "audit_fixes": audit_fixes,
+            "fingerprint_guid": fingerprint}

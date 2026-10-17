@@ -33,6 +33,9 @@ PROJECTIONS = ("first", "third")
 ORIENTS = ("auto", "fixed")
 UPS = ("z", "y")
 STL_TO_STEP = ("auto", "faceted", "nurbs", "off")
+#: ``stl_unit`` choices (STL carries no unit) and their factor to mm.
+STL_UNITS = ("mm", "cm", "m", "in")
+STL_UNIT_FACTORS = {"mm": 1.0, "cm": 10.0, "m": 1000.0, "in": 25.4}
 
 MIN_TIMEOUT_S = 15.0
 MIN_MEMORY_MB = 256
@@ -41,7 +44,7 @@ _TUPLE_FIELDS = ("formats", "views")
 _FLOAT_FIELDS = ("text_height", "facet_smooth_angle_deg", "feature_angle_deg",
                  "hlr_time_budget_s", "classifier_threshold", "max_input_mb", "timeout_s")
 _INT_FIELDS = ("max_hole_callouts", "faceted_max_triangles", "raster_px", "exact_hlr_max_faces",
-               "max_triangles", "memory_limit_mb", "output_cap_mb")
+               "max_triangles", "memory_limit_mb", "output_cap_mb", "max_hidden_primitives")
 _BOOL_FIELDS = ("hidden_lines", "hole_positions", "quiet")
 
 
@@ -74,6 +77,15 @@ class DrawingOptions:
     title: Optional[str] = None
     owner: str = ""
     quiet: bool = False
+    # QA round 1: the unit of an STL file (None = not given: read as mm and
+    # flagged ``unit_assumed_mm``); the mesh is scaled by STL_UNIT_FACTORS
+    stl_unit: Optional[str] = None
+    # raw hidden primitives per B-rep view above which the hidden lines of
+    # that view are dropped (flag ``hidden_lines_dropped``); None = no cap.
+    # Measured raw counts: at most 1393 per view on the QA corpus parts
+    # (NIST CTC/FTC, exact HLR), 185k-193k on the 10665-face RC buggy (poly
+    # HLR), whose hidden clean-up alone cost about 14 s per view
+    max_hidden_primitives: Optional[int] = 20_000
 
     def __post_init__(self):
         # lists (from JSON or callers) become tuples so options stay hashable-ish
@@ -148,6 +160,10 @@ class DrawingOptions:
             bad("title", "must be a string or null")
         if not isinstance(self.owner, str):
             bad("owner", "must be a string")
+        if self.stl_unit is not None and self.stl_unit not in STL_UNITS:
+            bad("stl_unit", "must be null or one of " + ", ".join(STL_UNITS))
+        if self.max_hidden_primitives is not None:
+            number("max_hidden_primitives", 0, integer=True)
 
     # -------------------------------------------------------------- JSON --
     def to_json(self) -> str:

@@ -718,3 +718,199 @@ def test_empty_sheet_and_bad_items(tmp_path):
         assert r6["entities"] == 0
         aud = ezdxf.readfile(str(tmp_path / "e.dxf")).audit()
         assert len(aud.errors) == 0 and len(aud.fixes) == 0
+
+
+# --------------------------------------------------------------------------- QA round 1 (F5)
+
+_DXF_DATE_VARS = {"$TDCREATE", "$TDUCREATE", "$TDUPDATE", "$TDUUPDATE"}
+_GUID_RE = re.compile(r"^\{[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\}$")
+
+
+def _dxf_pairs(path):
+    lines = open(path, encoding="utf-8").read().splitlines()
+    return [(lines[i].strip(), lines[i + 1]) for i in range(0, len(lines) - 1, 2)]
+
+
+def _dxf_header_value(pairs, name):
+    for i, (code, val) in enumerate(pairs):
+        if code == "9" and val == name:
+            return pairs[i + 1][1]
+    raise KeyError(name)
+
+
+def _mask_dates_only(path):
+    """Mask ONLY the date: the four header dates and ezdxf's 'version @ timestamp' marker."""
+    out, mask_next = [], False
+    for code, val in _dxf_pairs(path):
+        if mask_next or re.match(r"^\d+\.\d+\.\d+ @ \d{4}-\d\d-\d\dT", val):
+            val = "<date>"
+        mask_next = code == "9" and val in _DXF_DATE_VARS
+        out.append((code, val))
+    return out
+
+
+@needs_ezdxf
+def test_dxf_reproducible_masking_only_the_date(tmp_path):
+    """Issue 30: GUIDs are derived from the content, dates from the sheet date."""
+    sheet = make_sheet()
+    write_dxf(sheet, str(tmp_path / "a.dxf"))
+    write_dxf(sheet, str(tmp_path / "b.dxf"))
+    a, b = _mask_dates_only(str(tmp_path / "a.dxf")), _mask_dates_only(str(tmp_path / "b.dxf"))
+    assert sum(1 for _, v in a if v == "<date>") >= 4          # the mask hits the dates
+    assert a == b                                               # GUIDs and order are stable
+    pa = _dxf_pairs(str(tmp_path / "a.dxf"))
+    fp, vg = _dxf_header_value(pa, "$FINGERPRINTGUID"), _dxf_header_value(pa, "$VERSIONGUID")
+    assert _GUID_RE.match(fp) and _GUID_RE.match(vg) and fp != vg
+    # the GUIDs depend on the drawing content (not a constant)
+    sheet2 = make_sheet()
+    sheet2.items.append(Segment((30.0, 30.0), (40.0, 40.0), LineStyle.VISIBLE))
+    write_dxf(sheet2, str(tmp_path / "c.dxf"))
+    pc = _dxf_pairs(str(tmp_path / "c.dxf"))
+    assert _dxf_header_value(pc, "$FINGERPRINTGUID") != fp
+    # an explicit date gives byte-identical files and the Julian date of that day
+    write_dxf(sheet, str(tmp_path / "d1.dxf"), date="2026-01-02")
+    write_dxf(sheet, str(tmp_path / "d2.dxf"), date="2026-01-02")
+    assert (tmp_path / "d1.dxf").read_bytes() == (tmp_path / "d2.dxf").read_bytes()
+    import datetime as _dt
+    from ezdxf.tools.juliandate import calendardate   # independent decoder (DXF days start at 00:00)
+    pd1 = _dxf_pairs(str(tmp_path / "d1.dxf"))
+    for var in ("$TDCREATE", "$TDUCREATE", "$TDUPDATE", "$TDUUPDATE"):
+        decoded = calendardate(float(_dxf_header_value(pd1, var)))
+        assert decoded == _dt.datetime(2026, 1, 2), (var, decoded)
+    # the sheet's own title-block date is used when no date is passed
+    sheet.meta["date"] = "2026-01-02"
+    write_dxf(sheet, str(tmp_path / "d3.dxf"))
+    assert (tmp_path / "d3.dxf").read_bytes() == (tmp_path / "d1.dxf").read_bytes()
+
+
+@needs_ezdxf
+def test_dxf_reproducible_across_processes(tmp_path):
+    """Issue 30: interpreters with other hash seeds write the same bytes.
+
+    Seeds 1 and 4 are a measured pair: without the CLASSES sort they wrote
+    two different files (LAYOUT / ACDBPLACEHOLDER swapped; ezdxf iterates a
+    set of type names).
+    """
+    sheet = make_sheet()
+    sheet.meta["date"] = "2026-03-04"
+    write_dxf(sheet, str(tmp_path / "here.dxf"))
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    blobs = []
+    for seed in ("1", "4"):
+        out = str(tmp_path / f"seed{seed}.dxf")
+        code = ("import sys; sys.path.insert(0, %r); sys.path.insert(0, %r)\n"
+                "from test_drawing_writers import make_sheet\n"
+                "from src.drawing.writers import write_dxf\n"
+                "s = make_sheet(); s.meta['date'] = '2026-03-04'\n"
+                "write_dxf(s, %r)\n" % (repo, os.path.join(repo, "tests"), out))
+        env = dict(os.environ, PYTHONHASHSEED=seed, PYTHONDONTWRITEBYTECODE="1")
+        r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, timeout=120)
+        assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+        blobs.append(open(out, "rb").read())
+    assert blobs[0] == blobs[1] == (tmp_path / "here.dxf").read_bytes()
+
+
+def test_fonttools_logger_silenced_by_dxf_writer():
+    """Issue 20: fontTools' ERROR about a malformed system font never reaches stderr."""
+    import logging
+    import src.drawing.writers.dxf  # noqa: F401
+    assert logging.getLogger("fontTools").getEffectiveLevel() >= logging.CRITICAL
+    assert logging.getLogger().getEffectiveLevel() < logging.CRITICAL   # only fontTools
+
+
+def _poly_sheet():
+    t = np.linspace(0.0, np.pi, 40)
+    arc_pts = np.column_stack([100.0 + 30.0 * np.cos(t), 100.0 + 30.0 * np.sin(t)])
+    square_rep = np.array([[20.0, 20.0], [60.0, 20.0], [60.0, 60.0], [20.0, 60.0], [20.0, 20.0]])
+    tri = np.array([[150.0, 20.0], [190.0, 20.0], [170.0, 50.0]])
+    two = np.array([[20.0, 150.0], [80.0, 160.0]])
+    hatch_loops = _hatch_square()
+    hatch_free = HatchLines(np.array([[[200.0, 150.0], [240.0, 150.0]],
+                                      [[200.0, 153.0], [240.0, 153.0]],
+                                      [[200.0, 156.0], [240.0, 156.0]]]), [])
+    hatch_one = HatchLines(np.array([[[300.0, 20.0], [340.0, 60.0]]]),
+                           [np.array([[300.0, 20.0], [340.0, 20.0], [340.0, 60.0]])])
+    items = [Polyline(arc_pts, False, LineStyle.HIDDEN),        # open, many chords
+             Polyline(square_rep, True, LineStyle.VISIBLE),     # closed, end point repeated
+             Polyline(tri, True, LineStyle.SECTION),            # closed, no repeat
+             Polyline(two, False, LineStyle.VISIBLE),           # open, 2 points
+             hatch_loops, hatch_free, hatch_one]
+    return Sheet("A3", 420.0, 297.0, items=items, meta={"scale": 1.0})
+
+
+def test_svg_polylines_open_closed_and_hatches(tmp_path):
+    sheet = _poly_sheet()
+    res = write_svg(sheet, str(tmp_path / "p.svg"))
+    root = ET.parse(str(tmp_path / "p.svg")).getroot()
+    plines = list(root.iter(SVG_NS + "polyline"))
+    pgons = [e for e in root.iter(SVG_NS + "polygon") if e.get("fill") == "none"]
+    assert len(plines) == 2 and len(pgons) == 2
+    hidden = [e for e in plines if e.get("stroke-dasharray")]
+    assert len(hidden) == 1 and len(hidden[0].get("points").split()) == 40   # ONE element
+    npts = sorted(len(e.get("points").split()) for e in pgons)
+    assert npts == [3, 4]               # the repeated closing point is not written twice
+    paths = list(root.iter(SVG_NS + "path"))
+    n_segs = sorted(p.get("d").count("M ") for p in paths)
+    assert n_segs == sorted([len(sheet.items[4].segments), 3, 1])
+    assert res["elements"] == 7 and res["skipped"] == 0
+
+
+def test_pdf_polylines_open_closed_and_hatches(tmp_path):
+    sheet = _poly_sheet()
+    write_pdf(sheet, str(tmp_path / "p.pdf"), compress=False)
+    data = (tmp_path / "p.pdf").read_bytes()
+    ops = _pdf_content(data, _pdf_objects(data)).decode("latin-1").split("\n")
+    closed = [o for o in ops if o.endswith(" h S")]
+    assert sorted(o.count(" l") for o in closed) == [2, 3]   # triangle, square without repeat
+    long_ = [o for o in ops if o.count(" l") == 39]
+    assert len(long_) == 1 and long_[0].endswith(" S") and not long_[0].endswith("h S")
+    i = ops.index(long_[0])
+    dash = [o for o in ops[:i] if o.endswith(" d")][-1]
+    assert dash.split("[")[1].split("]")[0].strip() != ""     # dashed state before the hidden path
+    n_hatch_paths = sum(1 for o in ops if o.endswith(" S") and o.count(" m ") >= 1
+                        and o.count(" m ") == o.count(" l") and o.count(" m ") in
+                        (len(sheet.items[4].segments), 3, 1))
+    assert n_hatch_paths >= 3
+
+
+@needs_ezdxf
+def test_dxf_polylines_open_closed_plinegen_and_hatches(tmp_path):
+    import ezdxf
+    sheet = _poly_sheet()
+    res = write_dxf(sheet, str(tmp_path / "p.dxf"))
+    doc = ezdxf.readfile(str(tmp_path / "p.dxf"))
+    aud = doc.audit()
+    assert len(aud.errors) == 0 and len(aud.fixes) == 0
+    msp = doc.modelspace()
+    lw = list(msp.query("LWPOLYLINE"))
+    assert len(lw) == 4
+    by_n = {len(e): e for e in lw}
+    assert sorted(by_n) == [2, 3, 4, 40]          # square written with 4 vertices, not 5
+    assert by_n[4].closed and by_n[3].closed and not by_n[40].closed and not by_n[2].closed
+    hidden = by_n[40]
+    assert hidden.dxf.layer == "HIDDEN"
+    # PLINEGEN (flag 128): the DASHED pattern runs over the whole polyline instead of
+    # restarting at every chord vertex (a 40-chord curve would otherwise look solid)
+    assert hidden.dxf.flags & 128
+    assert len(list(msp.query("HATCH"))) == 2      # hatch with loops + the one-segment hatch
+    assert len(list(msp.query("LINE[layer=='HATCH']"))) == 3   # loop-less hatch -> lines
+    assert res["skipped"] == 0
+
+
+@needs_ezdxf
+def test_dxf_stabilise_leaves_marker_looking_text_alone(tmp_path):
+    """Review F5: only the ezdxf DICTIONARYVAR markers are rewritten, not a TEXT
+    entity whose content happens to look like ``x.y.z @ <iso time>``."""
+    import ezdxf
+    lookalike = "1.2.3 @ 2019-05-06T07:08:09+00:00"
+    sheet = make_sheet()
+    sheet.items.append(Text((60.0, 30.0), lookalike, 3.5, anchor="start"))
+    write_dxf(sheet, str(tmp_path / "t.dxf"), date="2026-01-02")
+    doc = ezdxf.readfile(str(tmp_path / "t.dxf"))
+    texts = [e.dxf.text for e in doc.modelspace().query("TEXT")]
+    assert lookalike in texts                                   # the user text is intact
+    # precondition / no-op guard: the real markers were still stamped with the date
+    raw = (tmp_path / "t.dxf").read_text(encoding="utf-8")
+    markers = re.findall(r"^\d+\.\d+\.\d+\S* @ \d{4}-\d\d-\d\dT\S*$", raw, re.M)
+    assert len(markers) == 3                                    # 2 ezdxf markers + the text
+    assert sum(1 for m in markers if "@ 2026-01-02T00:00:00+00:00" in m) == 2

@@ -504,6 +504,126 @@ def test_project_mesh_organic_torus_top_two_loops():
     assert pv.hidden == []
 
 
+# ------------------------------------- QA round 1 fixes (task F1-views-perf)
+
+def _plate_over_cylinder() -> trimesh.Trimesh:
+    """60x60x5 plate on top of a 48-gon cylinder r 10: in the top view both rims are hidden."""
+    plate = trimesh.creation.box(extents=(60.0, 60.0, 5.0))
+    plate.apply_translation((0.0, 0.0, 2.5))
+    cyl = trimesh.creation.cylinder(radius=10.0, height=20.0, sections=48)
+    cyl.apply_translation((0.0, 0.0, -10.0))
+    return trimesh.util.concatenate([plate, cyl])
+
+
+def _noisy_sphere(seed: int = 0) -> trimesh.Trimesh:
+    m = trimesh.creation.icosphere(subdivisions=4, radius=20.0)
+    m.vertices = m.vertices + np.random.default_rng(seed).normal(0.0, 0.002 * 20.0, m.vertices.shape)
+    return m
+
+
+def _prim_length(p, px):
+    from src.drawing.geometry2d import primitives_to_segments
+    s = primitives_to_segments([p], px)
+    return float(np.linalg.norm(s[:, 1] - s[:, 0], axis=1).sum())
+
+
+def test_project_mesh_hidden_circle_is_one_polyline(monkeypatch):
+    """Issue 6: the 48 hidden rim chords were 48 Segments (no dash pattern)."""
+    from src.drawing import mesh_views
+    pv = project_mesh(_plate_over_cylinder(), VIEWS["top"], raster_px=1024, feature_angle_deg=30.0,
+                      organic=False)
+    polys = [p for p in pv.hidden if isinstance(p, Polyline)]
+    assert len(pv.hidden) <= 2 and polys
+    assert max(len(p.points) for p in polys) >= 40
+    rad = np.linalg.norm(np.vstack([p.points for p in polys]), axis=1)
+    assert np.allclose(rad, 10.0, atol=3 * pv.stats["px"])
+    assert len(_segments(pv.visible)) == 4                 # plate outline stays 4 Segments
+    # negative control: without chaining the circle is dozens of chord Segments
+    monkeypatch.setattr(mesh_views, "_DASH_PERIOD_PAPER_MM", 0.0)
+    pv0 = project_mesh(_plate_over_cylinder(), VIEWS["top"], raster_px=1024, feature_angle_deg=30.0,
+                       organic=False)
+    assert len(_segments(pv0.hidden)) >= 40
+
+
+def test_project_mesh_organic_torus_side_has_hidden_inner_silhouettes(monkeypatch):
+    """Issue 13: organic meshes drew no interior or hidden silhouettes."""
+    from src.drawing import mesh_views
+    torus = trimesh.creation.torus(10.0, 3.0)
+    pv = project_mesh(torus, VIEWS["front"], raster_px=1024, feature_angle_deg=30.0, organic=True)
+    assert pv.stats["interior_silhouettes_omitted"] is False
+    assert len(pv.hidden) > 0
+    # the hidden inner silhouette lies inside the hole's span |x| < 7 + 3
+    pts = np.vstack([np.asarray(p.points if isinstance(p, Polyline) else [p.a, p.b], float)
+                     for p in pv.hidden])
+    assert np.abs(pts[:, 0]).max() < 10.0
+    # the outline is still one closed loop and no silhouette run duplicates it
+    loops = [p for p in pv.visible if isinstance(p, Polyline) and p.closed]
+    assert len(loops) == 1 and len(pv.visible) == 1
+    # skipping silhouettes is disclosed (and then nothing is hidden)
+    monkeypatch.setattr(mesh_views, "_MAX_ORGANIC_SILHOUETTE_FACES", 0)
+    pv0 = project_mesh(torus, VIEWS["front"], raster_px=1024, feature_angle_deg=30.0, organic=True)
+    assert pv0.stats["interior_silhouettes_omitted"] is True and pv0.hidden == []
+
+
+def test_project_mesh_noisy_sphere_has_no_noise_fragments(monkeypatch):
+    """Issue 24: crease flicker and noise gave fragments shorter than 2 px and a staircase outline."""
+    from src.drawing import mesh_views
+    m = _noisy_sphere()
+    pv = project_mesh(m, VIEWS["front"], raster_px=1024, feature_angle_deg=30.0, organic=False)
+    px = pv.stats["px"]
+    assert len(pv.visible) > 10                            # precondition: silhouettes drawn
+    assert not [p for p in pv.visible + pv.hidden if _prim_length(p, px) < 2 * px]
+    org = project_mesh(m, VIEWS["front"], raster_px=1024, feature_angle_deg=30.0, organic=True)
+    assert len(org.visible) == 1                           # outline only, fold noise removed
+    assert len(org.visible[0].points) < 120                # was 171 with the pixel staircase
+    # negative control: without the chain-length filter and hysteresis fragments come back
+    monkeypatch.setattr(mesh_views, "_MIN_CHAIN_PX", 0.0)
+    orig = mesh_views.edge_visibility
+    monkeypatch.setattr(mesh_views, "edge_visibility",
+                        lambda s, b, g, tol_px=1.5, nbhd=1: orig(s, b, g, tol_px=tol_px, nbhd=nbhd,
+                                                                 hysteresis=False))
+    pv0 = project_mesh(m, VIEWS["front"], raster_px=1024, feature_angle_deg=30.0, organic=False)
+    assert [p for p in pv0.visible + pv0.hidden if _prim_length(p, px) < 2 * px]
+
+
+def test_hysteresis_absorbs_single_sample_flips():
+    from src.drawing.mesh_views import _hysteresis
+    vis = np.array([1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0], bool)
+    rep = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2])
+    out = _hysteresis(vis, rep)
+    assert out[:5].all()                                  # inner single flip absorbed
+    assert not out[5:10].any()
+    # segment 2: two samples of each state is a real switch, kept
+    assert out[10:14].tolist() == [True, True, False, False]
+    # an end sample alone against the next two flips
+    out2 = _hysteresis(np.array([0, 1, 1, 1, 1, 0], bool), np.zeros(6, int))
+    assert out2.all()
+    assert (out != vis).sum() == 2                         # exactly the two lone samples changed
+
+
+def test_mask_outline_smoothing_removes_the_staircase():
+    yy, xx = np.mgrid[0:200, 0:200]
+    mask = (yy - 0.37 * xx > 20) & (yy - 0.37 * xx < 120) & (xx > 20) & (xx < 180)
+    grid = {"x0": 0.0, "y0": 0.0, "px": 1.0, "W": 200, "H": 200}
+    raw = mask_outline(mask, grid, smooth_px=0.0)
+    smooth = mask_outline(mask, grid)
+    assert len(raw) == len(smooth) == 1
+    assert len(raw[0]) > 12                               # precondition: staircase kept
+    assert len(smooth[0]) <= 8                            # a quadrilateral, few extra corners
+    assert abs(polygon_area(smooth[0])) == pytest.approx(abs(polygon_area(raw[0])), rel=0.03)
+
+
+def test_project_mesh_time_budget_drops_hidden():
+    mesh = _two_boxes(True)
+    on = project_mesh(mesh, VIEWS["front"], raster_px=512, feature_angle_deg=30.0, organic=False)
+    assert on.hidden and on.stats["hidden_dropped"] is False          # precondition
+    pv = project_mesh(mesh, VIEWS["front"], raster_px=512, feature_angle_deg=30.0, organic=False,
+                      time_budget_s=1e-9)
+    assert pv.hidden == [] and pv.stats["hidden_dropped"] is True
+    assert pv.stats["hidden_dropped_reason"] == "time_budget"
+    assert len(pv.visible) == len(on.visible)
+
+
 # ----------------------------------------------------------------- sections
 
 def test_choose_section_plane_mesh_auto_and_modes():
@@ -615,3 +735,539 @@ def test_section_body_cap_hides_material_behind_cut(monkeypatch):
                        organic=False, depth_extent=40.0)
     px2 = sv2.body.stats["px"]
     assert len(_cavity_wall_segments(sv2.body.visible, px2)) == 2
+
+
+# ===================================================== QA round 1 (task F4)
+
+def _edge_sharing_boxes(inverted: bool = False) -> trimesh.Trimesh:
+    """Two 10 mm cubes sharing exactly one vertical edge (x = y = 10).
+
+    After the vertex merge that edge carries four faces: one non-manifold
+    edge, zero boundary edges. ``inverted`` reverses every face.
+    """
+    a = _box((10.0, 10.0, 10.0), (5.0, 5.0, 5.0))
+    b = _box((10.0, 10.0, 10.0), (15.0, 15.0, 5.0))
+    m = trimesh.util.concatenate([a, b])
+    faces = m.faces[:, ::-1] if inverted else m.faces
+    return trimesh.Trimesh(m.vertices.copy(), np.ascontiguousarray(faces), process=True)
+
+
+def test_census_components_join_across_nonmanifold_edges():
+    # QA issue 11: face_adjacency skips non-manifold edge pairs and split one body
+    m = _edge_sharing_boxes()
+    old = trimesh.graph.connected_components(m.face_adjacency, nodes=np.arange(len(m.faces)),
+                                             min_len=1)
+    assert len(old) == 2                                  # precondition: the old count
+    c = mesh_census(m)
+    assert c["nonmanifold_edges"] == 1 and c["boundary_edges"] == 0
+    assert c["components"] == 1
+    assert c["manifold_components"] == 2
+    assert c["closed_components"] == 1 and c["open_components"] == 0
+    assert mesh_census(_box())["components"] == 1
+    far = trimesh.util.concatenate([_box(), _box(offset=(100.0, 0.0, 0.0))])
+    cf = mesh_census(far)
+    assert cf["components"] == 2 and cf["manifold_components"] == 2
+
+
+def test_census_nonmanifold_inside_out_volume_and_warning(tmp_path):
+    # QA issue 18: 0 boundary edges + non-manifold: the volume and the
+    # inverted check used to be skipped because is_watertight is False
+    m = _edge_sharing_boxes(inverted=True)
+    assert not m.is_watertight                            # precondition
+    assert float(m.volume) == pytest.approx(-2000.0)      # precondition: inside out
+    c = mesh_census(m)
+    assert c["boundary_edges"] == 0 and c["nonmanifold_edges"] == 1
+    assert c["inverted"] is True
+    assert c["volume_mm3"] == pytest.approx(2000.0, rel=1e-9)
+    assert c["volume_approximate"] is True
+    ok = mesh_census(_edge_sharing_boxes(inverted=False))
+    assert ok["inverted"] is False and ok["volume_mm3"] == pytest.approx(2000.0, rel=1e-9)
+    p = tmp_path / "nm.stl"
+    m.export(str(p))
+    mm = load_mesh_model(str(p))
+    assert mm.census["inverted"] is True
+    assert "mesh is not watertight: 0 boundary edge(s), 1 non-manifold edge(s)" in mm.warnings
+    assert any("inside out" in w for w in mm.warnings)
+    from src.drawing.mesh_load import watertight_detail
+    assert watertight_detail(c) == "0 boundary edge(s), 1 non-manifold edge(s)"
+    # an open mesh still has no volume (QA issue 28)
+    open_box = trimesh.Trimesh(_box().vertices.copy(), _box().faces[1:].copy())
+    co = mesh_census(open_box)
+    assert co["volume_mm3"] is None and co["volume_approximate"] is False
+
+
+def test_census_volume_repaired_per_component():
+    # QA issue 12: the raw signed sum of a badly wound multi-body mesh is meaningless
+    a = _box((20.0, 10.0, 10.0))
+    b = _box((10.0, 10.0, 10.0), (50.0, 0.0, 0.0))
+    b.invert()                                            # the smaller body inside out
+    two = trimesh.util.concatenate([a, b])
+    assert two.is_watertight and two.is_winding_consistent        # precondition
+    assert abs(float(two.volume)) == pytest.approx(1000.0)        # precondition: 2000 - 1000
+    c = mesh_census(two)
+    assert c["volume_mm3"] == pytest.approx(3000.0, rel=1e-9)
+    assert c["volume_repaired"] is True and c["volume_source"] == "winding_repaired"
+    assert c["volume_raw_mm3"] == pytest.approx(1000.0)
+    assert c["inverted"] is False                         # the dominant body is outward
+
+    # winding conflicts inside one shell: two faces of a cube reversed
+    cube = _box((10.0, 10.0, 10.0))
+    faces = cube.faces.copy()
+    faces[:2] = faces[:2, ::-1]
+    bad = trimesh.Trimesh(cube.vertices.copy(), faces, process=False)
+    assert not bad.is_winding_consistent                  # precondition
+    assert abs(float(bad.volume)) != pytest.approx(1000.0)        # precondition
+    cb = mesh_census(bad)
+    assert cb["winding_conflicts"] > 0
+    assert cb["volume_mm3"] == pytest.approx(1000.0, rel=1e-9)
+    assert cb["volume_repaired"] is True and cb["inverted"] is False
+
+    # a nested void keeps its sign: 48000 - 2000, nothing repaired
+    hb = mesh_census(_hollow_box())
+    assert hb["volume_mm3"] == pytest.approx(46000.0, rel=1e-9)
+    assert hb["volume_repaired"] is False and hb["volume_source"] == "signed"
+
+    from src.drawing.mesh_load import mesh_volume_repaired
+    assert mesh_volume_repaired(two) == (pytest.approx(3000.0), True)
+    assert mesh_volume_repaired(_box()) == (pytest.approx(48000.0), False)
+
+
+def _soup(n: int = 50, seed: int = 3) -> trimesh.Trimesh:
+    rng = np.random.default_rng(seed)
+    centres = rng.uniform(0.0, 100.0, (n, 1, 3))
+    tris = centres + rng.normal(scale=2.0, size=(n, 3, 3))
+    return trimesh.Trimesh(tris.reshape(-1, 3), np.arange(3 * n).reshape(-1, 3), process=True)
+
+
+def test_classify_triangle_soup_is_not_solid(tmp_path):
+    # QA issue 19: disconnected random triangles were classified 'organic'
+    soup = _soup()
+    cs = mesh_census(soup)
+    assert cs["components"] == 50 and cs["closed_components"] == 0      # precondition
+    assert classify(soup, 0.10, census=cs)["verdict"] == "not_solid"
+    cl = classify(soup)                                   # census computed internally
+    assert cl["verdict"] == "not_solid"
+    assert cl["surface_verdict"] == "organic" and cl["planar_big"] == 0.0
+    assert "50 disconnected open components, 0 closed" in cl["not_solid_reason"]
+    p = tmp_path / "soup.stl"
+    soup.export(str(p))
+    mm = load_mesh_model(str(p))
+    assert mm.classifier["verdict"] == "not_solid"
+    assert any("not a solid" in w for w in mm.warnings)
+
+    # a single open strip: boundary edges >= triangles
+    v = np.array([[i, j, 0.0] for i in range(6) for j in (0.0, 1.0)])
+    f = np.array([[2 * i, 2 * i + 2, 2 * i + 1] for i in range(5)] +
+                 [[2 * i + 1, 2 * i + 2, 2 * i + 3] for i in range(5)])
+    strip = trimesh.Trimesh(v, f, process=True)
+    st = mesh_census(strip)
+    assert st["components"] == 1 and st["boundary_edges"] >= st["triangles"]   # precondition
+    assert classify(strip)["verdict"] == "not_solid"
+
+    # controls: closed meshes and one open body with a hole keep their verdicts
+    assert classify(trimesh.creation.icosphere(subdivisions=3))["verdict"] == "organic"
+    assert classify(_box())["verdict"] == "prismatic"
+    open_box = trimesh.Trimesh(_box().vertices.copy(), _box().faces[1:].copy())
+    ob = classify(open_box)
+    assert ob["verdict"] == "prismatic" and ob["not_solid_reason"] is None
+    one_closed = trimesh.util.concatenate([_box(), _soup(5)])
+    assert classify(one_closed)["verdict"] == "prismatic"
+
+
+def _holed_sphere(r: float = 10.0, n_remove: int = 3) -> trimesh.Trimesh:
+    """Icosphere with the ``n_remove`` faces nearest to y = 0 (on the +x side) removed."""
+    ico = trimesh.creation.icosphere(subdivisions=3, radius=r)
+    c = ico.triangles_center
+    score = np.abs(c[:, 1]) + 10.0 * (c[:, 0] < 0.5 * r)          # equator band, +x side
+    drop = np.argsort(score)[:n_remove]
+    keep = np.setdiff1d(np.arange(len(ico.faces)), drop)
+    return trimesh.Trimesh(ico.vertices.copy(), ico.faces[keep].copy(), process=True)
+
+
+def test_section_open_mesh_bridges_gaps():
+    # QA issue 33: an open mesh lost its main contour (open wire dropped)
+    from trimesh.intersections import mesh_plane
+    from src.drawing.geometry2d import chain_segments
+
+    r = 10.0
+    sph = _holed_sphere(r)
+    normal = np.array([0.0, -1.0, 0.0])
+    segs = mesh_plane(sph, plane_normal=normal, plane_origin=np.zeros(3))
+    closed, n_open = chain_segments(np.asarray(segs), 1e-6 * 35.0)
+    assert closed == [] and n_open >= 1                   # precondition: the contour is open
+    sv = section_mesh(sph, np.zeros(3), normal, VIEWS["front"], raster_px=256,
+                      feature_angle_deg=30.0, organic=True, depth_extent=2 * r)
+    assert len(sv.loops) == 1
+    area = abs(polygon_area(sv.loops[0]))
+    assert area == pytest.approx(math.pi * r * r, rel=0.10)
+    assert sv.stats["bridged_gaps"] >= 1
+    assert sv.stats["open_wires_dropped"] == 0
+    assert 0.6 < sv.stats["kept_area_ratio"] <= 1.0      # disc in its bbox: pi / 4
+    # negative control: without bridging the contour is dropped again
+    sv0 = section_mesh(sph, np.zeros(3), normal, VIEWS["front"], raster_px=256,
+                       feature_angle_deg=30.0, organic=True, depth_extent=2 * r, bridge_k=0.0)
+    assert sv0.loops == [] and sv0.stats["open_wires_dropped"] >= 1
+    assert sv0.stats["bridged_gaps"] == 0
+    # a closed sphere needs no bridge
+    full = section_mesh(trimesh.creation.icosphere(subdivisions=3, radius=r), np.zeros(3), normal,
+                        VIEWS["front"], raster_px=256, feature_angle_deg=30.0, organic=True,
+                        depth_extent=2 * r)
+    assert full.stats["bridged_gaps"] == 0 and len(full.loops) == 1
+
+
+def test_section_sliver_left_after_open_contour_is_measurable():
+    # the bunny99 case: the main contour is open and dropped, only a small
+    # closed loop survives and the report said loops=1
+    r = 10.0
+    mesh = trimesh.util.concatenate([_holed_sphere(r), _box((1.0, 1.0, 1.0), (0.0, 0.0, 0.0))])
+    normal = np.array([0.0, -1.0, 0.0])
+    kw = dict(raster_px=128, feature_angle_deg=30.0, organic=True, depth_extent=2 * r)
+    sv0 = section_mesh(mesh, np.zeros(3), normal, VIEWS["front"], bridge_k=0.0, **kw)
+    assert len(sv0.loops) == 1 and sv0.stats["open_wires_dropped"] >= 1     # precondition: sliver
+    assert sv0.stats["kept_length_ratio"] < 0.1
+    assert sv0.stats["kept_area_ratio"] < 0.05
+    sv = section_mesh(mesh, np.zeros(3), normal, VIEWS["front"], **kw)
+    assert len(sv.loops) == 2 and sv.stats["open_wires_dropped"] == 0
+    assert sv.stats["kept_length_ratio"] == pytest.approx(1.0, abs=1e-6)
+    assert sv.stats["kept_area_ratio"] > 0.6
+
+
+def test_section_kept_area_ratio_subtracts_holes():
+    torus = trimesh.creation.torus(10.0, 3.0)
+    sv = section_mesh(torus, np.zeros(3), np.array([0.0, 0.0, 1.0]), VIEWS["top"], raster_px=128,
+                      feature_angle_deg=30.0, organic=True, depth_extent=6.0)
+    assert len(sv.loops) == 2                             # precondition: ring 13 / 7
+    ring = math.pi * (13.0 ** 2 - 7.0 ** 2) / (26.0 * 26.0)       # 0.558, not (169 + 49) pi / 676
+    assert sv.stats["kept_area_ratio"] == pytest.approx(ring, rel=0.02)
+
+
+def test_section_bridge_does_not_join_distant_chains():
+    # an open arc whose ends are 19.6 mm apart (far beyond k x median edge
+    # length) next to a holed sphere whose small gaps MUST be bridged: a
+    # no-op bridging loses the sphere loop, bridging everything closes the arc
+    r = 10.0
+    sph = _holed_sphere(r, n_remove=0)
+    keep = sph.triangles_center[:, 0] > 2.0               # a cap: its cut is an open arc
+    cap = trimesh.Trimesh(sph.vertices.copy(), sph.faces[keep].copy(), process=True)
+    holed = _holed_sphere(r)
+    holed.apply_translation((40.0, 0.0, 0.0))
+    both = trimesh.util.concatenate([cap, holed])
+    gap = 2.0 * math.sqrt(r * r - 2.0 ** 2)               # chord between the arc ends, ~19.6
+    med = float(np.median(both.edges_unique_length))
+    assert gap > 3.0 * med                                # precondition: arc gap out of reach
+    kw = dict(raster_px=128, feature_angle_deg=30.0, organic=True, depth_extent=2 * r)
+    normal = np.array([0.0, -1.0, 0.0])
+    sv0 = section_mesh(both, np.zeros(3), normal, VIEWS["front"], bridge_k=0.0, **kw)
+    assert sv0.loops == [] and sv0.stats["open_wires_dropped"] >= 2      # precondition: both open
+    sv = section_mesh(both, np.zeros(3), normal, VIEWS["front"], **kw)
+    assert len(sv.loops) == 1                             # the sphere, not the arc
+    assert sv.stats["bridged_gaps"] >= 1 and sv.stats["bridge_rejected"] is False
+    assert sv.stats["open_wires_dropped"] == 1            # the arc stays open
+    loop = sv.loops[0]
+    assert abs(polygon_area(loop)) == pytest.approx(math.pi * r * r, rel=0.10)
+    assert float(loop[:, 0].mean()) == pytest.approx(40.0, abs=1.0)
+    assert sv.stats["bridge_max_gap"] < 3.0 * med
+
+
+# ------------------------------------------------------- unit plausibility
+
+def test_unit_plausibility_flags_tiny_huge_and_inch_fractions():
+    # QA issue 5: an inch STL, a metre-scale bunny and a 5 m inch STEP were silent
+    from src.drawing.mesh_load import unit_plausibility
+    v, d, alt = unit_plausibility([50.0, 30.0, 20.0])
+    assert v == "ok" and alt is None
+    assert unit_plausibility([12.5, 25.0, 6.0])[0] == "ok"        # half-mm sizes are not inch
+    v, d, alt = unit_plausibility([5.0, 2.5, 1.375])
+    assert v == "suspicious" and alt["unit"] == "in"
+    assert alt["extents_mm"] == pytest.approx([127.0, 63.5, 34.925])
+    assert "inch fraction" in d
+    v, d, alt = unit_plausibility([0.1547, 0.1554, 0.1209])        # bunny99 in metres
+    assert v == "suspicious" and alt["unit"] == "m" and alt["factor"] == 1000.0
+    assert "below 2 mm" in d and "155" in d
+    v, d, alt = unit_plausibility([5080.0, 2540.0, 1270.0], declared_unit="inch")
+    assert v == "suspicious" and alt["unit"] == "mm"
+    assert alt["extents_mm"] == pytest.approx([200.0, 100.0, 50.0])
+    # a declared inch file is not re-flagged for inch fractions
+    assert unit_plausibility([127.0, 63.5, 34.925], declared_unit="inch")[0] == "ok"
+    assert unit_plausibility([1.0, 0.5, 0.25], declared_unit="mm")[0] == "suspicious"
+    assert unit_plausibility([])[0] == "suspicious"
+
+
+# ----------------------------------------------------- depth sign (mesh)
+
+def _voxel_mesh(occ: np.ndarray, pitch: float) -> trimesh.Trimesh:
+    """Closed blocky surface of a boolean voxel array: one quad per exposed voxel face."""
+    pad = np.pad(occ, 1)
+    tris = []
+    for axis in range(3):
+        for sgn in (1, -1):
+            u, w = [a for a in range(3) if a != axis]
+            for idx in np.argwhere(occ):
+                nb = idx + 1
+                nb[axis] += sgn
+                if pad[tuple(nb)]:
+                    continue
+                base = idx.astype(float)
+                if sgn > 0:
+                    base[axis] += 1.0
+                q = []
+                for du, dw in ((0, 0), (1, 0), (1, 1), (0, 1)):
+                    p = base.copy()
+                    p[u] += du
+                    p[w] += dw
+                    q.append(p * pitch)
+                q = np.array(q)
+                n = np.cross(q[1] - q[0], q[2] - q[0])
+                if n[axis] * sgn < 0:                    # wind outward
+                    q = q[::-1]
+                tris += [q[[0, 1, 2]], q[[0, 2, 3]]]
+    tris = np.asarray(tris)
+    return trimesh.Trimesh(tris.reshape(-1, 3), np.arange(len(tris) * 3).reshape(-1, 3), process=True)
+
+
+def _bossed_plate(side: int) -> trimesh.Trimesh:
+    """Plate 100 x 10 x 60 (depth along Y) with six 10 mm cube bosses on +Y (side=+1) or -Y."""
+    occ = np.zeros((10, 3, 6), dtype=bool)
+    py = 1 if side > 0 else 2
+    occ[:, py, :] = True
+    by = 2 if side > 0 else 1
+    for i in (1, 4, 7):
+        for k in (1, 4):
+            occ[i, by, k] = True
+    m = _voxel_mesh(occ, 10.0)
+    m.apply_translation((0.0, -10.0 - 10.0 * (py - 1), 0.0))
+    return m
+
+
+def test_score_depth_sign_mesh_prefers_the_featured_side():
+    # QA issue 14: plates were drawn from their featureless underside
+    from src.drawing.mesh_load import choose_depth_sign_mesh, score_depth_sign_mesh
+    plate = _bossed_plate(+1)
+    assert plate.is_watertight and plate.volume == pytest.approx(60000.0 + 6000.0)   # precondition
+    up, down = np.array([0.0, 1.0, 0.0]), np.array([0.0, -1.0, 0.0])
+    # precondition: the facing AREA cannot tell the sides apart (triage proposal)
+    fn, fa = plate.face_normals, plate.area_faces
+    proj = [float((fa * np.clip(fn @ d, 0, None)).sum()) for d in (up, down)]
+    flat = [float(fa[fn @ d > 0.5].sum()) for d in (up, down)]
+    assert proj[0] == pytest.approx(proj[1], rel=1e-12) and flat[0] == pytest.approx(flat[1])
+    s_up, s_down = score_depth_sign_mesh(plate, up), score_depth_sign_mesh(plate, down)
+    assert s_up == pytest.approx(320.0 + 6 * 80.0)        # plate rim + boss top and foot rims
+    assert s_down == pytest.approx(320.0)                 # plate rim only
+    # front viewer at -Y sees the plain back: flip; the mirror plate keeps its side
+    r = choose_depth_sign_mesh(plate, np.eye(3))
+    assert r["flip"] is True
+    assert np.allclose(r["matrix"], np.diag([-1.0, -1.0, 1.0]))
+    assert np.linalg.det(np.asarray(r["matrix"])) == pytest.approx(1.0)
+    mirror = choose_depth_sign_mesh(_bossed_plate(-1), np.eye(3))
+    assert mirror["flip"] is False and np.allclose(mirror["matrix"], np.eye(3))
+    # a symmetric part keeps the permutation
+    assert choose_depth_sign_mesh(_box(), np.eye(3))["flip"] is False
+
+
+# ------------------------------------------- F4 review: origin-free volume
+
+def _face_sharing_cubes(inverted: bool = False) -> trimesh.Trimesh:
+    """Two 10 mm cubes sharing the full face x = 10 (touching bodies of a multi-body STL).
+
+    The four edges of the shared square carry four faces each, so the face
+    adjacency splits the closed body into four OPEN shells. ``inverted``
+    reverses every face.
+    """
+    a = _box((10.0, 10.0, 10.0), (5.0, 5.0, 5.0))
+    b = _box((10.0, 10.0, 10.0), (15.0, 5.0, 5.0))
+    m = trimesh.util.concatenate([a, b])
+    faces = m.faces[:, ::-1] if inverted else m.faces
+    return trimesh.Trimesh(m.vertices.copy(), np.ascontiguousarray(faces), process=True)
+
+
+def _shifted(m: trimesh.Trimesh, shift) -> trimesh.Trimesh:
+    out = m.copy()
+    out.apply_translation(shift)
+    return out
+
+
+_SHIFTS = ((0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (-100.0, 0.0, 0.0), (-3000.0, 2500.0, 777.0))
+
+
+def test_census_volume_is_translation_invariant_with_open_shells():
+    # review F4 must-fix: open shells (split by non-manifold edges) were
+    # flipped or treated as voids from their origin-dependent signed volume:
+    # 2000 / 7333.33 / 6000 at x shifts 0 / +100 / -100
+    from src.drawing.mesh_load import mesh_topology
+    m = _face_sharing_cubes()
+    c0 = mesh_census(m)
+    assert c0["nonmanifold_edges"] >= 1 and c0["boundary_edges"] == 0       # precondition
+    assert c0["manifold_components"] >= 3 and c0["components"] == 1         # precondition
+    # precondition: the per-shell signed volumes really depend on the origin
+    shell = mesh_topology(m)["shell_label"]
+    per_shell = []
+    for s in ((0.0, 0.0, 0.0), (100.0, 0.0, 0.0)):
+        ms = _shifted(m, s)
+        tri = ms.triangles
+        fv = np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])) / 6.0
+        per_shell.append(np.bincount(shell, weights=fv))
+    assert np.abs(per_shell[0] - per_shell[1]).max() > 100.0
+    for s in _SHIFTS:
+        c = mesh_census(_shifted(m, s))
+        assert c["volume_mm3"] == pytest.approx(2000.0, rel=1e-9), s
+        assert c["volume_source"] == "signed" and c["volume_repaired"] is False, s
+        assert c["inverted"] is False, s
+        ci = mesh_census(_shifted(_face_sharing_cubes(inverted=True), s))
+        assert ci["volume_mm3"] == pytest.approx(2000.0, rel=1e-9), s
+        assert ci["inverted"] is True and ci["volume_source"] == "signed", s
+    from src.drawing.mesh_load import mesh_volume_repaired
+    assert mesh_volume_repaired(_shifted(m, (100.0, 0.0, 0.0))) == (pytest.approx(2000.0), False)
+    # the open shells form one balanced piece (their union is closed)
+    assert c0["volume_pieces"] == 1 and c0["volume_unbalanced_pieces"] == 0
+
+
+def test_census_edge_sharing_one_inverted_is_translation_invariant():
+    # two closed shells of equal |V| = 1000, one inside out: the tie must not
+    # be broken by float noise of the position (inverted used to flip with it)
+    a = _box((10.0, 10.0, 10.0), (5.0, 5.0, 5.0))
+    b = _box((10.0, 10.0, 10.0), (15.0, 15.0, 5.0))
+    b.invert()
+    m0 = trimesh.util.concatenate([a, b])
+    m0 = trimesh.Trimesh(m0.vertices.copy(), m0.faces.copy(), process=True)
+    tri = m0.triangles
+    raw = float(np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum()) / 6.0
+    assert abs(raw) < 1e-9                                # precondition: raw sum cancels
+    assert mesh_census(m0)["nonmanifold_edges"] == 1     # precondition
+    for s in _SHIFTS:
+        c = mesh_census(_shifted(m0, s))
+        assert c["volume_mm3"] == pytest.approx(2000.0, rel=1e-9), s
+        assert c["volume_source"] == "winding_repaired", s
+        assert c["inverted"] is False, s
+    # the all-inverted fixture stays inverted at every position
+    for s in _SHIFTS:
+        ci = mesh_census(_shifted(_edge_sharing_boxes(inverted=True), s))
+        assert ci["inverted"] is True and ci["volume_mm3"] == pytest.approx(2000.0, rel=1e-9)
+
+
+def _l_block() -> trimesh.Trimesh:
+    """L-shaped prism: 2 x 1 x 2 voxels of 10 mm minus the (x 10..20, z 10..20) one; 3000 mm3."""
+    occ = np.ones((2, 1, 2), dtype=bool)
+    occ[1, 0, 1] = False
+    return _voxel_mesh(occ, 10.0)
+
+
+def test_census_inverted_body_in_a_notch_is_not_a_void():
+    # review F4 should-fix: bbox containment alone subtracted a separate
+    # inverted body that sits in the notch of an L (inside the bbox, outside
+    # the material)
+    L = _l_block()
+    assert L.is_watertight and L.volume == pytest.approx(3000.0)           # precondition
+    small = _box((4.0, 4.0, 4.0), (15.0, 5.0, 15.0))
+    small.invert()
+    assert np.all(small.bounds[0] >= L.bounds[0]) and np.all(small.bounds[1] <= L.bounds[1])  # precondition
+    m = trimesh.util.concatenate([L, small])
+    c = mesh_census(m)
+    assert c["volume_mm3"] == pytest.approx(3064.0, rel=1e-9)               # 3000 + 64, not 3000 - 64
+    assert c["volume_source"] == "winding_repaired" and c["inverted"] is False
+    # control: the same small cube inside the material is a void
+    void = _box((4.0, 4.0, 4.0), (5.0, 5.0, 5.0))
+    void.invert()
+    cv = mesh_census(trimesh.util.concatenate([L, void]))
+    assert cv["volume_mm3"] == pytest.approx(2936.0, rel=1e-9)
+    assert cv["volume_source"] == "signed"
+
+
+def test_census_many_inverted_bodies_is_fast():
+    # review F4 should-fix: the void test was O(n_shells^2) in Python and each
+    # repaired shell copied every vertex (2000 cubes, every second inverted:
+    # 6.68 s; with two reversed faces in every second cube: 3.24 s)
+    import time
+    k = 13
+    parts = []
+    for i in range(2000):
+        b = _box((1.0, 1.0, 1.0), (3.0 * (i % k), 3.0 * ((i // k) % k), 3.0 * (i // (k * k))))
+        if i % 2:
+            b.invert()
+        if i % 4 == 2:
+            f = b.faces.copy()
+            f[:2] = f[:2, ::-1]
+            b = trimesh.Trimesh(b.vertices, f, process=False)
+        parts.append(b)
+    m = trimesh.util.concatenate(parts)
+    t = time.perf_counter()
+    c = mesh_census(m)
+    dt = time.perf_counter() - t
+    assert c["manifold_components"] == 2000                # precondition
+    assert c["winding_conflicts"] > 0                      # precondition: some shells need a rewind
+    assert c["volume_mm3"] == pytest.approx(2000.0, rel=1e-9)
+    assert c["volume_source"] == "winding_repaired"
+    assert dt < 2.0, f"census of 2000 shells took {dt:.2f} s"
+
+
+def test_census_zero_volume_closed_mesh_is_silent():
+    # review F4 should-fix: mesh.volume (trimesh mass properties) warns
+    # "divide by zero" on stderr when the signed sum is 0
+    import warnings
+    a = _box((10.0, 10.0, 10.0))
+    b = _box((10.0, 10.0, 10.0), (50.0, 0.0, 0.0))
+    b.invert()
+    m = trimesh.util.concatenate([a, b])
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        trimesh.Trimesh(m.vertices.copy(), m.faces.copy()).volume
+    assert any(issubclass(w.category, RuntimeWarning) for w in rec)        # precondition
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        c = mesh_census(trimesh.Trimesh(m.vertices.copy(), m.faces.copy()))
+    assert [str(w.message) for w in rec if issubclass(w.category, RuntimeWarning)] == []
+    assert c["volume_raw_mm3"] == pytest.approx(0.0, abs=1e-9)
+    assert c["volume_mm3"] == pytest.approx(2000.0, rel=1e-9) and c["inverted"] is False
+
+
+def _dense_soup(n: int = 2000, box: float = 20.0, noise: float = 1.0, seed: int = 3) -> trimesh.Trimesh:
+    rng = np.random.default_rng(seed)
+    centres = rng.uniform(0.0, box, (n, 1, 3))
+    tris = centres + rng.normal(scale=noise, size=(n, 3, 3))
+    return trimesh.Trimesh(tris.reshape(-1, 3), np.arange(3 * n).reshape(-1, 3), process=True)
+
+
+def test_section_soup_is_not_bridged_into_loops():
+    # review F4 should-fix: bridging turned a triangle soup into junk loops
+    # that looked healthy (corpus 22: 75 bridges -> 3 loops, length ratio 1.0)
+    from trimesh.intersections import mesh_plane
+    from src.drawing.geometry2d import chain_segments
+    from src.drawing.mesh_sections import BRIDGE_K, _bridges, _dangling_ends
+
+    soup = _dense_soup()
+    centre = 0.5 * (soup.bounds[0] + soup.bounds[1])
+    normal = np.array([0.0, -1.0, 0.0])
+    weld = 1e-6 * float(np.linalg.norm(soup.extents))
+    segs = np.asarray(mesh_plane(soup, plane_normal=normal, plane_origin=centre)).reshape(-1, 2, 3)
+    closed, n_open = chain_segments(segs, weld)
+    assert closed == [] and n_open > 50                   # precondition: one-segment chains
+    tol = BRIDGE_K * float(np.median(soup.edges_unique_length))
+    br = _bridges(_dangling_ends(segs, weld), tol)
+    junk, _ = chain_segments(np.concatenate([segs, br]), weld)
+    assert len(junk) >= 3                                 # precondition: unguarded bridging makes loops
+    sv = section_mesh(soup, centre, normal, VIEWS["front"], raster_px=64, feature_angle_deg=30.0,
+                      organic=True, depth_extent=20.0)
+    assert sv.loops == []
+    assert sv.stats["bridge_rejected"] is True and sv.stats["bridged_gaps"] == 0
+    assert sv.stats["open_chain_mean_segments"] < 2.0
+
+
+def test_project_mesh_fine_torus_keeps_hidden_runs_shorter_than_the_outline_cover():
+    """F1 review: the 3 px outline subtraction also deleted every visible and hidden run of
+    3 px or less before chaining, so a finely tessellated torus (edges ~1.6 px at raster
+    256) lost its whole hidden inner silhouette. The length floor is the 0.5 px clean-up
+    tolerance; chains are still filtered by their total length afterwards."""
+    from src.drawing import mesh_views
+    torus = trimesh.creation.torus(10.0, 3.0, major_sections=512, minor_sections=64)
+    pv = project_mesh(torus, VIEWS["front"], raster_px=256, feature_angle_deg=30.0, organic=True)
+    px = pv.stats["px"]
+    # precondition: the major-circle edges are shorter than the 3 px outline cover tolerance
+    assert 2.0 * math.pi * 13.0 / 512 < mesh_views._OUTLINE_COVER_PX * px
+    assert pv.stats["interior_silhouettes_omitted"] is False
+    from src.drawing.geometry2d import primitives_to_segments
+    segs = primitives_to_segments(pv.hidden, 0.01) if pv.hidden else np.zeros((0, 2, 2))
+    total = float(np.linalg.norm(segs[:, 1] - segs[:, 0], axis=1).sum()) if len(segs) else 0.0
+    assert total > 10.0                         # shipped code: 0 (256x32 torus: 14.1)
+    pts = segs.reshape(-1, 2)
+    assert np.abs(pts[:, 0]).max() < 10.0       # inside the hole's span |x| < 7 + 3
+    loops = [p for p in pv.visible if isinstance(p, Polyline) and p.closed]
+    assert len(loops) == 1 and len(pv.visible) == 1

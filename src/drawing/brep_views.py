@@ -61,8 +61,8 @@ from typing import List, Optional
 
 import numpy as np
 
-from .geometry2d import (dedupe_primitives, drop_covered_curves, is_straight, merge_collinear,
-                         subtract_covered)
+from .geometry2d import (chain_to_primitives, dedupe_primitives, drop_covered_curves,
+                         drop_isolated_fragments, is_straight, merge_collinear, subtract_covered)
 from .model import Arc, BBox2D, Circle, LineStyle, Polyline, Primitive2D, ProjectedView, Segment
 
 log = logging.getLogger(__name__)
@@ -72,6 +72,12 @@ _TWO_PI = 2.0 * math.pi
 # Behaviour switches, module-level so negative-control tests can turn one off.
 _SUBTRACT_COVERED = True   # drop hidden edges lying on visible ones
 _SWAP_CW_ARCS = True       # swap arc ends when the circle axis Z < 0
+
+# Paper-scaled clean-up constants (paper mm; divided by the sheet scale).
+_DEFLECTION_PER_SCALE = 0.05   # pipeline rule deflection = 0.05 / scale, inverted for the default scale
+_COVER_PAPER_MM = 0.3          # poly route: hidden-on-visible subtraction tolerance (QA issue 27)
+_DASH_PERIOD_PAPER_MM = 3.0    # one hidden dash: chains with >= 2 shorter chords become Polylines (QA issue 6)
+_MIN_FRAGMENT_PAPER_MM = 0.3   # isolated open fragments shorter than this are dropped (QA issue 35)
 
 _VISIBLE_COMPOUNDS = ("VCompound", "OutLineVCompound")
 _HIDDEN_COMPOUNDS = ("HCompound", "OutLineHCompound")
@@ -131,7 +137,8 @@ def _discretize(adaptor, u0: float, u1: float, deflection: float, angular: float
     return [t.Value(i) for i in range(1, t.NbPoints() + 1)]
 
 
-def edges_to_primitives(compound, deflection: float, style: LineStyle) -> List[Primitive2D]:
+def edges_to_primitives(compound, deflection: float, style: LineStyle, *,
+                        deadline: Optional[float] = None) -> List[Primitive2D]:
     """HLR result compound (edges in the z = 0 view plane) -> 2D primitives.
 
     Line -> ``Segment``; Circle -> ``Circle`` (full turn) or ``Arc``
@@ -140,6 +147,8 @@ def edges_to_primitives(compound, deflection: float, style: LineStyle) -> List[P
     collapsed to a ``Segment`` when straight within ``0.1 * deflection``.
     Degenerated edges are skipped; an edge without usable geometry becomes
     the chord of its vertices. ``None`` or a null compound -> ``[]``.
+    ``deadline`` (a ``time.perf_counter()`` value) raises ``TimeoutError``
+    when passed (checked every 512 edges).
     """
     from OCP.BRep import BRep_Tool
     from OCP.BRepAdaptor import BRepAdaptor_Curve
@@ -158,9 +167,13 @@ def edges_to_primitives(compound, deflection: float, style: LineStyle) -> List[P
     min_len = 1e-9
     straight_tol = _straight_tol(deflection)
     ex = TopExp_Explorer(compound, TopAbs_EDGE)
+    n_seen = 0
     while ex.More():
         edge = TopoDS.Edge_s(ex.Current())
         ex.Next()
+        n_seen += 1
+        if deadline is not None and n_seen % 512 == 0 and time.perf_counter() > deadline:
+            raise TimeoutError("edges_to_primitives: time budget exceeded")
         try:
             if BRep_Tool.Degenerated_s(edge):
                 continue
@@ -318,49 +331,136 @@ def _polyline_edges(prims) -> np.ndarray:
     return np.concatenate(chunks)
 
 
-def _clean(visible: list, hidden: list, tol: float):
-    """Dedupe, drop/subtract hidden edges on visible ones, merge collinear segments."""
-    visible = dedupe_primitives(visible, tol)
-    hidden = dedupe_primitives(hidden, tol)
-    vis_segs, vis_other = _split(visible)
-    hid_segs, hid_other = _split(hidden)
-    vis_arr = merge_collinear(_seg_array(vis_segs), tol) if vis_segs else np.zeros((0, 2, 2))
+def _clean_hidden(hid_segs, hid_other, vis_arr, vis_other, tol: float, cover_tol: float,
+                  loose: bool, deadline: Optional[float]):
+    """Hidden half of ``_clean``: drop/subtract what lies on visible edges, merge collinear."""
     hid_arr = _seg_array(hid_segs)
     if _SUBTRACT_COVERED:
         hid_other = drop_covered_curves(hid_other, vis_other, tol)
         if len(hid_arr):
             cover = np.concatenate([vis_arr, _polyline_edges(vis_other)]) if len(vis_other) else vis_arr
-            hid_arr = subtract_covered(hid_arr, cover, tol)
+            # the length floor is the geometric tol, NOT the (paper-scaled) cover tol:
+            # otherwise every hidden chord shorter than 0.3 mm on paper is deleted
+            # anywhere in the view (F1 review: 97.6 % of the hidden segments on 03)
+            hid_arr = subtract_covered(hid_arr, cover, cover_tol, loose=loose, deadline=deadline,
+                                       min_len=tol)
     if len(hid_arr):
-        hid_arr = merge_collinear(hid_arr, tol)
+        hid_arr = merge_collinear(hid_arr, tol, deadline=deadline)
+    return hid_arr, hid_other
+
+
+def _emit(arr: np.ndarray, style: LineStyle, tol: float, chain_short: Optional[float],
+          deadline: Optional[float]) -> list:
+    if chain_short is None or len(arr) == 0:
+        return _to_segments(arr, style)
+    return chain_to_primitives(arr, style, tol, short_len=chain_short, deadline=deadline)
+
+
+def _clean(visible: list, hidden: list, tol: float, *, cover_tol: Optional[float] = None,
+           loose: bool = False, chain_short: Optional[float] = None,
+           deadline: Optional[float] = None, info: Optional[dict] = None):
+    """Dedupe, drop/subtract hidden edges on visible ones, merge collinear segments.
+
+    ``cover_tol`` (default ``tol``) is the tolerance of the hidden-on-visible
+    subtraction and ``loose`` its loose mode (poly-HLR route, QA issue 27).
+    ``chain_short`` not None chains the cleaned segments into Polylines
+    (``chain_to_primitives`` with ``short_len=chain_short``, QA issue 6).
+    ``deadline``: when passed during the visible clean-up the visible
+    segments are kept merged-or-not as far as they got; when passed during
+    the hidden clean-up the hidden lines are dropped and ``info`` gets
+    ``hidden_dropped = True`` (QA issue 3). Returns (visible, hidden).
+    """
+    info = {} if info is None else info
+    cover_tol = tol if cover_tol is None else max(float(cover_tol), tol)
+    visible = dedupe_primitives(visible, tol)
+    vis_segs, vis_other = _split(visible)
     vis_style = vis_segs[0].style if vis_segs else LineStyle.VISIBLE
-    hid_style = hid_segs[0].style if hid_segs else LineStyle.HIDDEN
-    return (_to_segments(vis_arr, vis_style) + vis_other,
-            _to_segments(hid_arr, hid_style) + hid_other)
+    vis_arr = _seg_array(vis_segs)
+    if len(vis_arr):
+        try:
+            vis_arr = merge_collinear(vis_arr, tol, deadline=deadline)
+        except TimeoutError:
+            info["visible_unmerged"] = True
+            log.debug("visible clean-up over the time budget: segments left unmerged")
+    hid_prims: list = []
+    if hidden:
+        try:
+            if deadline is not None and time.perf_counter() > deadline:
+                raise TimeoutError("hidden clean-up: time budget exceeded")
+            hidden = dedupe_primitives(hidden, tol)
+            hid_segs, hid_other = _split(hidden)
+            hid_style = hid_segs[0].style if hid_segs else LineStyle.HIDDEN
+            hid_arr, hid_other = _clean_hidden(hid_segs, hid_other, vis_arr, vis_other, tol,
+                                               cover_tol, loose, deadline)
+            hid_prims = _emit(hid_arr, hid_style, tol, chain_short, deadline) + hid_other
+        except TimeoutError:
+            info["hidden_dropped"] = True
+            info["hidden_dropped_reason"] = "time_budget"
+            hid_prims = []
+    try:
+        vis_prims = _emit(vis_arr, vis_style, tol, chain_short, deadline) + vis_other
+    except TimeoutError:
+        vis_prims = _to_segments(vis_arr, vis_style) + vis_other
+    return vis_prims, hid_prims
+
+
+def _paper_scale(deflection: float, paper_scale: Optional[float]) -> float:
+    """Sheet scale (paper mm per model mm): given, or the pipeline's deflection rule inverted."""
+    if paper_scale is not None and float(paper_scale) > 0.0 and math.isfinite(float(paper_scale)):
+        return float(paper_scale)
+    return _DEFLECTION_PER_SCALE / float(deflection)
 
 
 # ----------------------------------------------------------------- API
 
 def project_brep(shape, spec, *, exact: bool, deflection: float, hidden: bool = True,
-                 time_budget_s: Optional[float] = None) -> ProjectedView:
+                 time_budget_s: Optional[float] = None, paper_scale: Optional[float] = None,
+                 cover_tol: Optional[float] = None, max_hidden_primitives: Optional[int] = None,
+                 min_fragment_mm: Optional[float] = None) -> ProjectedView:
     """Hidden-line projection of ``shape`` for ``spec`` (a ``ViewSpec``).
 
     Returns a ``ProjectedView`` with ``visible`` (style VISIBLE) and
     ``hidden`` (style HIDDEN; ``[]`` when ``hidden=False``) primitives in view
     coordinates, ``bbox`` over both (None when nothing was drawn) and
     ``algorithm`` "hlr_exact" or "hlr_poly". ``stats``: seconds (hlr,
-    extract, total), raw edge counts per compound, primitive counts.
+    extract, clean, total), raw edge counts per compound, primitive counts,
+    ``hidden_dropped`` (bool) and, when True, ``hidden_dropped_reason``
+    ("time_budget" or "max_hidden_primitives"), ``fragments_dropped``.
 
-    Raises ``TimeoutError`` when ``time_budget_s`` is exceeded (checked after
-    ``Update``/``Hide``), ``ValueError`` for a non-positive deflection and
-    ``RuntimeError`` when OCCT fails.
+    ``time_budget_s`` covers the whole call (QA issue 3). When the native
+    HLR step alone exceeds it, ``TimeoutError`` is raised (the OCCT call
+    cannot be interrupted; checked after ``Update``/``Hide``). When the
+    budget runs out later - during edge extraction or the Python clean-up -
+    the view is returned WITHOUT hidden lines and ``stats["hidden_dropped"]``
+    is True instead of raising. ``max_hidden_primitives`` (None = no cap)
+    drops the hidden lines of a view whose raw hidden primitive count is
+    larger, before the clean-up.
+
+    ``paper_scale`` (paper mm per model mm; default ``0.05 / deflection``,
+    the pipeline's deflection rule, which is WRONG where the pipeline clamps
+    the deflection - pass the real sheet scale; ``stats["paper_scale"]`` and
+    ``stats["paper_scale_guessed"]`` record what was used) sets the
+    paper-scaled tolerances:
+    on the poly route (``exact=False``) the hidden-on-visible subtraction
+    uses ``cover_tol`` (default ``max(0.01 * deflection, 0.3 mm on paper)``)
+    in loose mode (QA issue 27; only near-parallel visible edges cover, and
+    the minimum hidden length stays the geometric ``0.01 * deflection``, so
+    the short chords of fine faceted curves are kept) and the cleaned segments are chained into
+    Polylines where they hold two or more chords shorter than one hidden dash
+    (3 mm on paper, QA issue 6). ``min_fragment_mm`` (paper mm, default
+    0.3; 0 disables) drops isolated open fragments shorter than that whose
+    ends touch nothing (QA issue 35). Exact Circles/Arcs are kept as such.
+
+    Raises ``ValueError`` for a non-positive deflection and ``RuntimeError``
+    when OCCT fails.
     """
     deflection = float(deflection)
     if not (deflection > 0.0 and math.isfinite(deflection)):
         raise ValueError(f"project_brep: deflection must be positive, got {deflection!r}")
     algorithm = "hlr_exact" if exact else "hlr_poly"
     t0 = time.perf_counter()
-    stats: dict = {"meshed": False}
+    deadline = None if time_budget_s is None else t0 + float(time_budget_s)
+    stats: dict = {"meshed": False, "hidden_dropped": False}
     if _is_null(shape):
         stats.update(seconds=0.0, empty_shape=True)
         return ProjectedView(spec, [], [], None, algorithm, stats)
@@ -396,22 +496,64 @@ def project_brep(shape, spec, *, exact: bool, deflection: float, hidden: bool = 
         raise RuntimeError(f"{algorithm} result extraction failed for view {spec.name!r}: {exc}") from exc
     stats["edge_counts"] = {k: _count_edges(v) for k, v in comps.items()}
 
+    def drop_hidden(reason: str) -> None:
+        stats["hidden_dropped"] = True
+        stats["hidden_dropped_reason"] = reason
+        log.debug("view %s: hidden lines dropped (%s)", spec.name, reason)
+
     visible: list = []
     for name in _VISIBLE_COMPOUNDS:
         visible += edges_to_primitives(comps[name], deflection, LineStyle.VISIBLE)
     hidden_prims: list = []
     if hidden:
-        for name in _HIDDEN_COMPOUNDS:
-            hidden_prims += edges_to_primitives(comps[name], deflection, LineStyle.HIDDEN)
+        try:
+            for name in _HIDDEN_COMPOUNDS:
+                hidden_prims += edges_to_primitives(comps[name], deflection, LineStyle.HIDDEN,
+                                                    deadline=deadline)
+        except TimeoutError:
+            hidden_prims = []
+            drop_hidden("time_budget")
     stats["raw_visible"] = len(visible)
     stats["raw_hidden"] = len(hidden_prims)
-    visible, hidden_prims = _clean(visible, hidden_prims, _geo_tol(deflection))
+    if max_hidden_primitives is not None and len(hidden_prims) > int(max_hidden_primitives):
+        hidden_prims = []
+        drop_hidden("max_hidden_primitives")
+
+    t2 = time.perf_counter()
+    scale = _paper_scale(deflection, paper_scale)
+    tol = _geo_tol(deflection)
+    if exact:
+        ctol, loose, chain_short = tol, False, None
+    else:
+        ctol = max(tol, _COVER_PAPER_MM / scale) if cover_tol is None else max(float(cover_tol), tol)
+        loose, chain_short = True, _DASH_PERIOD_PAPER_MM / scale
+    info: dict = {}
+    visible, hidden_prims = _clean(visible, hidden_prims, tol, cover_tol=ctol, loose=loose,
+                                   chain_short=chain_short, deadline=deadline, info=info)
+    if info.get("hidden_dropped"):
+        drop_hidden(info.get("hidden_dropped_reason", "time_budget"))
+    if info.get("visible_unmerged"):
+        stats["visible_unmerged"] = True
+    frag_mm = _MIN_FRAGMENT_PAPER_MM if min_fragment_mm is None else float(min_fragment_mm)
+    n_frag = 0
+    if frag_mm > 0.0 and (deadline is None or time.perf_counter() <= deadline):
+        min_len = frag_mm / scale
+        touch = max(deflection, tol)
+        visible, nv = drop_isolated_fragments(visible, min_len, touch, deflection, context=hidden_prims)
+        hidden_prims, nh = drop_isolated_fragments(hidden_prims, min_len, touch, deflection,
+                                                   context=visible)
+        n_frag = nv + nh
+    stats["fragments_dropped"] = n_frag
+    stats["cover_tol"] = ctol
+    stats["paper_scale"] = scale
+    stats["paper_scale_guessed"] = not (paper_scale is not None and float(paper_scale) > 0.0
+                                        and math.isfinite(float(paper_scale)))
 
     bbox = BBox2D.of_primitives(visible + hidden_prims) if (visible or hidden_prims) else None
     t_end = time.perf_counter()
     stats.update(seconds=round(t_end - t0, 6), seconds_hlr=round(t_hlr, 6),
-                 seconds_extract=round(t_end - t1, 6), n_visible=len(visible),
-                 n_hidden=len(hidden_prims))
+                 seconds_extract=round(t_end - t1, 6), seconds_clean=round(t_end - t2, 6),
+                 n_visible=len(visible), n_hidden=len(hidden_prims))
     log.debug("%s view %s: %d visible, %d hidden, %.3f s", algorithm, spec.name,
               len(visible), len(hidden_prims), t_end - t0)
     return ProjectedView(spec, visible, hidden_prims, bbox, algorithm, stats)

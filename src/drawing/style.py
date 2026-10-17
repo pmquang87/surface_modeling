@@ -122,3 +122,26 @@ def hatch_spacing(style: SheetStyle, shorter_extent_sheet_mm: float) -> float:
     else:
         s = style.hatch_spacing_large
     return max(_HATCH_MIN, float(s))
+
+
+# Small section regions (QA round 1 issue 29; conventions, not ISO numbers):
+# a region whose smallest width on the sheet (caliper width of its outer loop, any
+# orientation, layout._min_width) is below HATCH_FILL_BELOW is filled
+# solid (ISO 128-50 allows blackening thin sections); a region narrower than two
+# section spacings across the hatch lines gets width / 3 (two or three lines),
+# never below HATCH_MIN_REGION.
+HATCH_FILL_BELOW = 2.0
+HATCH_MIN_REGION = 0.7
+
+
+def region_hatch_spacing(section_spacing: float, across_sheet_mm: float) -> float:
+    """Spacing for one section region ``across_sheet_mm`` wide across the hatch lines.
+
+    The section spacing when the region takes at least two lines at it,
+    else ``across / 3`` floored at ``HATCH_MIN_REGION`` (0.7 mm).
+    """
+    s = float(section_spacing)
+    w = float(across_sheet_mm)
+    if w >= 2.0 * s:
+        return s
+    return max(HATCH_MIN_REGION, min(s, w / 3.0))

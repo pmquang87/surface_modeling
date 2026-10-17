@@ -25,7 +25,8 @@ Sourced rules (ISO texts read through their BIS adoptions):
   every view box plus its dimension bands plus the 20 mm view gaps fits the
   drawing space (5 mm clear of the frame) without touching the title block
   and strip (5 mm clear) wins. Nothing fits at 1:100 -> 1:100 is used and
-  ``views_overflow`` is flagged.
+  ``views_overflow`` is flagged. ``LayoutResult.flags`` starts with the
+  plan's own flags (``DimensionPlan.flags``, e.g. ``dimension_extent_mismatch``).
 * ISO 128-40: cutting line = wide long-dashed dotted (04.2) dashes of
   ``section_dash_len`` (12 mm) at both ends, from 3 mm inside the view
   outline to 9 mm outside; arrows = continuous wide shaft (CUTTING style,
@@ -49,12 +50,27 @@ Conventions of this module (no standard behind them):
 * Dimension bands: ``k`` bands on a side reserve ``dim_first_offset +
   k * dim_pitch`` mm (10 + 7k, spec 3.6); band ``i`` puts the dimension line
   at ``dim_first_offset + i * dim_pitch`` from the view outline.
-* Extra room, added to the bands: diameter callouts reserve their leader +
-  text reach (``dimensions.callout_extent``) on the side the leader points
-  to; the section view and the iso view reserve the label height above
-  them; the marker view reserves 12 mm (plus the bands it has to clear, see
-  below) on the sides the cutting line leaves through and 11 mm on the side
-  the arrows point to (when the bands do not already cover it).
+* Extra room, added to the bands: the section view and the iso view
+  reserve the label height above them; the marker view reserves 12 mm
+  (plus the bands it has to clear, see below) on the sides the cutting line
+  leaves through and 11 mm on the side the arrows point to (when the bands
+  do not already cover it). Diameter callouts reserve, per scale, the
+  exact reach of the rendered callout beyond the outline
+  (``_callout_room``), taken as the MAX with the bands, not added to them
+  (QA round 1 issue 7: the old fixed reach from the circle, added to the
+  bands, cost about 25 mm per side; the synthetic plate on A4 fell from
+  1:5 to 1:10 once bands appeared on four sides).
+* Text collisions (``_resolve_text_collisions``, after the dimensions are
+  rendered): a linear dimension text crossed by the section marker (wide
+  dash, narrow connector, arrows, letters) is shifted along its line
+  (``Dimension.text_offset``, QA issue 4); a callout whose text overlaps
+  another text (``TEXT_CLEARANCE`` = 1 mm), sits on the marker, or whose
+  leader runs through another text tries the four leader angles and
+  longer leaders; the shortest leader that stays in its placement rect,
+  off view outlines and off foreign dimension lines wins (QA issue 8).
+  Texts that still overlap afterwards give the flag
+  ``layout_text_collision`` (info); ``sheet.meta["text_collisions"]``
+  counts the moves.
 * Scale-dependent room (``min_mm_fn`` of ``choose_scale``): a linear
   dimension whose sheet span is shorter than two arrows + 0.5 mm is drawn
   with the arrows outside and its line ``arrow_length + 2`` mm longer at
@@ -80,16 +96,19 @@ Conventions of this module (no standard behind them):
 * Iso view: at each scale the grid WITH the iso cell is tried first; when
   that does not fit, the iso view (aligned to nothing) floats into free
   space at least ``view_gap`` clear of every grid view, top-right corner
-  first (``info["iso_mode"]`` = "cell" | "free"). Measured on the synthetic
-  plate (100 x 60 x 15, 7 linear dims, 2 callouts, iso, section): the iso
-  row above F pushes the top view into the title block at 1:1, so without
-  the float A3 would drop to 1:2; with it the plate is drawn at 1:1.
-  When the floating iso view still finds no room, it may be drawn up to
-  ``ISO_SCALE_STEPS`` (2) standard scales smaller than the sheet before the
-  sheet scale drops (spec 3.6: the iso view is labelled with its scale).
-  Measured: the plate on A3 with the 9 mm label room above the iso view
-  misses the right centring mark by -0.1 mm at 1:1, so the iso view goes to
-  1:2 and the principal views stay at 1:1.
+  first (``info["iso_mode"]`` = "cell" | "free"): eight fixed positions,
+  then a vectorised sweep of up to 61 x 61 positions (2.5 mm steps) over
+  the drawing space, nearest the top-right corner first
+  (``_float_spots``). Measured on the synthetic plate (100 x 60 x 15, iso,
+  section): the iso row above F pushes the top view into the title block
+  at 1:1, so without the float A3 would drop to 1:2; with it the plate is
+  drawn at 1:1. When the floating iso view still finds no room, it may be
+  drawn up to ``ISO_SCALE_STEPS`` (2) standard scales smaller than the
+  sheet before the sheet scale drops (spec 3.6: the iso view is labelled
+  with its scale). Measured (QA round 1 issue 7): with the eight fixed
+  positions only the plate's iso view went to 1:2 on A3; with the sweep it
+  is 1:1, and 45 of 700 synthetic box sizes on A3/A4 got a larger iso or
+  sheet scale (choose_scale at most 43 ms).
 * Placement of the whole grid: six preferred positions (centred, centred
   above the title zone, centred left of it, top-left, top-right,
   bottom-left), then a sweep of at most 41 x 41 positions ordered by
@@ -101,8 +120,12 @@ Conventions of this module (no standard behind them):
   drawing fits at 1:1 or larger; otherwise A3 with its best reduction
   (overflow on A3 if nothing fits).
 * Hidden lines are not drawn in the iso view; the section body shows its
-  visible edges only. Hatch: ``hatch_spacing`` of the section's shorter
-  extent ON THE SHEET, 45 degrees, phase-locked to the sheet origin.
+  visible edges only. Hatch: one ``HatchLines`` per region (outer loop
+  with its holes), ``hatch_spacing`` of the section's shorter extent ON THE
+  SHEET for every region it crosses with two or more lines, a finer
+  ``style.region_hatch_spacing`` for narrower regions, and a filled
+  ``Polygon`` for regions under ``HATCH_FILL_BELOW`` (2 mm); 45 degrees,
+  phase-locked to the sheet origin (``_section_items``).
 """
 from __future__ import annotations
 
@@ -115,15 +138,15 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .dimensions import (LEADER_LEN, SIDES, DimensionPlan, arrowhead, callout_extent,
-                         render_dimension)
+from .dimensions import (LEADER_ANGLES, LEADER_LEN, SIDES, DimensionPlan, arrowhead, render_dimension)
 from .geometry2d import hatch_lines, nest_loops
 from .model import (TEXT_ADVANCE, BBox2D, Circle, Dimension, HatchLines, LineStyle, Point,
-                    Polyline, ProjectedView, SectionView, Segment, Sheet, SheetItem, Text,
+                    Polygon, Polyline, ProjectedView, SectionView, Segment, Sheet, SheetItem, Text,
                     transform_primitive)
 from .options import DrawingOptions
 from .projection import PRINCIPAL, VIEWS, ViewSpec, grid_cell
-from .style import SHEETS, STANDARD_SCALES, SheetSize, SheetStyle, hatch_spacing, scale_text
+from .style import (HATCH_FILL_BELOW, SHEETS, STANDARD_SCALES, SheetSize, SheetStyle, hatch_spacing,
+                    region_hatch_spacing, scale_text)
 
 log = logging.getLogger(__name__)
 
@@ -382,6 +405,9 @@ def _place(arr: _Arrangement, sheet: SheetSize, style: SheetStyle,
     def free(r: BBox2D) -> bool:
         return _inside(r, inner) and not any(_overlaps(r, o) for o in obstacles)
 
+    spots = None
+    if float_size is not None:
+        spots = _float_spots(float_size[0], float_size[1], inner, obstacles)
     for dx, dy in _grid_candidates(W, H, inner, tz):
         shifted = [_shift(r, dx, dy) for r in rects]
         if not all(free(s) for s in shifted):
@@ -397,7 +423,59 @@ def _place(arr: _Arrangement, sheet: SheetSize, style: SheetStyle,
             if any(_overlaps(fr.expanded(gap - 1e-6), s) for s in shifted):
                 continue
             return dx, dy, (fx, fy)
+        hit = _first_clear_spot(spots, w, h, shifted, gap - 1e-6)
+        if hit is not None:
+            return dx, dy, hit
     return None
+
+
+_FLOAT_STEP = 2.5           # sheet mm between the floating-view sweep positions
+_FLOAT_MAX_STEPS = 60       # at most 61 x 61 sweep positions
+
+
+def _float_spots(w: float, h: float, inner: BBox2D, obstacles: List[BBox2D]):
+    """(xs, ys) lower-left corners of a floating ``w x h`` view that stay inside
+    ``inner`` and off the obstacles, nearest the top-right corner first.
+
+    QA round 1 issue 7: the eight fixed corner positions of
+    ``_free_candidates`` missed free space, so the iso view dropped up to two
+    scales on a mostly empty sheet. The sweep is vectorised (numpy), so one
+    test per grid position costs one pass over the spots.
+    """
+    xr, yr = inner.width - w, inner.height - h
+    if xr < -_EPS or yr < -_EPS:
+        return None
+    nx = int(min(_FLOAT_MAX_STEPS, max(1, math.floor(xr / _FLOAT_STEP)))) if xr > _EPS else 0
+    ny = int(min(_FLOAT_MAX_STEPS, max(1, math.floor(yr / _FLOAT_STEP)))) if yr > _EPS else 0
+    xs = np.linspace(inner.xmin, inner.xmin + max(xr, 0.0), nx + 1)
+    ys = np.linspace(inner.ymin, inner.ymin + max(yr, 0.0), ny + 1)
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+    X, Y = X.ravel(), Y.ravel()
+    ok = np.ones(X.shape, dtype=bool)
+    for o in obstacles:
+        ok &= ~((X < o.xmax - _EPS) & (X + w > o.xmin + _EPS) & (Y < o.ymax - _EPS) & (Y + h > o.ymin + _EPS))
+    X, Y = X[ok], Y[ok]
+    if X.size == 0:
+        return None
+    d2 = (X - (inner.xmax - w)) ** 2 + (Y - (inner.ymax - h)) ** 2
+    order = np.lexsort((X, -Y, np.round(d2, 9)))
+    return X[order], Y[order]
+
+
+def _first_clear_spot(spots, w: float, h: float, rects: List[BBox2D], gap: float):
+    """First spot whose ``w x h`` rectangle keeps ``gap`` from every rect, or None."""
+    if spots is None:
+        return None
+    X, Y = spots
+    ok = np.ones(X.shape, dtype=bool)
+    for r in rects:
+        ok &= ~((X - gap < r.xmax - _EPS) & (X + w + gap > r.xmin + _EPS)
+                & (Y - gap < r.ymax - _EPS) & (Y + h + gap > r.ymin + _EPS))
+    idx = np.flatnonzero(ok)
+    if idx.size == 0:
+        return None
+    k = int(idx[0])
+    return float(X[k]), float(Y[k])
 
 
 def _estimate_iso_box(boxes: Dict[str, BBox2D]) -> Optional[BBox2D]:
@@ -762,10 +840,60 @@ def strip_items(sheet: SheetSize, style: SheetStyle, scale_label: str, projectio
     return items
 
 
+def _min_width(points: np.ndarray) -> float:
+    """Smallest caliper width of a 2D point set (min over its convex hull edges), sheet mm.
+
+    Unlike the shorter bounding-box side it does not depend on the region's
+    orientation: a thin strip at 45 degrees is as narrow as the same strip
+    lying flat. Degenerate input (fewer than 3 distinct points, collinear)
+    gives 0.
+    """
+    pts = np.unique(np.asarray(points, dtype=float).reshape(-1, 2), axis=0)
+    if len(pts) < 3:
+        return 0.0
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[np.ndarray] = []
+    for p in pts:                                   # Andrew's monotone chain (pts sorted by x, y)
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0.0:
+            lower.pop()
+        lower.append(p)
+    upper: List[np.ndarray] = []
+    for p in pts[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0.0:
+            upper.pop()
+        upper.append(p)
+    hull = np.array(lower[:-1] + upper[:-1])
+    if len(hull) < 3:
+        return 0.0
+    edges = np.roll(hull, -1, axis=0) - hull
+    lens = np.linalg.norm(edges, axis=1)
+    keep = lens > 1e-12
+    nrm = np.column_stack([-edges[keep, 1], edges[keep, 0]]) / lens[keep, None]
+    proj = hull @ nrm.T                             # (n_hull, n_edges)
+    return float(np.min(np.ptp(proj, axis=0)))
+
+
 def _section_items(section: SectionView, origin: Point, scale: float, style: SheetStyle,
                    geom: BBox2D) -> Tuple[List[SheetItem], dict]:
+    """Section outlines, hatch per region (outer loop with its holes), body edges, A-A label.
+
+    The section spacing ``hatch_spacing`` of the shorter extent of all loops
+    on the sheet is used for every region that it crosses with at least two
+    lines (ISO 128-50: one part, one hatching). A region narrower than two
+    spacings across the 45 degree lines gets ``region_hatch_spacing``
+    (width / 3, at least 0.7 mm); a region whose smallest width (caliper
+    width of its outer loop, ``_min_width``, so a thin strip at any angle
+    counts, not only an axis-aligned one) is below
+    ``HATCH_FILL_BELOW`` (2 mm on the sheet) is filled solid (ISO 128-50
+    blackened thin section). QA round 1 issue 29: one spacing from the box of
+    all loops left 4 mm regions with 0 or 1 line, so they read as holes.
+    """
     items: List[SheetItem] = []
-    stats = {"hatch_segments": 0, "hatch_spacing": None, "loops": 0}
+    stats = {"hatch_segments": 0, "hatch_spacing": None, "loops": 0, "hatch_spacings": [],
+             "filled_regions": 0}
     off = np.array([float(origin[0]), float(origin[1])])
     loops = [np.asarray(lp, dtype=float).reshape(-1, 2) * scale + off for lp in section.loops if np.size(lp)]
     nested = nest_loops(loops) if loops else []
@@ -778,13 +906,26 @@ def _section_items(section: SectionView, origin: Point, scale: float, style: She
     if ordered:
         bb = BBox2D.from_points(np.vstack(ordered))
         spacing = hatch_spacing(style, min(bb.width, bb.height))
-        try:
-            segs = hatch_lines(ordered, spacing, 45.0)
-        except Exception as exc:                  # pragma: no cover - cap on absurd inputs
-            log.warning("layout: hatch failed (%s)", exc)
-            segs = np.zeros((0, 2, 2))
-        items.append(HatchLines(segs, [lp.copy() for lp in ordered], LineStyle.HATCH))
-        stats.update(hatch_segments=int(len(segs)), hatch_spacing=spacing, loops=len(ordered))
+        nrm = np.array([-math.sin(math.pi / 4.0), math.cos(math.pi / 4.0)])
+        n_segs = 0
+        for outer, holes in nested:
+            ob = BBox2D.from_points(outer)
+            if min(ob.width, ob.height, _min_width(outer)) < HATCH_FILL_BELOW:
+                items.append(Polygon(outer.copy(), LineStyle.SECTION))
+                stats["filled_regions"] += 1
+                continue
+            across = float(np.ptp(outer @ nrm))
+            s = spacing if across >= 2.0 * spacing else region_hatch_spacing(spacing, across)
+            region = [outer] + list(holes)
+            try:
+                segs = hatch_lines(region, s, 45.0)
+            except Exception as exc:              # pragma: no cover - cap on absurd inputs
+                log.warning("layout: hatch failed (%s)", exc)
+                segs = np.zeros((0, 2, 2))
+            items.append(HatchLines(segs, [lp.copy() for lp in region], LineStyle.HATCH))
+            stats["hatch_spacings"].append(float(s))
+            n_segs += int(len(segs))
+        stats.update(hatch_segments=n_segs, hatch_spacing=spacing, loops=len(ordered))
     if section.body is not None:
         for p in section.body.visible:
             items.append(_restyle(transform_primitive(p, origin, scale), LineStyle.VISIBLE))
@@ -853,10 +994,268 @@ def _dim_to_sheet(d: Dimension, band: Optional[Tuple[str, int]], origin: Point, 
     a = math.radians(float(d.leader_angle_deg))
     u = np.array([math.cos(a), math.sin(a)])
     tip = c + r * u
-    length = max(LEADER_LEN, _ray_exit(tip, u, geom) + LEADER_EXIT_MARGIN)
+    length = _callout_leader_length(tip, u, geom, d.text, style)
     end = tip + length * u
     return dataclasses.replace(d, center=(float(c[0]), float(c[1])), radius=r,
                                base=(float(end[0]), float(end[1])))
+
+
+def _callout_leader_length(tip: np.ndarray, u: np.ndarray, geom: BBox2D, text: str, style: SheetStyle,
+                           extra: float = 0.0) -> float:
+    """Leader length from the circle: out of the outline by ``LEADER_EXIT_MARGIN`` (at least
+    ``LEADER_LEN``), plus ``extra``, and longer when the text above the shelf would still sit on
+    the view outline (a leader leaving through the bottom edge: the text is drawn ABOVE the
+    shelf, back toward the view)."""
+    length = max(LEADER_LEN, _ray_exit(tip, u, geom) + LEADER_EXIT_MARGIN) + float(extra)
+    gap, h = style.dim_text_gap, style.text_height
+    right = u[0] >= -1e-12
+    sx = 1.0 if right else -1.0
+    for _ in range(int(4.0 * h) + 8):
+        end = tip + length * u
+        t = Text((float(end[0] + sx * gap), float(end[1] + gap)), text, h,
+                 anchor="start" if right else "end", valign="baseline")
+        tb = BBox2D.of_primitives([t])
+        if tb is None or not _overlaps(tb, geom):
+            break
+        length += 1.0
+    return float(length)
+
+
+# ------------------------------------------------------- text collisions --
+
+def _box_of(item) -> Optional[BBox2D]:
+    try:
+        return BBox2D.of_primitives([item])
+    except Exception:
+        return None
+
+
+def _segment_hits_box(a, b, box: BBox2D) -> bool:
+    """Liang-Barsky: does segment a-b pass through the (open) box?"""
+    x0, y0 = float(a[0]), float(a[1])
+    dx, dy = float(b[0]) - x0, float(b[1]) - y0
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, x0 - box.xmin), (dx, box.xmax - x0), (-dy, y0 - box.ymin), (dy, box.ymax - y0)):
+        if abs(p) < 1e-12:
+            if q <= 1e-9:
+                return False
+            continue
+        t = q / p
+        if p < 0:
+            t0 = max(t0, t)
+        else:
+            t1 = min(t1, t)
+        if t0 > t1 - 1e-12:
+            return False
+    return True
+
+
+def _item_hits_box(item, box: BBox2D) -> bool:
+    if isinstance(item, Segment):
+        return _segment_hits_box(item.a, item.b, box)
+    b = _box_of(item)
+    return b is not None and _overlaps(b, box)
+
+
+def _render_group(ds: Dimension, style: SheetStyle):
+    items = render_dimension(ds, style)
+    text = next((it for it in items if isinstance(it, Text)), None)
+    return items, text
+
+
+def _callout_candidate(ds: Dimension, angle: float, extra: float, geom: BBox2D,
+                       style: SheetStyle) -> Dimension:
+    """Sheet-space diameter callout with leader ``angle`` leaving ``geom`` plus ``extra`` mm."""
+    a = math.radians(float(angle))
+    u = np.array([math.cos(a), math.sin(a)])
+    c = np.asarray(ds.center, dtype=float)
+    tip = c + abs(float(ds.radius)) * u
+    length = _callout_leader_length(tip, u, geom, ds.text, style, extra)
+    end = tip + length * u
+    return dataclasses.replace(ds, leader_angle_deg=float(angle), base=(float(end[0]), float(end[1])))
+
+
+CALLOUT_EXTRA_STEPS = 12       # leader lengthenings tried per angle when a callout text collides
+TEXT_CLEARANCE = 1.0           # sheet mm a moved text keeps from every other text (adjacent texts read as one)
+
+
+def _resolve_text_collisions(items: List[SheetItem], sheet: Sheet, groups: List[List[int]],
+                             marker_idx: List[int], fixed_texts: List[int], geoms: Dict[str, BBox2D],
+                             rects: Dict[str, BBox2D], allowed: BBox2D, blocked: List[BBox2D],
+                             style: SheetStyle) -> dict:
+    """Move dimension texts off the section marker and callout texts off each other.
+
+    QA round 1 issue 4: a linear dimension text crossed by the cutting line
+    (wide dash, narrow connector, arrow, letter) is shifted along its line by
+    ``k * (text width / 2 + text height)``, toward the longer free half
+    first. Issue 8: a diameter callout whose text (or leader) overlaps
+    another text, or whose text sits on the marker, tries the leader
+    angles 45 / 135 / -45 / -135 and longer leaders; a candidate must keep
+    its text off every other text and the marker and inside the frame
+    (``allowed``, off ``blocked``); among those the one inside its view's
+    placement rect, off every view outline and off other dimension lines,
+    with the shortest leader, wins. ``items`` and ``sheet.dimensions`` are
+    updated in place (same item count per dimension). Returns counts.
+    """
+    stats = {"linear_text_shifted": 0, "callouts_moved": 0, "unresolved": 0}
+    marker = [items[i] for i in marker_idx]
+    h = style.text_height
+
+    def text_index(g: List[int]) -> Optional[int]:
+        return next((i for i in g if isinstance(items[i], Text)), None)
+
+    def other_text_boxes(skip: int) -> List[BBox2D]:
+        out = []
+        for k, g in enumerate(groups):
+            if k == skip:
+                continue
+            ti = text_index(g)
+            if ti is not None:
+                b = _box_of(items[ti])
+                if b is not None:
+                    out.append(b)
+        for i in fixed_texts:
+            b = _box_of(items[i])
+            if b is not None:
+                out.append(b)
+        return out
+
+    def hits_marker(box: BBox2D) -> bool:
+        return any(_item_hits_box(m, box) for m in marker)
+
+    def replace(k: int, ds: Dimension, rendered: List[SheetItem]) -> None:
+        for i, it in zip(groups[k], rendered):
+            items[i] = it
+        sheet.dimensions[k] = ds
+
+    # 1. linear texts on the cutting line: shift along the dimension line
+    for k, ds in enumerate(sheet.dimensions):
+        if ds.kind != "linear" or not marker:
+            continue
+        ti = text_index(groups[k])
+        if ti is None:
+            continue
+        box = _box_of(items[ti])
+        if box is None or not hits_marker(box):
+            continue
+        a = math.radians(float(ds.angle_deg))
+        d = np.array([math.cos(a), math.sin(a)])
+        p1, p2 = np.asarray(ds.p1, dtype=float), np.asarray(ds.p2, dtype=float)
+        u = d if float((p2 - p1) @ d) >= 0 else -d
+        mid = 0.5 * float(p1 @ u + p2 @ u)
+        lo, hi = min(float(p1 @ u), float(p2 @ u)), max(float(p1 @ u), float(p2 @ u))
+        crossings = [float(np.mean([np.asarray(m.a, float) @ u, np.asarray(m.b, float) @ u]))
+                     for m in marker if isinstance(m, Segment) and _segment_hits_box(m.a, m.b, box)]
+        tc = float(np.mean(crossings)) if crossings else mid
+        first = 1.0 if (hi - tc) >= (tc - lo) else -1.0
+        step = 0.5 * TEXT_ADVANCE * h * len(ds.text or "") + h
+        others = other_text_boxes(k)
+        rect = rects.get(ds.view)
+        best = None
+        for m in range(1, 7):
+            for sgn in (first, -first):
+                cand = dataclasses.replace(ds, text_offset=sgn * m * step)
+                rendered, t = _render_group(cand, style)
+                tb = _box_of(t)
+                if tb is None or hits_marker(tb) or any(_overlaps(tb, o.expanded(TEXT_CLEARANCE)) for o in others):
+                    continue
+                inside = rect is None or all(_inside(b, rect.expanded(1e-6)) for b in
+                                             (_box_of(it) for it in rendered) if b is not None)
+                score = (0 if inside else 1, m)
+                if best is None or score < best[0]:
+                    best = (score, cand, rendered)
+            if best is not None and best[0][0] == 0:
+                break
+        if best is not None:
+            replace(k, best[1], best[2])
+            stats["linear_text_shifted"] += 1
+
+    # 2. diameter callouts: no text on another text, the marker or a foreign leader
+    dim_segments = {k: [i for i in g if isinstance(items[i], Segment)] for k, g in enumerate(groups)}
+
+    def callout_clash(k: int, rendered: List[SheetItem], t: Text, others: List[BBox2D]) -> bool:
+        tb = _box_of(t)
+        if tb is None:
+            return True
+        if any(_overlaps(tb, o.expanded(TEXT_CLEARANCE)) for o in others) or hits_marker(tb):
+            return True
+        for it in rendered:          # own leader / shelf across another text
+            if isinstance(it, Segment) and any(_segment_hits_box(it.a, it.b, o.expanded(-0.2)) for o in others):
+                return True
+        return False
+
+    outlines = list(geoms.values())
+
+    def callout_score(k: int, rendered: List[SheetItem], t: Text, others: List[BBox2D], rect, e: int, ai: int):
+        """None when the placement is not allowed, else (out of rect, on outlines, on lines, e, ai)."""
+        if callout_clash(k, rendered, t, others):
+            return None
+        tb = _box_of(t)
+        if not _inside(tb, allowed) or any(_overlaps(tb, b) for b in blocked):
+            return None
+        boxes_r = [b for b in (_box_of(it) for it in rendered) if b is not None]
+        out_rect = 0 if (rect is None or all(_inside(b, rect.expanded(1e-6)) for b in boxes_r)) else 1
+        on_outline = sum(1 for o in outlines if _overlaps(tb, o))
+        foreign = [items[i] for kk, segs in dim_segments.items() if kk != k for i in segs]
+        on_lines = sum(1 for s in foreign if _segment_hits_box(s.a, s.b, tb))
+        leader = next((it for it in rendered if isinstance(it, Segment)), None)
+        length = math.hypot(leader.b[0] - leader.a[0], leader.b[1] - leader.a[1]) if leader is not None else 0.0
+        return (out_rect, on_outline, on_lines, round(length, 3), ai)
+
+    for _pass in range(2):
+        for k, ds in enumerate(sheet.dimensions):
+            if ds.kind != "diameter" or ds.view not in geoms:
+                continue
+            g = groups[k]
+            ti = text_index(g)
+            if ti is None:
+                continue
+            others = other_text_boxes(k)
+            rect = rects.get(ds.view)
+            now = callout_score(k, [items[i] for i in g], items[ti], others, rect, 0, 0)
+            if now is not None and now[:3] == (0, 0, 0):
+                continue                      # clean as planned
+            geom = geoms[ds.view]
+            angles = [float(ds.leader_angle_deg)] + [a for a in LEADER_ANGLES
+                                                     if abs(a - float(ds.leader_angle_deg)) > 1e-9]
+            best = None
+            for e in range(CALLOUT_EXTRA_STEPS + 1):
+                extra = e * (h + 2.0 * style.dim_text_gap)
+                for ai, ang in enumerate(angles):
+                    cand = _callout_candidate(ds, ang, extra, geom, style)
+                    rendered, t = _render_group(cand, style)
+                    score = callout_score(k, rendered, t, others, rect, e, ai)
+                    if score is not None and (best is None or score < best[0]):
+                        best = (score, cand, rendered)
+                if best is not None and best[0][:3] == (0, 0, 0) and extra > best[0][3]:
+                    break                     # every longer leader is longer than the clean best
+            if best is None:
+                if now is None:
+                    stats["unresolved"] += 1
+                continue
+            if now is not None and best[0] >= now:
+                continue
+            replace(k, best[1], best[2])
+            stats["callouts_moved"] += 1
+    return stats
+
+
+def text_collisions(items: Sequence[SheetItem], texts_idx: Sequence[int], marker_idx: Sequence[int]) -> List[str]:
+    """Descriptions of every pair of overlapping texts and every text crossed by a marker item."""
+    out: List[str] = []
+    boxes = [(i, _box_of(items[i])) for i in texts_idx]
+    boxes = [(i, b) for i, b in boxes if b is not None]
+    for a in range(len(boxes)):
+        ia, ba = boxes[a]
+        for b in range(a + 1, len(boxes)):
+            ib, bb = boxes[b]
+            if _overlaps(ba, bb):
+                out.append(f"{items[ia].text!r} overlaps {items[ib].text!r}")
+        for m in marker_idx:
+            if m != ia and _item_hits_box(items[m], ba):
+                out.append(f"{items[ia].text!r} crossed by the section marker")
+                break
+    return out
 
 
 def _extra_allowances(plan: DimensionPlan, boxes: Dict[str, BBox2D], counts: Dict[str, Tuple[int, int, int, int]],
@@ -868,13 +1267,8 @@ def _extra_allowances(plan: DimensionPlan, boxes: Dict[str, BBox2D], counts: Dic
         i = SIDES.index(side)
         e[i] = max(e[i], mm)
 
-    for d in plan.dims:
-        if d.kind != "diameter" or d.view not in boxes:
-            continue
-        dx, dy = callout_extent(d.text, style, d.leader_angle_deg, max(LEADER_LEN, LEADER_EXIT_MARGIN))
-        a = math.radians(d.leader_angle_deg)
-        add(d.view, "right" if math.cos(a) >= 0 else "left", dx)
-        add(d.view, "top" if math.sin(a) >= 0 else "bottom", dy)
+    # diameter callouts: scale-dependent exact reach, see _callout_room (QA round 1 issue 7:
+    # the fixed reach measured from the circle was ADDED to the bands, about 25 mm per side)
     for labelled in (SECTION_KEY, "iso"):
         if labelled in boxes:
             add(labelled, "top", LABEL_GAP + style.label_height + 1.0)
@@ -891,6 +1285,51 @@ def _extra_allowances(plan: DimensionPlan, boxes: Dict[str, BBox2D], counts: Dic
             if have < need:
                 add(name, side, e[i] + (need - have))
     return {v: (e[0], e[1], e[2], e[3]) for v, e in extra.items()}
+
+
+def _callout_room(plan: DimensionPlan, boxes: Dict[str, BBox2D], style: SheetStyle
+                  ) -> Callable[[float], Dict[str, Sides]]:
+    """``scale -> {view: sides}`` sheet mm the diameter callouts reach beyond the view outline.
+
+    Renders each callout exactly as ``compose`` does at that scale (leader
+    out of the outline by ``LEADER_EXIT_MARGIN``, shelf, text) and measures
+    its box against the geometry box. ``choose_scale`` takes the larger of
+    this and the bands on each side: the callout text sits in the band zone
+    next to the outline, the collision pass in ``compose`` keeps it off the
+    dimension texts.
+    """
+    calls = [d for d in plan.dims if d.kind == "diameter" and d.view in boxes]
+
+    def room(scale: float) -> Dict[str, Sides]:
+        out: Dict[str, List[float]] = {}
+        for d in calls:
+            bb = boxes[d.view]
+            geom = BBox2D(scale * bb.xmin, scale * bb.ymin, scale * bb.xmax, scale * bb.ymax)
+            ds = dataclasses.replace(d, center=(scale * float(d.center[0]), scale * float(d.center[1])),
+                                     radius=scale * float(d.radius))
+            ds = _callout_candidate(ds, float(d.leader_angle_deg), 0.0, geom, style)
+            box = BBox2D.of_primitives(render_dimension(ds, style))
+            if box is None:
+                continue
+            e = out.setdefault(d.view, [0.0, 0.0, 0.0, 0.0])
+            reach = (geom.xmin - box.xmin, geom.ymin - box.ymin, box.xmax - geom.xmax, box.ymax - geom.ymax)
+            for i in range(4):
+                e[i] = max(e[i], float(reach[i]))
+        return {v: (e[0], e[1], e[2], e[3]) for v, e in out.items()}
+
+    return room
+
+
+def _max_room(*fns: Callable[[float], Dict[str, Sides]]) -> Callable[[float], Dict[str, Sides]]:
+    def room(scale: float) -> Dict[str, Sides]:
+        out: Dict[str, List[float]] = {}
+        for fn in fns:
+            for v, s in fn(scale).items():
+                e = out.setdefault(v, [0.0, 0.0, 0.0, 0.0])
+                for i in range(4):
+                    e[i] = max(e[i], float(s[i]))
+        return {v: (e[0], e[1], e[2], e[3]) for v, e in out.items()}
+    return room
 
 
 def _short_span_room(plan: DimensionPlan, boxes: Dict[str, BBox2D], style: SheetStyle,
@@ -992,7 +1431,7 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
         labels[SECTION_KEY] = lambda s: sec_label
     if has_iso:
         labels["iso"] = lambda s: iso_label(s)
-    short_room = _short_span_room(plan, boxes, style, labels)
+    short_room = _max_room(_short_span_room(plan, boxes, style, labels), _callout_room(plan, boxes, style))
 
     def attempt(size: SheetSize):
         return choose_scale(boxes, counts, size, style, options.projection, has_section, has_iso,
@@ -1039,12 +1478,16 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
             items.append(Text((0.5 * (g.xmin + g.xmax), g.ymax + LABEL_GAP), iso_label(vs),
                               style.label_height, anchor="middle"))
     section_stats: dict = {}
+    marker_idx: List[int] = []
     if has_section:
         sec_items, section_stats = _section_items(section, origins[SECTION_KEY], scale, style, geoms[SECTION_KEY])
         items += sec_items
         if marker is not None:
-            items += _marker_items(marker, origins[marker[0]], scale, style, section.label,
-                                   counts.get(marker[0], (0, 0, 0, 0)))
+            mk = _marker_items(marker, origins[marker[0]], scale, style, section.label,
+                               counts.get(marker[0], (0, 0, 0, 0)))
+            marker_idx = list(range(len(items), len(items) + len(mk)))
+            items += mk
+    label_idx = [i for i, it in enumerate(items) if isinstance(it, Text) and i not in marker_idx]
     dimension_items: List[List[int]] = []
     for d, band in zip(plan.dims, _resolved_bands(plan)):
         if d.view not in origins or d.view == SECTION_KEY:
@@ -1055,6 +1498,17 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
         dimension_items.append(list(range(len(items), len(items) + len(rendered))))
         items += rendered
         sheet.dimensions.append(ds)
+    try:
+        collision_stats = _resolve_text_collisions(
+            items, sheet, dimension_items, marker_idx, label_idx, geoms, rects,
+            _frame_rect(size, style).expanded(-1.0), _obstacles(size, style), style)
+    except Exception as exc:          # the pass only moves texts; never lose the sheet over it
+        log.warning("layout: text collision pass failed (%s)", exc)
+        collision_stats = {"error": f"{type(exc).__name__}: {exc}"}
+    texts_idx = label_idx + [i for i in marker_idx if isinstance(items[i], Text)] + \
+        [i for g in dimension_items for i in g if isinstance(items[i], Text)]
+    collisions = text_collisions(items, texts_idx, [i for i in marker_idx if not isinstance(items[i], Text)])
+    collision_stats["remaining"] = len(collisions)
 
     projection = "first_angle" if options.projection in ("first", "first_angle") else "third_angle"
     fields = {
@@ -1091,14 +1545,20 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
                        "title": fields["title"], "owner": fields["owner"],
                        "date": fields["date"], "section_layout": section_stats,
                        "iso_scale": (iso_scale if "iso" in origins else None),
-                       "marker_view": marker[0] if marker is not None else None})
-    flags: List[Tuple[str, str, str]] = []
+                       "marker_view": marker[0] if marker is not None else None,
+                       "text_collisions": collision_stats})
+    # the planner's flags (dimension_extent_mismatch, QA issue 2) travel with the layout's, so the
+    # pipeline's existing loop over LayoutResult.flags reports them with no extra step
+    flags: List[Tuple[str, str, str]] = [tuple(f) for f in (getattr(plan, "flags", None) or [])]
     if not size.iso5457:
         flags.append(("sheet_not_iso5457", "warning",
                       f"{size.name} ({size.orientation}) is not an ISO 5457 sheet (A4 is portrait only)"))
     if overflow:
         flags.append(("views_overflow", "warning",
                       f"the views do not fit {size.name} even at {stext}"))
+    if collisions:
+        flags.append(("layout_text_collision", "info",
+                      f"{len(collisions)} text collision(s) left: " + "; ".join(collisions[:5])))
     placements = {n: ((float(origins[n][0]), float(origins[n][1])), rects[n]) for n in origins}
     log.debug("layout: %s at %s, %d items, %d dims", size.name, stext, len(items), len(sheet.dimensions))
     return LayoutResult(sheet=sheet, scale=scale, scale_text=stext, sheet_size=size,
@@ -1107,4 +1567,4 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
 
 __all__ = ["LayoutResult", "compose", "choose_scale", "grid_cells", "band_counts", "band_extent",
            "frame_items", "title_block_items", "strip_items", "projection_symbol", "marker_arrow_at",
-           "SECTION_KEY"]
+           "SECTION_KEY", "text_collisions"]

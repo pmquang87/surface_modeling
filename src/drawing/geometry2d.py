@@ -52,7 +52,8 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import List, Sequence, Tuple
+import time
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -396,25 +397,15 @@ def _union_find_roots(n: int, pairs) -> np.ndarray:
     return np.array([find(i) for i in range(n)], dtype=np.int64)
 
 
-def chain_segments(segments: np.ndarray, tol: float) -> Tuple[List[np.ndarray], int]:
-    """Chain unordered segments (k, 2, d) into closed loops.
+def _weld_endpoints(segs: np.ndarray, tol: float):
+    """Weld segment endpoints closer than ``tol``: (node index per endpoint (k, 2), node coords).
 
-    Endpoints closer than ``tol`` are welded (grid key at ``tol`` plus a
-    KD-tree union-find); welded points become their mean. Zero-length and
-    duplicate edges are ignored. Paths stop at nodes of degree != 2. Returns
-    (closed loops without a repeated end point, number of open chains
-    dropped). Works in 2D and 3D.
+    Grid key at ``tol`` plus a KD-tree union-find; a node sits at the mean of
+    its welded endpoints. Works in 2D and 3D.
     """
-    segs = np.asarray(segments, dtype=np.float64)
-    if segs.size == 0:
-        return [], 0
-    dim = segs.shape[-1]
-    segs = segs.reshape(-1, 2, dim)
-    tol = float(tol)
-    if not tol > 0.0:
-        raise ValueError(f"chain_segments: tol must be positive, got {tol!r}")
     from scipy.spatial import cKDTree
 
+    dim = segs.shape[-1]
     pts = segs.reshape(-1, dim)
     key = np.round(pts / tol).astype(np.int64)
     uniq, inv = np.unique(key, axis=0, return_inverse=True)
@@ -433,6 +424,112 @@ def chain_segments(segments: np.ndarray, tol: float) -> Tuple[List[np.ndarray], 
     np.add.at(node_xyz, node.ravel(), pts)
     np.add.at(c2, node.ravel(), 1.0)
     node_xyz /= c2[:, None]
+    return node, node_xyz
+
+
+def _check_deadline(deadline, what: str) -> None:
+    if deadline is not None and time.perf_counter() > deadline:
+        raise TimeoutError(f"{what}: time budget exceeded")
+
+
+def chain_paths(segments: np.ndarray, tol: float, *, deadline: float = None
+                ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """Chain unordered 2D segments (k, 2, 2) into polylines: ``(open, closed)``.
+
+    Endpoints closer than ``tol`` are welded as in ``chain_segments``
+    (welded points move to their mean, so by at most ``tol``). Zero-length
+    and duplicate edges are ignored. A path runs through nodes of degree 2
+    and stops at nodes of any other degree (ends, T- and X-junctions), so
+    every input edge lands in exactly one path and no path crosses a
+    junction. Open paths are (n >= 2, 2) arrays from end to end; closed
+    paths (cycles of degree-2 nodes, n >= 3) have no repeated end point.
+    Paths are emitted in a deterministic order (by smallest start node).
+    ``deadline`` (a ``time.perf_counter()`` value) raises ``TimeoutError``
+    when passed during the walk.
+    """
+    segs = _as_segments(segments)
+    if len(segs) == 0:
+        return [], []
+    tol = float(tol)
+    if not tol > 0.0:
+        raise ValueError(f"chain_paths: tol must be positive, got {tol!r}")
+    node, node_xy = _weld_endpoints(segs, tol)
+    edges = node[node[:, 0] != node[:, 1]]
+    if len(edges) == 0:
+        return [], []
+    edges = np.unique(np.sort(edges, axis=1), axis=0)
+    n_nodes = len(node_xy)
+    # CSR adjacency: neighbours of node v are nb[ptr[v]:ptr[v + 1]] (edge ids in eid)
+    ends = np.concatenate([edges[:, 0], edges[:, 1]])
+    other = np.concatenate([edges[:, 1], edges[:, 0]])
+    eid = np.concatenate([np.arange(len(edges)), np.arange(len(edges))])
+    order = np.argsort(ends, kind="stable")
+    nb = other[order].tolist()
+    eids = eid[order].tolist()
+    deg = np.bincount(ends, minlength=n_nodes)
+    ptr = np.concatenate([[0], np.cumsum(deg)]).tolist()
+    deg = deg.tolist()
+    used = [False] * len(edges)
+    open_paths: List[np.ndarray] = []
+    closed_paths: List[np.ndarray] = []
+    steps = 0
+
+    def walk(s: int, k: int) -> list:
+        nonlocal steps
+        path = [s]
+        while True:
+            used[eids[k]] = True
+            nxt = nb[k]
+            path.append(nxt)
+            steps += 1
+            if steps % 4096 == 0:
+                _check_deadline(deadline, "chain_paths")
+            if nxt == s or deg[nxt] != 2:
+                return path
+            a, b = ptr[nxt], ptr[nxt + 1]
+            k = next((q for q in range(a, b) if not used[eids[q]]), -1)
+            if k < 0:
+                return path
+
+    def emit(p: list) -> None:
+        if p[-1] == p[0] and len(p) > 3:          # loop (possibly hanging on a junction)
+            closed_paths.append(node_xy[p[:-1]].copy())
+        else:                                      # a 2-cycle cannot occur (edges are unique)
+            open_paths.append(node_xy[p].copy())
+
+    for s in range(n_nodes):                      # paths from ends and junctions
+        if deg[s] == 2 or deg[s] == 0:
+            continue
+        for k in range(ptr[s], ptr[s + 1]):
+            if not used[eids[k]]:
+                emit(walk(s, k))
+    for s in range(n_nodes):                      # what is left: pure cycles
+        if deg[s] != 2:
+            continue
+        for k in range(ptr[s], ptr[s + 1]):
+            if not used[eids[k]]:
+                emit(walk(s, k))
+    return open_paths, closed_paths
+
+
+def chain_segments(segments: np.ndarray, tol: float) -> Tuple[List[np.ndarray], int]:
+    """Chain unordered segments (k, 2, d) into closed loops.
+
+    Endpoints closer than ``tol`` are welded (grid key at ``tol`` plus a
+    KD-tree union-find); welded points become their mean. Zero-length and
+    duplicate edges are ignored. Paths stop at nodes of degree != 2. Returns
+    (closed loops without a repeated end point, number of open chains
+    dropped). Works in 2D and 3D.
+    """
+    segs = np.asarray(segments, dtype=np.float64)
+    if segs.size == 0:
+        return [], 0
+    dim = segs.shape[-1]
+    segs = segs.reshape(-1, 2, dim)
+    tol = float(tol)
+    if not tol > 0.0:
+        raise ValueError(f"chain_segments: tol must be positive, got {tol!r}")
+    node, node_xyz = _weld_endpoints(segs, tol)
 
     edges = node[node[:, 0] != node[:, 1]]
     if len(edges) == 0:
@@ -482,68 +579,303 @@ def _canonical_dirs(segs: np.ndarray):
     return u, length
 
 
-def merge_collinear(segments: np.ndarray, tol: float) -> np.ndarray:
+_SAMPLES_PER_SEG = 8.0       # cap on the mean number of KD samples per segment in _near_pairs
+
+
+def _seg_samples(segs: np.ndarray, step: float):
+    """Points every <= ``step`` along each segment (ends included) and their owner index."""
+    d = segs[:, 1] - segs[:, 0]
+    L = np.hypot(d[:, 0], d[:, 1])
+    k = np.maximum(1, np.ceil(L / step)).astype(np.int64)        # intervals per segment
+    cnt = k + 1
+    owner = np.repeat(np.arange(len(segs), dtype=np.int64), cnt)
+    first = np.cumsum(cnt) - cnt
+    j = np.arange(int(cnt.sum()), dtype=np.int64) - np.repeat(first, cnt)
+    t = j / np.repeat(k, cnt)
+    return segs[owner, 0] + d[owner] * t[:, None], owner
+
+
+_NEAR_CLASSES = 8           # sample-spacing classes in _near_pairs (spacing bound step / 2**m)
+
+
+def _spacing_classes(segs: np.ndarray, step: float):
+    """Samples of ``segs`` at <= ``step`` and the spacing class of each sample.
+
+    A segment shorter than ``step`` is sampled at its two ends only, so its
+    real spacing is its length; class m holds samples whose segment spacing
+    is at most ``step / 2**m`` (the last class: everything finer).
+    """
+    pts, own = _seg_samples(segs, step)
+    d = segs[:, 1] - segs[:, 0]
+    L = np.hypot(d[:, 0], d[:, 1])
+    k = np.maximum(1, np.ceil(L / step))
+    s = np.maximum(L / k, step * 1e-12)
+    m = np.clip(np.floor(np.log2(step / s)), 0, _NEAR_CLASSES - 1).astype(np.int64)
+    return pts, own, m[own]
+
+
+def _near_pairs(a: np.ndarray, b: Optional[np.ndarray], r: float, *, max_sin: Optional[float] = None,
+                deadline: Optional[float] = None):
+    """Candidate pairs of segments closer than ``r`` (a superset), O(n log n).
+
+    Every segment is sampled at a step of at most ``s``; a sample lies
+    within ``h = spacing / 2`` of every point of its segment piece, so two
+    segments whose distance is at most ``r`` own samples at most
+    ``r + h_i + h_j`` apart and a KD-tree radius query finds every such
+    pair. ``s`` is the median segment length (at least ``2 r``), raised
+    until there are at most ``_SAMPLES_PER_SEG`` samples per segment on
+    average. Segments shorter than ``s`` keep their own (smaller) spacing:
+    the samples are grouped into ``_NEAR_CLASSES`` spacing classes and each
+    class pair is queried with its own radius, so a view of 0.2 mm chords
+    with a 1.5 mm tolerance is not queried at ``r + s = 4.5`` mm (F1
+    review: 03 front view, 11 M candidate pairs and 18 s before, see the
+    measured numbers in the task report).
+
+    ``max_sin`` (optional): keep only pairs whose directions differ by at
+    most ``asin(max_sin)`` (the loose-mode parallelism test), applied to
+    the sample pairs before the unique step. ``deadline`` raises
+    ``TimeoutError`` between the class queries. ``b is None``: pairs
+    (i, j), i < j, within ``a``; otherwise pairs (i into a, j into b).
+    Returns two int64 arrays (unique pairs).
+    """
+    from scipy.spatial import cKDTree
+
+    na = len(a)
+    nb = 0 if b is None else len(b)
+    empty = (np.zeros(0, np.int64), np.zeros(0, np.int64))
+    if na == 0 or (b is not None and nb == 0) or (b is None and na < 2):
+        return empty
+    allseg = a if b is None else np.concatenate([a, b])
+    L = np.linalg.norm(allseg[:, 1] - allseg[:, 0], axis=1)
+    r = float(r)
+    step = max(2.0 * r, float(np.median(L)), float(L.sum()) / (_SAMPLES_PER_SEG * len(allseg)), 1e-12)
+    bound = step / np.power(2.0, np.arange(_NEAR_CLASSES))          # spacing bound per class
+    pa, oa, ca = _spacing_classes(a, step)
+    da = a[:, 1] - a[:, 0]
+    if b is None:
+        pb, ob, cb, db, n_key = pa, oa, ca, da, na
+    else:
+        pb, ob, cb = _spacing_classes(b, step)
+        db, n_key = b[:, 1] - b[:, 0], nb
+    groups_a = [np.flatnonzero(ca == m) for m in range(_NEAR_CLASSES)]
+    groups_b = groups_a if b is None else [np.flatnonzero(cb == m) for m in range(_NEAR_CLASSES)]
+    trees_a = [cKDTree(pa[g]) if len(g) else None for g in groups_a]
+    trees_b = trees_a if b is None else [cKDTree(pb[g]) if len(g) else None for g in groups_b]
+    keys = []
+    for ma in range(_NEAR_CLASSES):
+        if trees_a[ma] is None:
+            continue
+        for mb in range(ma if b is None else 0, _NEAR_CLASSES):
+            if trees_b[mb] is None:
+                continue
+            _check_deadline(deadline, "near pairs")
+            rad = (r + 0.5 * (bound[ma] + bound[mb])) * (1.0 + 1e-9) + 1e-12
+            if b is None and ma == mb:
+                pr = trees_a[ma].query_pairs(rad, output_type="ndarray")
+                if len(pr) == 0:
+                    continue
+                i, j = oa[groups_a[ma][pr[:, 0]]], oa[groups_a[ma][pr[:, 1]]]
+            else:
+                sdm = trees_a[ma].sparse_distance_matrix(trees_b[mb], rad, output_type="ndarray")
+                if len(sdm) == 0:
+                    continue
+                i, j = oa[groups_a[ma][sdm["i"]]], ob[groups_b[mb][sdm["j"]]]
+            if b is None:
+                m = i != j
+                i, j = np.minimum(i[m], j[m]), np.maximum(i[m], j[m])
+            if max_sin is not None and len(i):
+                u, v = da[i], db[j]
+                cross = np.abs(u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0])
+                keep = cross <= float(max_sin) * np.hypot(u[:, 0], u[:, 1]) * np.hypot(v[:, 0], v[:, 1])
+                i, j = i[keep], j[keep]
+            if len(i):
+                keys.append(np.unique(i * n_key + j))
+    if not keys:
+        return empty
+    # every segment lies in exactly one class, so a segment pair is found by exactly one
+    # class pair: the per-class key sets are disjoint and need no second unique
+    key = np.concatenate(keys) if len(keys) > 1 else keys[0]
+    return key // n_key, key % n_key
+
+
+def _components(n: int, i: np.ndarray, j: np.ndarray) -> np.ndarray:
+    """Connected-component label per node (labels ordered by smallest member)."""
+    if len(i) == 0:
+        return np.arange(n, dtype=np.int64)
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    g = coo_matrix((np.ones(len(i), np.int8), (i, j)), shape=(n, n))
+    _, lab = connected_components(g, directed=False)
+    return np.asarray(lab, dtype=np.int64)
+
+
+def premerge_collinear(segs: np.ndarray, tol: float) -> np.ndarray:
+    """Cheap O(n log n) union of overlapping runs on (numerically) the same line.
+
+    Edge-on rims project onto one line as hundreds of short, exactly
+    collinear segments (a 2000-section cylinder in a side view: 4000 rim
+    edges on two lines), and poly-HLR hidden compounds repeat edges split at
+    different parameters. Segments whose direction agrees to 1e-9 rad and
+    whose line offset falls in the same ``tol`` bin are unioned per line
+    here (1D interval union, gap <= tol), keeping the extreme original
+    endpoints. Segments in neighbouring bins are left to
+    ``merge_collinear``. Zero-length segments are dropped.
+    """
+    s = np.asarray(segs, dtype=np.float64).reshape(-1, 2, 2)
+    if len(s) < 2:
+        return s
+    d = s[:, 1] - s[:, 0]
+    length = np.linalg.norm(d, axis=1)
+    s, d, length = s[length > 0], d[length > 0], length[length > 0]
+    if len(s) < 2:
+        return s
+    u = d / length[:, None]
+    flip = (u[:, 0] < 0) | ((u[:, 0] == 0) & (u[:, 1] < 0))
+    u[flip] *= -1.0
+    theta = np.arctan2(u[:, 1], u[:, 0])
+    off = s[:, 0, 0] * -u[:, 1] + s[:, 0, 1] * u[:, 0]
+    keys = np.stack([np.round(theta / 1e-9), np.round(off / max(tol, 1e-300))], axis=1).astype(np.int64)
+    _, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+    inv = np.asarray(inv).ravel()
+    single = counts[inv] == 1
+    out = [s[single]]
+    multi = np.nonzero(~single)[0]
+    if len(multi):
+        order = multi[np.argsort(inv[multi], kind="stable")]
+        g = inv[order]
+        cuts = np.nonzero(np.diff(g))[0] + 1
+        for members in np.split(order, cuts):
+            ref_u = u[members[0]]
+            p0 = s[members[0], 0]
+            pts = s[members].reshape(-1, 2)              # (2m, 2)
+            t = (pts - p0) @ ref_u
+            t_pair = t.reshape(-1, 2)
+            lo_i = np.argmin(t_pair, axis=1)
+            t_lo = t_pair[np.arange(len(members)), lo_i]
+            t_hi = t_pair[np.arange(len(members)), 1 - lo_i]
+            p_lo = pts.reshape(-1, 2, 2)[np.arange(len(members)), lo_i]
+            p_hi = pts.reshape(-1, 2, 2)[np.arange(len(members)), 1 - lo_i]
+            idx = np.argsort(t_lo, kind="stable")
+            run_a, run_b, run_end = p_lo[idx[0]], p_hi[idx[0]], t_hi[idx[0]]
+            runs = []
+            for k in idx[1:]:
+                if t_lo[k] <= run_end + tol:
+                    if t_hi[k] > run_end:
+                        run_end, run_b = t_hi[k], p_hi[k]
+                else:
+                    runs.append((run_a, run_b))
+                    run_a, run_b, run_end = p_lo[k], p_hi[k], t_hi[k]
+            runs.append((run_a, run_b))
+            out.append(np.asarray(runs, dtype=np.float64).reshape(-1, 2, 2))
+    return np.concatenate(out).reshape(-1, 2, 2)
+
+
+def _merge_pairs_vectorized(segs: np.ndarray, pairs: np.ndarray, tol: float):
+    """``_merge_group`` for two-member groups, vectorized: (merged (m, 2, 2), ok mask)."""
+    a, b = segs[pairs[:, 0]], segs[pairs[:, 1]]
+    pts = np.concatenate([a, b], axis=1)                         # (m, 4, 2)
+    la = np.linalg.norm(a[:, 1] - a[:, 0], axis=1)
+    lb = np.linalg.norm(b[:, 1] - b[:, 0], axis=1)
+    ref = np.where((la >= lb)[:, None, None], a, b)
+    ur = ref[:, 1] - ref[:, 0]
+    ur = ur / np.linalg.norm(ur, axis=1)[:, None]
+    t = np.einsum("mpk,mk->mp", pts - ref[:, :1], ur)
+    rows = np.arange(len(pts))
+    ps = pts[rows, np.argmin(t, axis=1)]
+    pe = pts[rows, np.argmax(t, axis=1)]
+    nd = pe - ps
+    nL = np.linalg.norm(nd, axis=1)
+    nn = np.stack([-nd[:, 1], nd[:, 0]], axis=1) / np.where(nL > 0, nL, 1.0)[:, None]
+    dev = np.abs(np.einsum("mpk,mk->mp", pts - ps[:, None, :], nn)).max(axis=1)
+    ok = (nL > 0) & (dev <= tol)
+    return np.stack([ps, pe], axis=1), ok
+
+
+def merge_collinear(segments: np.ndarray, tol: float, *, deadline: Optional[float] = None) -> np.ndarray:
     """Merge collinear segments that overlap or touch (gap <= tol).
 
     Candidates: two segments are on one line when both endpoints of each lie
-    within ``tol`` of the other's infinite line. A merge is accepted only
-    when every input endpoint of the merged run lies within ``tol`` of the
-    output segment's line, so the chords of a finely faceted curve (each
-    pair collinear within tol, the chain not) are never straightened: every
-    input vertex stays within ``tol`` of the output. The merged segment keeps
-    the original extreme endpoints. Segments not longer than ``tol`` are
-    dropped. Returns (m, 2, 2).
+    within ``tol`` of the other's infinite line, and they touch: one's
+    extent along the other's line overlaps it or leaves a gap <= ``tol``.
+    A merge is accepted only when every input endpoint of the merged run
+    lies within ``tol`` of the output segment's line, so the chords of a
+    finely faceted curve (each pair collinear within tol, the chain not)
+    are never straightened: every input vertex stays within ``tol`` of the
+    output. The merged segment keeps the original extreme endpoints.
+    Segments not longer than ``tol`` are dropped. Returns (m, 2, 2).
+
+    Cost O(n log n) (QA issue 3: the old angular-window scan was quadratic
+    on short chords, 338 s for 175k poly-HLR chords): exactly collinear
+    runs are unioned first (``premerge_collinear``), the touching
+    candidates come from a KD-tree over points sampled along the segments
+    (``_near_pairs``), groups are connected components, two-member groups
+    are merged vectorized and larger ones by the ``_merge_group`` sweep.
+    ``deadline`` (a ``time.perf_counter()`` value) raises ``TimeoutError``
+    once passed.
     """
     segs = _as_segments(segments)
     if len(segs) == 0:
         return _empty_segments()
     tol = float(tol)
+    # exact runs first, so tiny exactly collinear pieces (edge-on rim chords near a
+    # silhouette) still extend their run before the length filter drops them
+    segs = premerge_collinear(segs, tol)
     u, length = _canonical_dirs(segs)
     keep = length > tol
     if not keep.all():
         log.debug("merge_collinear: dropped %d segments not longer than tol", int((~keep).sum()))
-    segs, u, length = segs[keep], u[keep], length[keep]
-    n = len(segs)
-    if n == 0:
+    segs = segs[keep]
+    if len(segs) == 0:
         return _empty_segments()
-    theta = np.mod(np.arctan2(u[:, 1], u[:, 0]), math.pi)          # [0, pi)
-    order = np.argsort(theta, kind="stable")
-    th_sorted = theta[order]
+    n = len(segs)
+    if n < 2:
+        return segs.copy().reshape(-1, 2, 2)
+    _check_deadline(deadline, "merge_collinear")
+    d = segs[:, 1] - segs[:, 0]
+    length = np.linalg.norm(d, axis=1)
+    u = d / length[:, None]
     nrm = np.stack([-u[:, 1], u[:, 0]], axis=1)
-    pairs = []
-    for i in range(n):
-        win = min(math.pi / 2, 2.0 * tol / length[i] + 1e-12)
-        cand = []
-        for shift in (-math.pi, 0.0, math.pi):           # wrap around theta = 0 / pi
-            lo = np.searchsorted(th_sorted, theta[i] + shift - win, side="left")
-            hi = np.searchsorted(th_sorted, theta[i] + shift + win, side="right")
-            if hi > lo:
-                cand.append(order[lo:hi])
-        if not cand:
-            continue
-        # the shifted windows are disjoint unless win reaches pi/2
-        j = cand[0] if len(cand) == 1 else np.unique(np.concatenate(cand))
-        j = j[j > i]
-        if len(j) == 0:
-            continue
-        # endpoints of j within tol of line i, and endpoints of i within tol of line j
-        dj = np.abs((segs[j] - segs[i, 0]) @ nrm[i])                   # (m, 2)
+    I, J = _near_pairs(segs, None, tol)
+    _check_deadline(deadline, "merge_collinear")
+    if len(I):
+        dj = np.abs(np.einsum("mpk,mk->mp", segs[J] - segs[I, 0][:, None, :], nrm[I]))
         ok = np.all(dj <= tol, axis=1)
-        if not ok.any():
-            continue
-        j = j[ok]
-        di = np.abs(np.einsum("mk,pk->mp", nrm[j], segs[i]) - np.einsum("mk,mk->m", nrm[j], segs[j, 0])[:, None])
-        ok2 = np.all(di <= tol, axis=1)
-        pairs.extend((i, int(x)) for x in j[ok2])
-    roots = _union_find_roots(n, pairs)
-    out = []
-    for r in np.unique(roots):
-        members = np.nonzero(roots == r)[0]
-        if len(members) == 1:
-            out.append(segs[members[0]])
-            continue
-        out.extend(_merge_group(segs, members, length, tol))
-    return np.asarray(out, dtype=np.float64).reshape(-1, 2, 2)
+        I, J = I[ok], J[ok]
+    if len(I):
+        di = np.abs(np.einsum("mpk,mk->mp", segs[I] - segs[J, 0][:, None, :], nrm[J]))
+        ok = np.all(di <= tol, axis=1)
+        I, J = I[ok], J[ok]
+    if len(I):
+        tj = np.einsum("mpk,mk->mp", segs[J] - segs[I, 0][:, None, :], u[I])
+        ok = (tj.max(axis=1) >= -tol) & (tj.min(axis=1) <= length[I] + tol)
+        I, J = I[ok], J[ok]
+    lab = _components(n, I, J)
+    order = np.argsort(lab, kind="stable")
+    cuts = np.flatnonzero(np.diff(lab[order])) + 1
+    groups = np.split(order, cuts)
+    sizes = np.fromiter((len(g) for g in groups), dtype=np.int64, count=len(groups))
+    out = [segs[np.concatenate([g for g, k in zip(groups, sizes) if k == 1])]] if (sizes == 1).any() else []
+    two = [g for g, k in zip(groups, sizes) if k == 2]
+    if two:
+        pairs = np.asarray(two, dtype=np.int64).reshape(-1, 2)
+        merged, ok = _merge_pairs_vectorized(segs, pairs, tol)
+        out.append(merged[ok])
+        out.append(segs[pairs[~ok].ravel()])
+    big = [g for g, k in zip(groups, sizes) if k > 2]
+    rest = []
+    for c, members in enumerate(big):
+        if c % 256 == 0:
+            _check_deadline(deadline, "merge_collinear")
+        rest.extend(_merge_group(segs, members, length, tol))
+    if rest:
+        out.append(np.asarray(rest, dtype=np.float64).reshape(-1, 2, 2))
+    out = [o.reshape(-1, 2, 2) for o in out if len(o)]
+    if not out:
+        return _empty_segments()
+    return np.concatenate(out).astype(np.float64)
+
+
+_MERGE_MAX_TRIES = 64        # open runs tried per member in _merge_group (newest first)
 
 
 class _Run:
@@ -560,16 +892,19 @@ class _Run:
         """Join a-b when it touches the run AND every endpoint of the run plus
         a and b stays within ``tol`` of the line through the new extremes."""
         ps, pe = self.ps, self.pe
-        d = pe - ps
-        L = math.hypot(float(d[0]), float(d[1]))
+        # cheap rejects in plain floats (this is called O(m * runs) times per group)
+        px, py = float(ps[0]), float(ps[1])
+        dx, dy = float(pe[0]) - px, float(pe[1]) - py
+        L = math.hypot(dx, dy)
         if L <= 0.0:
             return False
-        u = d / L
-        ta, tb = float((a - ps) @ u), float((b - ps) @ u)
+        ux, uy = dx / L, dy / L
+        ax, ay = float(a[0]) - px, float(a[1]) - py
+        bx, by = float(b[0]) - px, float(b[1]) - py
+        ta, tb = ax * ux + ay * uy, bx * ux + by * uy
         if min(ta, tb) > L + tol or max(ta, tb) < -tol:     # gap along the run's own line
             return False
-        nrm = np.array([-u[1], u[0]])
-        if abs(float((a - ps) @ nrm)) > tol or abs(float((b - ps) @ nrm)) > tol:
+        if abs(ay * ux - ax * uy) > tol or abs(by * ux - bx * uy) > tol:
             return False                                     # cheap reject before the full check
         cand = ((0.0, ps), (L, pe), (ta, a), (tb, b))
         nps = min(cand, key=lambda c: c[0])[1]
@@ -618,7 +953,11 @@ def _merge_group(segs: np.ndarray, members: np.ndarray, length: np.ndarray, tol:
             else:
                 still.append(run)
         runs = still
-        for run in runs:
+        # newest runs first, at most _MERGE_MAX_TRIES of them: a finely faceted closed
+        # curve is ONE group with hundreds of open runs, and trying them all made the
+        # sweep quadratic (wheel top view: 597k try_join calls, 8.8 s). Skipping a join
+        # only leaves a segment unmerged; it never changes geometry.
+        for run in runs[:-_MERGE_MAX_TRIES - 1:-1]:
             if run.try_join(a, b, tol):
                 run.tmax = max(run.tmax, e_ref)
                 break
@@ -628,71 +967,185 @@ def _merge_group(segs: np.ndarray, members: np.ndarray, length: np.ndarray, tol:
     return out
 
 
-def subtract_covered(hidden: np.ndarray, visible: np.ndarray, tol: float) -> np.ndarray:
+_LOOSE_SIN = math.sin(math.radians(15.0))   # max angle between a hidden piece and the visible edge it lies on
+
+
+def _cut_intervals(a: np.ndarray, u: np.ndarray, L: float, tv: np.ndarray, tol: float) -> list:
+    """Pieces of [0, L] along a + t u left after removing the intervals ``tv`` (m, 2)."""
+    iv = np.sort(tv, axis=1)
+    iv = iv[(iv[:, 1] > 0.0) & (iv[:, 0] < L)]
+    iv = iv[np.argsort(iv[:, 0], kind="stable")]
+    cur = 0.0
+    pieces = []
+    for s, e in iv:
+        if s > cur:
+            pieces.append((cur, min(s, L)))
+        cur = max(cur, e)
+        if cur >= L:
+            break
+    if cur < L:
+        pieces.append((cur, L))
+    return [np.array([a + s * u, a + e * u]) for s, e in pieces if e - s > tol]
+
+
+def _point_seg_dist_pairs(p: np.ndarray, sa: np.ndarray, sb: np.ndarray) -> np.ndarray:
+    """Row-wise distance of points p (m, 2) to segments sa-sb (m, 2)."""
+    d = sb - sa
+    dd = np.einsum("mk,mk->m", d, d)
+    t = np.clip(np.einsum("mk,mk->m", p - sa, d) / np.where(dd > 0, dd, 1.0), 0.0, 1.0)
+    return np.linalg.norm(p - (sa + t[:, None] * d), axis=1)
+
+
+def _drop_on_visible(pieces: np.ndarray, vis: np.ndarray, tol: float,
+                     deadline: Optional[float] = None) -> np.ndarray:
+    """Drop hidden pieces whose ends and midpoint each lie within ``tol`` of a
+    near-parallel (<= 15 deg) visible segment (possibly different ones)."""
+    if len(pieces) == 0 or len(vis) == 0:
+        return pieces
+    I, J = _near_pairs(pieces, vis, tol, max_sin=_LOOSE_SIN, deadline=deadline)
+    if len(I) == 0:
+        return pieces
+    dh = pieces[I, 1] - pieces[I, 0]
+    dv = vis[J, 1] - vis[J, 0]
+    cross = np.abs(dh[:, 0] * dv[:, 1] - dh[:, 1] * dv[:, 0])
+    par = cross <= _LOOSE_SIN * np.linalg.norm(dh, axis=1) * np.linalg.norm(dv, axis=1)
+    I, J = I[par], J[par]
+    if len(I) == 0:
+        return pieces
+    hit = np.zeros((len(pieces), 3), dtype=bool)
+    probes = (pieces[I, 0], 0.5 * (pieces[I, 0] + pieces[I, 1]), pieces[I, 1])
+    for k, p in enumerate(probes):
+        near = _point_seg_dist_pairs(p, vis[J, 0], vis[J, 1]) <= tol
+        hit[I[near], k] = True
+    drop = hit.all(axis=1)
+    if drop.any():
+        log.debug("subtract_covered: dropped %d hidden pieces lying on visible edges", int(drop.sum()))
+    return pieces[~drop]
+
+
+def subtract_covered(hidden: np.ndarray, visible: np.ndarray, tol: float, *, loose: bool = False,
+                     deadline: Optional[float] = None, min_len: Optional[float] = None) -> np.ndarray:
     """Remove the parts of hidden segments that lie on visible segments.
 
     A visible segment covers a hidden one where both its endpoints lie within
     ``tol`` of the hidden segment's line; its projection onto the hidden
     segment is cut out. Hidden segments (and remaining pieces) not longer
-    than ``tol`` are always dropped, whatever ``visible`` holds; every other
+    than ``min_len`` are always dropped, whatever ``visible`` holds, and
+    visible segments not longer than ``min_len`` cover nothing; every other
     hidden segment with no collinear visible segment is returned unchanged.
+    ``min_len=None`` means ``min_len = tol`` (the old behaviour). Callers
+    that enlarge ``tol`` beyond the geometric tolerance (the paper-scaled
+    cover tolerance of the poly-HLR route, the 3 px outline cover of the
+    mesh route) must pass the geometric tolerance as ``min_len``, otherwise
+    every short chord of a finely faceted curve is deleted anywhere in the
+    view (F1 review: 256-section r10 rim at scale 1 -> 0 hidden lines).
     Only segments are handled: a hidden Circle/Arc lying on a visible one
     (the far mouth of a through hole) is removed with
     ``drop_covered_curves`` before flattening.
+
+    ``loose=True`` (poly-HLR and mesh routes, where the hidden and visible
+    copies of one edge come from different tessellations, QA issue 27): a
+    visible segment also covers the hidden one when both hidden endpoints
+    lie within ``tol`` of the visible segment's line; in loose mode every
+    covering pair must be near-parallel (at most 15 degrees apart), and
+    afterwards every remaining piece whose two ends and midpoint each lie
+    within ``tol`` of a visible segment at most 15 degrees off its direction
+    is dropped. The angle guard keeps hidden lines that merely cross visible
+    ones, also short chords whose two ends both lie within ``tol`` of the
+    visible line.
+
+    Candidates come from a KD-tree over points sampled along the segments
+    (``_near_pairs``), O((H + V) log(H + V)) instead of the old O(H V) scan
+    (QA issue 3: 128 s for 184k x 10k). ``deadline`` (a
+    ``time.perf_counter()`` value) raises ``TimeoutError`` once passed.
     """
     hid = _as_segments(hidden)
     vis = _as_segments(visible)
     tol = float(tol)
+    floor = tol if min_len is None else max(float(min_len), 0.0)
     if len(hid) == 0:
         return _empty_segments()
     hlen = np.linalg.norm(hid[:, 1] - hid[:, 0], axis=1)
-    if not np.all(hlen > tol):
-        log.debug("subtract_covered: dropped %d hidden segments not longer than tol",
-                  int(np.count_nonzero(hlen <= tol)))
-        hid = hid[hlen > tol]
+    if not np.all(hlen > floor):
+        log.debug("subtract_covered: dropped %d hidden segments not longer than %.4g",
+                  int(np.count_nonzero(hlen <= floor)), floor)
+        hid = hid[hlen > floor]
         if len(hid) == 0:
             return _empty_segments()
     if len(vis) == 0:
         return hid.copy()
     vlen = np.linalg.norm(vis[:, 1] - vis[:, 0], axis=1)
-    vis = vis[vlen > tol]
-    out = []
-    for h in hid:
-        a, b = h[0], h[1]
-        d = b - a
-        L = float(np.linalg.norm(d))
-        if L <= tol:
-            continue
-        u = d / L
-        nrm = np.array([-u[1], u[0]])
-        if len(vis):
-            off = np.abs((vis - a) @ nrm)                                # (m, 2)
-            on = np.all(off <= tol, axis=1)
-        else:
-            on = np.zeros(0, dtype=bool)
-        if not on.any():
-            out.append(h.copy())
-            continue
-        t = (vis[on] - a) @ u                                            # (m, 2)
-        iv = np.sort(t, axis=1)
-        iv = iv[(iv[:, 1] > 0.0) & (iv[:, 0] < L)]
-        iv = iv[np.argsort(iv[:, 0])]
-        cur = 0.0
+    vis = vis[vlen > floor]
+    if len(vis) == 0:
+        return hid.copy()
+    _check_deadline(deadline, "subtract_covered")
+    d = hid[:, 1] - hid[:, 0]
+    L = np.linalg.norm(d, axis=1)
+    uh = d / L[:, None]
+    nh = np.stack([-uh[:, 1], uh[:, 0]], axis=1)
+    Hc, Vc = _near_pairs(hid, vis, tol, max_sin=_LOOSE_SIN if loose else None, deadline=deadline)
+    _check_deadline(deadline, "subtract_covered")
+    if len(Hc):
+        off = np.abs(np.einsum("mpk,mk->mp", vis[Vc] - hid[Hc, 0][:, None, :], nh[Hc]))
+        on = np.all(off <= tol, axis=1)
+        if loose:
+            dv = vis[Vc, 1] - vis[Vc, 0]
+            nvl = np.linalg.norm(dv, axis=1)
+            nv = np.stack([-dv[:, 1], dv[:, 0]], axis=1) / nvl[:, None]
+            offh = np.abs(np.einsum("mpk,mk->mp", hid[Hc] - vis[Vc, 0][:, None, :], nv))
+            on |= np.all(offh <= tol, axis=1)
+            # angle guard (as in _drop_on_visible): a short chord whose two ends lie
+            # within tol of the visible line, or a short visible chord within tol of
+            # the hidden line, crossing at a steep angle covers nothing
+            dh = d[Hc]
+            cross = np.abs(dh[:, 0] * dv[:, 1] - dh[:, 1] * dv[:, 0])
+            on &= cross <= _LOOSE_SIN * L[Hc] * nvl
+        Hc, Vc = Hc[on], Vc[on]
+    covered = np.zeros(len(hid), dtype=bool)
+    covered[Hc] = True
+    out = [hid[~covered]]
+    if len(Hc):
+        o = np.argsort(Hc, kind="stable")
+        Hc, Vc = Hc[o], Vc[o]
+        tv_all = np.einsum("mpk,mk->mp", vis[Vc] - hid[Hc, 0][:, None, :], uh[Hc])     # (m, 2)
+        cuts = np.flatnonzero(np.diff(Hc)) + 1
+        starts = np.r_[0, cuts]
+        stops = np.r_[cuts, len(Hc)]
+        # hidden segments with ONE covering visible segment (most of them): vectorized,
+        # same result as _cut_intervals (pieces [0, s) and (e, L] longer than the floor)
+        single = (stops - starts) == 1
+        if single.any():
+            s_idx = starts[single]
+            h1 = Hc[s_idx]
+            iv = np.sort(tv_all[s_idx], axis=1)
+            L1 = L[h1]
+            hit = (iv[:, 1] > 0.0) & (iv[:, 0] < L1)
+            a1 = np.where(hit, np.minimum(iv[:, 0], L1), L1)
+            b0 = np.maximum(iv[:, 1], 0.0)
+            k_a = np.where(hit, iv[:, 0] > 0.0, True) & (a1 > floor)
+            k_b = hit & (b0 < L1) & (L1 - b0 > floor)
+            p0, p1 = hid[h1, 0], uh[h1]
+            first = np.stack([p0, p0 + a1[:, None] * p1], axis=1)
+            second = np.stack([p0 + b0[:, None] * p1, p0 + L1[:, None] * p1], axis=1)
+            out.append(first[k_a])
+            out.append(second[k_b])
         pieces = []
-        for s, e in iv:
-            if s > cur:
-                pieces.append((cur, min(s, L)))
-            cur = max(cur, e)
-            if cur >= L:
-                break
-        if cur < L:
-            pieces.append((cur, L))
-        for s, e in pieces:
-            if e - s > tol:
-                out.append(np.array([a + s * u, a + e * u]))
-    if not out:
+        multi = np.flatnonzero(~single)
+        for c, g in enumerate(multi):
+            if c % 2048 == 0:
+                _check_deadline(deadline, "subtract_covered")
+            s0, s1 = int(starts[g]), int(stops[g])
+            h = int(Hc[s0])
+            pieces.extend(_cut_intervals(hid[h, 0], uh[h], float(L[h]), tv_all[s0:s1], floor))
+        if pieces:
+            out.append(np.asarray(pieces, dtype=np.float64).reshape(-1, 2, 2))
+    res = np.concatenate([o.reshape(-1, 2, 2) for o in out]).astype(np.float64)
+    if loose and len(res):
+        _check_deadline(deadline, "subtract_covered")
+        res = _drop_on_visible(res, vis, tol, deadline)
+    if len(res) == 0:
         return _empty_segments()
-    return np.asarray(out, dtype=np.float64).reshape(-1, 2, 2)
+    return res
 
 
 # -------------------------------------------------------------- primitives
@@ -922,8 +1375,137 @@ def primitives_to_segments(prims: list, deflection: float) -> np.ndarray:
     return np.concatenate(chunks).astype(np.float64)
 
 
+def chain_to_primitives(segments: np.ndarray, style, tol: float, *, short_len: float = 0.0,
+                        min_chain_len: float = 0.0, deadline: Optional[float] = None) -> list:
+    """Chain segments with ``chain_paths`` and emit drawing primitives (QA issue 6).
+
+    Hidden edges written one element per short chord never show the dash
+    pattern (the dash restarts on every element), so a chain that contains
+    at least two edges shorter than ``short_len`` (callers pass one dash
+    length on paper, in model units) becomes ONE ``Polyline`` (``closed``
+    for cycles). Other chains are emitted as separate ``Segment`` objects
+    (box edges and other long lines keep their exact one-element-per-edge
+    form; a single short edge between long ones cannot break the pattern of
+    its neighbours); a two-point chain is always a ``Segment``. Chains (open or closed) whose total length is below
+    ``min_chain_len`` are dropped (mesh noise, QA issues 13 and 24).
+    ``style`` is the ``LineStyle`` of every output primitive.
+    """
+    from .model import Polyline, Segment
+
+    segs = _as_segments(segments)
+    if len(segs) == 0:
+        return []
+    opened, closed = chain_paths(segs, tol, deadline=deadline)
+    out: list = []
+    n_drop = 0
+    for pts, is_closed in [(p, False) for p in opened] + [(p, True) for p in closed]:
+        ring = np.vstack([pts, pts[:1]]) if is_closed else pts
+        edge_len = np.linalg.norm(np.diff(ring, axis=0), axis=1)
+        if float(edge_len.sum()) < min_chain_len:
+            n_drop += 1
+            continue
+        if len(pts) == 2 and not is_closed:
+            out.append(Segment((float(pts[0, 0]), float(pts[0, 1])),
+                               (float(pts[1, 0]), float(pts[1, 1])), style))
+        elif int(np.count_nonzero(edge_len < short_len)) < 2:
+            out.extend(Segment((float(a[0]), float(a[1])), (float(b[0]), float(b[1])), style)
+                       for a, b in zip(ring[:-1], ring[1:]))
+        else:
+            out.append(Polyline(np.ascontiguousarray(pts, dtype=np.float64), closed=is_closed,
+                                style=style))
+    if n_drop:
+        log.debug("chain_to_primitives: dropped %d chains shorter than %.4g", n_drop, min_chain_len)
+    return out
+
+
+def _prim_ends_and_length(p):
+    """(end points (2, 2), length) of an open primitive, or None for closed ones."""
+    from .model import Arc, Polyline, Segment
+    if isinstance(p, Segment):
+        a = np.array([[float(p.a[0]), float(p.a[1])], [float(p.b[0]), float(p.b[1])]])
+        return a, float(np.linalg.norm(a[1] - a[0]))
+    if isinstance(p, Polyline):
+        pts = np.asarray(p.points, dtype=np.float64).reshape(-1, 2)
+        if p.closed or len(pts) < 2:
+            return None
+        return pts[[0, -1]].copy(), float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+    if isinstance(p, Arc):
+        sweep = _arc_sweep(p.start_deg, p.end_deg)
+        if sweep >= 360.0:
+            return None
+        c = np.array([float(p.center[0]), float(p.center[1])])
+        r = float(p.radius)
+        s, e = math.radians(float(p.start_deg)), math.radians(float(p.start_deg) + sweep)
+        ends = np.array([c + r * np.array([math.cos(s), math.sin(s)]),
+                         c + r * np.array([math.cos(e), math.sin(e)])])
+        return ends, abs(r) * math.radians(sweep)
+    return None
+
+
+def drop_isolated_fragments(prims: list, min_len: float, touch_tol: float, deflection: float,
+                            context: Optional[list] = None) -> Tuple[list, int]:
+    """Drop short open primitives that touch nothing (QA issue 35).
+
+    A ``Segment``, open ``Polyline`` or ``Arc`` shorter than ``min_len``
+    whose two end points both lie farther than ``touch_tol`` from every
+    OTHER primitive of ``prims`` and ``context`` (flattened at
+    ``deflection``; interiors count, so a stub ending on a line is kept) is
+    an isolated fragment and removed. Closed items, Circles and anything
+    longer are always kept. Returns (kept primitives, number dropped).
+    """
+    prims = list(prims)
+    if min_len <= 0.0 or not prims:
+        return prims, 0
+    context = list(context or [])
+    cand = []
+    for i, p in enumerate(prims):
+        el = _prim_ends_and_length(p)
+        if el is not None and el[1] < min_len:
+            cand.append((i, el[0]))
+    if not cand:
+        return prims, 0
+    from .model import Segment
+
+    allp = prims + context
+    chunks, owner = [], []
+    seg_k = [k for k, p in enumerate(allp) if type(p) is Segment]
+    if seg_k:                                       # plain Segments in bulk (most of a view)
+        chunks.append(np.array([[allp[k].a, allp[k].b] for k in seg_k], dtype=np.float64).reshape(-1, 2, 2))
+        owner.append(np.asarray(seg_k, dtype=np.int64))
+    for k, p in enumerate(allp):
+        if type(p) is Segment:
+            continue
+        try:
+            s = primitives_to_segments([p], deflection)
+        except (TypeError, ValueError):
+            continue
+        if len(s):
+            chunks.append(s)
+            owner.append(np.full(len(s), k, dtype=np.int64))
+    if not chunks:
+        return prims, 0
+    flat = np.concatenate(chunks)
+    own = np.concatenate(owner)
+    ends = np.array([e for _, e in cand], dtype=np.float64).reshape(-1, 2)    # (2c, 2)
+    pseg = np.stack([ends, ends], axis=1)                                    # zero-length probes
+    I, J = _near_pairs(pseg, flat, touch_tol)
+    probe_owner = np.repeat(np.array([i for i, _ in cand], dtype=np.int64), 2)
+    other = own[J] != probe_owner[I]
+    I, J = I[other], J[other]
+    touched = np.zeros(len(pseg), dtype=bool)
+    if len(I):
+        dist = _point_seg_dist_pairs(ends[I], flat[J, 0], flat[J, 1])
+        touched[I[dist <= touch_tol]] = True
+    touched = touched.reshape(-1, 2)
+    drop = {cand[k][0] for k in range(len(cand)) if not touched[k].any()}
+    if drop:
+        log.debug("drop_isolated_fragments: dropped %d fragments shorter than %.4g", len(drop), min_len)
+    return [p for i, p in enumerate(prims) if i not in drop], len(drop)
+
+
 __all__: Sequence[str] = (
     "simplify_polyline", "is_straight", "polygon_area", "point_in_polygon", "nest_loops",
-    "hatch_lines", "chain_segments", "merge_collinear", "subtract_covered",
-    "dedupe_primitives", "drop_covered_curves", "primitives_to_segments",
+    "hatch_lines", "chain_segments", "chain_paths", "merge_collinear", "premerge_collinear",
+    "subtract_covered", "dedupe_primitives", "drop_covered_curves", "primitives_to_segments",
+    "chain_to_primitives", "drop_isolated_fragments",
 )

@@ -45,6 +45,21 @@ REPORT-hlr.md, OCP 7.9.3.1 on this machine):
   (icosphere(2): 480 edges C0 -> C1 at 0.35 rad, unchanged at 0.1 rad since
   its dihedral angles are 0.12..0.20 rad); on a bare compound of faces it
   silently does nothing.
+* QA round 1: ``OneShape`` holds every root, so a ``GEOMETRIC_CURVE_SET``
+  (sketch / PMI curves) arrives as loose edges and a
+  ``SHELL_BASED_SURFACE_MODEL`` as a free shell next to the solid (a
+  STEPControl_Writer round trip of box + line + face gives exactly 1 solid,
+  1 free shell, 1 loose edge). They were drawn, bounded and counted as part
+  geometry; ``select_drawn_shape`` keeps the solids (NIST CTC 01: 78 loose
+  edges and 22 loose vertices dropped, CTC 02: 1 free shell).
+* A tessellated-only AP242 file (``TESSELLATED_SOLID`` of
+  ``COMPLEX_TRIANGULATED_FACE``) transfers into faces with a
+  ``Poly_Triangulation`` and a null surface, 0 edges (NIST FTC 08: 273
+  faces, 3377 triangles); the stored node normals disagree with the
+  triangle winding on all of them, so the winding follows the normals.
+* ``FileUnits`` spells 'metre', 'centimetre', 'kilometre', 'micrometre',
+  'FOOT', 'MILE', 'MIL' for files written with those ``write.step.unit``
+  values; OCCT converts all of them to mm on read.
 """
 from __future__ import annotations
 
@@ -77,10 +92,29 @@ class BrepModel:
 
     ``census`` keys: solids shells faces edges vertices face_types
     brepcheck_valid free_edges closed volume_mm3 area_mm2 bbox_min bbox_max
-    inverted. ``bbox_min``/``bbox_max`` are lists of three floats (None for an
+    inverted solids_unique faces_unique tessellated_faces, plus
+    ``volume_signed_open`` when the volume was withheld. ``solids`` / ``faces``
+    ... count INSTANCES (an assembly part placed twice counts twice);
+    ``solids_unique`` / ``faces_unique`` count distinct ``TShape`` s.
+    ``volume_mm3`` is None for an open model (no solid, or a shell that is not
+    closed): the signed number is kept under ``volume_signed_open``.
+    ``bbox_min``/``bbox_max`` are lists of three floats (None for an
     empty shape). ``brepcheck_valid`` is a bool, or None when the census ran
     with ``full_check=False``. ``warnings`` are human-readable flags for the
     report.
+
+    ``shape`` is the DRAWN shape: for a STEP file (``load_step``) the solids
+    only when there is at least one, else the free shells and faces, and the
+    loose edges only for a pure wireframe (see ``select_drawn_shape``). The
+    census, the bbox, the features and the sections all use it.
+    ``original_shape`` is the full transferred compound (None when the model
+    was built by ``analyze_shape``). ``bodies`` is the split report of
+    ``select_drawn_shape`` (empty for ``analyze_shape``): counts of solids,
+    free_shells, free_faces, loose_edges, loose_vertices, tessellated_bodies,
+    ``drawn`` ("solids" | "shells_faces" | "wireframe" | "empty") and
+    ``dropped`` (dict of the counts left out of the drawing).
+    ``source_unit_factor`` is the length factor source unit -> mm (1.0 for mm,
+    25.4 for inch, 1000 for m; None when unknown).
     """
 
     shape: object
@@ -88,6 +122,35 @@ class BrepModel:
     roots: int
     census: dict
     warnings: List[str] = field(default_factory=list)
+    source_unit_factor: Optional[float] = None
+    bodies: dict = field(default_factory=dict)
+    original_shape: object = None
+
+
+class TessellatedOnlyError(ValueError):
+    """The STEP file holds only tessellated faces (``TESSELLATED_SOLID`` /
+    ``TRIANGULATED_FACE``): OCCT gives faces with a triangulation and no
+    surface, so the B-rep route (HLR, census, bbox) cannot run.
+
+    Subclass of ``ValueError`` so an unaware caller still fails with a clear
+    message. ``mesh`` is a ``trimesh.Trimesh`` built from the triangulations
+    (nodes in mm, moved by the face location, winding flipped on reversed
+    faces, duplicate nodes merged) for the mesh route; ``faces`` and
+    ``triangles`` count what it came from; ``source_unit`` /
+    ``source_unit_factor`` / ``roots`` / ``bodies`` are as on ``BrepModel``.
+    """
+
+    def __init__(self, message: str, mesh: Any = None, *, faces: int = 0, triangles: int = 0,
+                 source_unit: str = "unknown", source_unit_factor: Optional[float] = None,
+                 roots: int = 1, bodies: Optional[dict] = None) -> None:
+        super().__init__(message)
+        self.mesh = mesh
+        self.faces = int(faces)
+        self.triangles = int(triangles)
+        self.source_unit = source_unit
+        self.source_unit_factor = source_unit_factor
+        self.roots = int(roots)
+        self.bodies = dict(bodies or {})
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +158,8 @@ class BrepModel:
 # ---------------------------------------------------------------------------
 
 def _count_unique(shape: Any, kind: Any) -> int:
+    """Number of sub-shape INSTANCES of ``kind`` (TShape + location; an
+    explorer would count a shared edge twice, this does not)."""
     from OCP.TopExp import TopExp
     from OCP.TopTools import TopTools_IndexedMapOfShape
     m = TopTools_IndexedMapOfShape()
@@ -102,11 +167,29 @@ def _count_unique(shape: Any, kind: Any) -> int:
     return m.Extent()
 
 
+def _count_tshapes(shape: Any, kind: Any) -> int:
+    """Number of distinct ``TShape`` s of ``kind``: every instance is moved to
+    the identity location before it goes into the map, so one part placed
+    twice in an assembly counts once."""
+    from OCP.TopExp import TopExp
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopTools import TopTools_IndexedMapOfShape, TopTools_MapOfShape
+    m = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(shape, kind, m)
+    seen = TopTools_MapOfShape()
+    ident = TopLoc_Location()
+    for i in range(1, m.Extent() + 1):
+        seen.Add(m.FindKey(i).Located(ident))
+    return seen.Extent()
+
+
 def _empty_census() -> Dict[str, Any]:
     return {"solids": 0, "shells": 0, "faces": 0, "edges": 0, "vertices": 0,
             "face_types": {}, "brepcheck_valid": False, "free_edges": 0,
             "closed": False, "volume_mm3": 0.0, "area_mm2": 0.0,
-            "bbox_min": None, "bbox_max": None, "inverted": False}
+            "bbox_min": None, "bbox_max": None, "inverted": False,
+            "solids_unique": 0, "faces_unique": 0, "tessellated_faces": 0,
+            "loose_faces": 0, "volume_scope": "shape"}
 
 
 def _face_types(shape: Any) -> Dict[str, int]:
@@ -166,6 +249,13 @@ def _census(shape: Any, full_check: bool = True) -> Dict[str, Any]:
     c["faces"] = _count_unique(shape, TopAbs_FACE)
     c["edges"] = _count_unique(shape, TopAbs_EDGE)
     c["vertices"] = _count_unique(shape, TopAbs_VERTEX)
+    try:
+        c["solids_unique"] = _count_tshapes(shape, TopAbs_SOLID)
+        c["faces_unique"] = _count_tshapes(shape, TopAbs_FACE)
+    except Exception as exc:
+        logger.debug("unique TShape count failed: %s", exc)
+        c["solids_unique"], c["faces_unique"] = c["solids"], c["faces"]
+    c["tessellated_faces"] = count_tessellated_faces(shape)
     c["face_types"] = _face_types(shape)
 
     shells = TopTools_IndexedMapOfShape()
@@ -178,7 +268,38 @@ def _census(shape: Any, full_check: bool = True) -> Dict[str, Any]:
         except Exception as exc:
             logger.debug("IsClosed failed: %s", exc)
             closed.append(False)
-    c["closed"] = bool(closed) and all(closed)
+    shells_closed = bool(closed) and all(closed)
+    # faces outside any shell (a stray surface next to a solid): they make the
+    # model open and must stay out of the volume integral (a box 10^3 with a
+    # loose face at z = 200 integrated to 6571.4 mm3)
+    try:
+        from OCP.TopExp import TopExp_Explorer
+        loose = TopTools_IndexedMapOfShape()
+        ex = TopExp_Explorer(shape, TopAbs_FACE, TopAbs_SHELL)
+        while ex.More():
+            loose.Add(ex.Current())
+            ex.Next()
+        c["loose_faces"] = loose.Extent()
+    except Exception as exc:
+        logger.debug("loose face count failed: %s", exc)
+    c["closed"] = shells_closed and c["loose_faces"] == 0
+    vol_target = shape
+    if c["loose_faces"] and c["solids"] > 0 and shells_closed:
+        try:
+            from OCP.BRep import BRep_Builder
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopoDS import TopoDS_Compound
+            bld = BRep_Builder()
+            only = TopoDS_Compound()
+            bld.MakeCompound(only)
+            ex = TopExp_Explorer(shape, TopAbs_SOLID)
+            while ex.More():
+                bld.Add(only, ex.Current())
+                ex.Next()
+            vol_target = only
+            c["volume_scope"] = "solids"
+        except Exception as exc:
+            logger.debug("solid-only compound failed: %s", exc)
 
     try:
         fb = ShapeAnalysis_FreeBounds(shape)
@@ -198,10 +319,10 @@ def _census(shape: Any, full_check: bool = True) -> Dict[str, Any]:
     if c["faces"]:
         try:
             if full_check:
-                vol = brep_volume(shape)     # adaptive Gauss, Precision.Confusion
+                vol = brep_volume(vol_target)   # adaptive Gauss, Precision.Confusion
             else:
                 props = GProp_GProps()       # fixed Gauss: exact on planar facets
-                BRepGProp.VolumeProperties_s(shape, props)
+                BRepGProp.VolumeProperties_s(vol_target, props)
                 vol = float(props.Mass())
             c["volume_mm3"] = float(vol) if math.isfinite(vol) else None
         except Exception as exc:
@@ -215,7 +336,13 @@ def _census(shape: Any, full_check: bool = True) -> Dict[str, Any]:
             logger.warning("area integration failed: %s", exc)
             c["area_mm2"] = None
     vol = c["volume_mm3"]
-    c["inverted"] = bool(c["solids"] > 0 and vol is not None and vol < 0)
+    vol_ok = shells_closed and (c["loose_faces"] == 0 or c["volume_scope"] == "solids")
+    c["inverted"] = bool(c["solids"] > 0 and vol_ok and vol is not None and vol < 0)
+    if c["faces"] and (c["solids"] == 0 or not vol_ok):
+        # an open model encloses no volume: the signed integral is meaningless
+        # (-6.57 on a spline cage) and is kept for diagnostics only
+        c["volume_signed_open"] = vol
+        c["volume_mm3"] = None
 
     bb = exact_bbox(shape)
     if bb is not None:
@@ -243,8 +370,17 @@ def _census_warnings(c: Dict[str, Any], source_unit: str, roots: int) -> List[st
                  f"ShapeFix_Solid would heal it")
     if c["brepcheck_valid"] is False:        # None = not checked (fast census)
         w.append("BRepCheck_Analyzer reports the shape invalid")
-    if c["volume_mm3"] is None:
+    if c.get("loose_faces"):
+        w.append(f"{c['loose_faces']} face(s) outside any shell (stray surfaces)"
+                 + ("; the volume counts the solids only" if c.get("volume_scope") == "solids"
+                    else ""))
+    if "volume_signed_open" in c:
+        w.append("volume not reported: the model is open (no closed solid)")
+    elif c["volume_mm3"] is None:
         w.append("volume integration failed")
+    if c.get("tessellated_faces"):
+        w.append(f"{c['tessellated_faces']} tessellated face(s) without a surface "
+                 f"(triangulation only)")
     if c["bbox_min"] is None:
         w.append("bounding box is void")
     if source_unit != "mm":
@@ -272,7 +408,255 @@ def analyze_shape(shape, source_unit: str = "mm", roots: int = 1, *,
     """
     census = _census(shape, full_check=bool(full_check))
     return BrepModel(shape=shape, source_unit=source_unit, roots=int(roots),
-                     census=census, warnings=_census_warnings(census, source_unit, roots))
+                     census=census, warnings=_census_warnings(census, source_unit, roots),
+                     source_unit_factor=UNIT_FACTORS.get(source_unit))
+
+
+# ---------------------------------------------------------------------------
+# drawn bodies: solids / free shells / free faces / loose edges
+# ---------------------------------------------------------------------------
+
+def _is_tessellated_face(face: Any) -> bool:
+    """True for a face with a triangulation and no surface (a STEP
+    ``TRIANGULATED_FACE`` / ``COMPLEX_TRIANGULATED_FACE`` after transfer)."""
+    from OCP.BRep import BRep_Tool
+    from OCP.TopLoc import TopLoc_Location
+    try:
+        if BRep_Tool.Surface_s(face, TopLoc_Location()) is not None:
+            return False
+        return BRep_Tool.Triangulation_s(face, TopLoc_Location()) is not None
+    except Exception as exc:
+        logger.debug("tessellation check failed: %s", exc)
+        return False
+
+
+def _faces_of(shape: Any) -> List[Any]:
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp
+    from OCP.TopoDS import TopoDS
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+    m = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(shape, TopAbs_FACE, m)
+    return [TopoDS.Face_s(m.FindKey(i)) for i in range(1, m.Extent() + 1)]
+
+
+def count_tessellated_faces(shape: Any) -> int:
+    """Faces of ``shape`` that carry a triangulation but no surface."""
+    if shape is None:
+        return 0
+    try:
+        if shape.IsNull():
+            return 0
+        return sum(1 for f in _faces_of(shape) if _is_tessellated_face(f))
+    except Exception as exc:
+        logger.debug("tessellated face count failed: %s", exc)
+        return 0
+
+
+def _explore(shape: Any, kind: Any, avoid: Any = None) -> List[Any]:
+    """Sub-shapes of ``kind`` not reached through ``avoid``, each instance once."""
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopTools import TopTools_MapOfShape
+    seen = TopTools_MapOfShape()
+    out: List[Any] = []
+    ex = TopExp_Explorer(shape, kind) if avoid is None else TopExp_Explorer(shape, kind, avoid)
+    while ex.More():
+        s = ex.Current()
+        if seen.Add(s):
+            out.append(s)
+        ex.Next()
+    return out
+
+
+def _compound_of(shapes: List[Any]) -> Any:
+    from OCP.BRep import BRep_Builder
+    from OCP.TopoDS import TopoDS_Compound
+    b = BRep_Builder()
+    comp = TopoDS_Compound()
+    b.MakeCompound(comp)
+    for s in shapes:
+        b.Add(comp, s)
+    return comp
+
+
+def _all_tessellated(shape: Any) -> bool:
+    faces = _faces_of(shape)
+    return bool(faces) and all(_is_tessellated_face(f) for f in faces)
+
+
+def split_bodies(shape: Any) -> Dict[str, List[Any]]:
+    """Split a transferred shape into ``solids``, free ``shells`` (not in a
+    solid), free ``faces`` (not in a shell), loose ``edges`` (not in a face,
+    e.g. a STEP ``GEOMETRIC_CURVE_SET`` or PMI sketch) and loose ``vertices``
+    (not in an edge). Every instance appears once (TShape + location)."""
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID, TopAbs_VERTEX
+    out: Dict[str, List[Any]] = {"solids": [], "shells": [], "faces": [], "edges": [],
+                                 "vertices": []}
+    if shape is None or shape.IsNull():
+        return out
+    out["solids"] = _explore(shape, TopAbs_SOLID)
+    out["shells"] = _explore(shape, TopAbs_SHELL, TopAbs_SOLID)
+    out["faces"] = _explore(shape, TopAbs_FACE, TopAbs_SHELL)
+    out["edges"] = _explore(shape, TopAbs_EDGE, TopAbs_FACE)
+    out["vertices"] = _explore(shape, TopAbs_VERTEX, TopAbs_EDGE)
+    return out
+
+
+def select_drawn_shape(shape: Any) -> "tuple[Any, Dict[str, Any]]":
+    """``(drawn_shape, bodies)``: the part of a transferred STEP shape that is
+    drawn, bounded, dimensioned and counted.
+
+    Rule: the solids when there is at least one; else the free shells and
+    free faces (a surface model); the loose edges and vertices only when
+    there is no face at all (a pure wireframe). When exact bodies exist,
+    tessellated-only bodies (every face a triangulation without surface,
+    e.g. an AP242 file that carries both representations) are left out too.
+    The input is returned unchanged when nothing is left out.
+
+    ``bodies``: solids, free_shells, free_faces, loose_edges,
+    loose_vertices, tessellated_bodies (counts in the input), ``drawn``
+    ("solids" | "shells_faces" | "wireframe" | "empty") and ``dropped``
+    (counts left out, only the non-zero ones).
+    """
+    parts = split_bodies(shape)
+    info: Dict[str, Any] = {"solids": len(parts["solids"]), "free_shells": len(parts["shells"]),
+                            "free_faces": len(parts["faces"]),
+                            "loose_edges": len(parts["edges"]),
+                            "loose_vertices": len(parts["vertices"]),
+                            "tessellated_bodies": 0, "drawn": "empty", "dropped": {}}
+    if shape is None or shape.IsNull():
+        return shape, info
+
+    def exact_only(items: List[Any]) -> "tuple[List[Any], int]":
+        try:
+            flags = [_all_tessellated(s) for s in items]
+        except Exception as exc:
+            logger.debug("tessellated body check failed: %s", exc)
+            return items, 0
+        if all(flags):
+            return items, 0              # nothing exact: keep (load_step routes it)
+        return [s for s, t in zip(items, flags) if not t], int(sum(flags))
+
+    dropped: Dict[str, int] = {}
+    if parts["solids"]:
+        kept, n_tess = exact_only(parts["solids"])
+        info["drawn"] = "solids"
+        for key, name in (("shells", "free_shells"), ("faces", "free_faces"),
+                          ("edges", "loose_edges"), ("vertices", "loose_vertices")):
+            if parts[key]:
+                dropped[name] = len(parts[key])
+    elif parts["shells"] or parts["faces"]:
+        kept, n_tess = exact_only(parts["shells"] + parts["faces"])
+        info["drawn"] = "shells_faces"
+        for key, name in (("edges", "loose_edges"), ("vertices", "loose_vertices")):
+            if parts[key]:
+                dropped[name] = len(parts[key])
+    else:
+        info["drawn"] = "wireframe" if (parts["edges"] or parts["vertices"]) else "empty"
+        info["dropped"] = {}
+        return shape, info
+    if n_tess:
+        dropped["tessellated_bodies"] = n_tess
+    info["tessellated_bodies"] = n_tess
+    info["dropped"] = dropped
+    if not dropped:
+        return shape, info
+    return _compound_of(kept), info
+
+
+def _dropped_warning(info: Dict[str, Any]) -> Optional[str]:
+    d = info.get("dropped") or {}
+    if not d:
+        return None
+    words = {"free_shells": "free shell(s)", "free_faces": "free face(s)",
+             "loose_edges": "loose edge(s)", "loose_vertices": "loose vertex(es)",
+             "tessellated_bodies": "tessellated body(ies)"}
+    what = ", ".join(f"{n} {words.get(k, k)}" for k, n in d.items())
+    kept = ("the solid(s)" if info.get("drawn") == "solids" else "the shells and faces")
+    return f"supplemental geometry not drawn: {what}; the drawing uses {kept} only"
+
+
+def triangulation_mesh(shape: Any) -> "tuple[Any, int, int]":
+    """``(trimesh.Trimesh, faces_used, triangles)`` from the stored face
+    triangulations of ``shape``: nodes moved by the face location, the
+    winding flipped on ``TopAbs_REVERSED`` faces, duplicate nodes merged.
+    Faces without a triangulation are skipped. Raises ``ValueError`` when no
+    triangle is found."""
+    import trimesh
+    from OCP.BRep import BRep_Tool
+    from OCP.TopAbs import TopAbs_REVERSED
+    from OCP.TopLoc import TopLoc_Location
+
+    verts: List[np.ndarray] = []
+    tris: List[np.ndarray] = []
+    offset = 0
+    used = 0
+    flipped_by_normals = 0
+    for face in _faces_of(shape):
+        try:
+            loc = TopLoc_Location()
+            T = BRep_Tool.Triangulation_s(face, loc)
+            if T is None or T.NbTriangles() == 0:
+                continue
+            trsf = None if loc.IsIdentity() else loc.Transformation()
+            nn = T.NbNodes()
+            pts = np.empty((nn, 3), dtype=np.float64)
+            for i in range(1, nn + 1):
+                p = T.Node(i)
+                if trsf is not None:
+                    p = p.Transformed(trsf)
+                pts[i - 1] = (p.X(), p.Y(), p.Z())
+            nt = T.NbTriangles()
+            idx = np.empty((nt, 3), dtype=np.int64)
+            for i in range(1, nt + 1):
+                idx[i - 1] = T.Triangle(i).Get()
+            idx -= 1
+            if _winding_against_normals(T, idx):
+                idx = idx[:, ::-1]
+                flipped_by_normals += 1
+            if face.Orientation() == TopAbs_REVERSED:
+                idx = idx[:, ::-1]
+        except Exception as exc:
+            logger.debug("triangulation of a face skipped: %s", exc)
+            continue
+        verts.append(pts)
+        tris.append(idx + offset)
+        offset += nn
+        used += 1
+    if not tris:
+        raise ValueError("no face carries a triangulation")
+    if flipped_by_normals:
+        logger.info("tessellated faces: %d of %d wound against their stored normals; flipped",
+                    flipped_by_normals, used)
+    mesh = trimesh.Trimesh(vertices=np.vstack(verts), faces=np.vstack(tris), process=False)
+    mesh.merge_vertices()
+    return mesh, used, int(len(mesh.faces))
+
+
+def _winding_against_normals(T: Any, idx: np.ndarray) -> bool:
+    """True when the triangles of ``T`` (0-based ``idx``) are mostly wound
+    against the node normals stored with the triangulation (a STEP
+    ``COMPLEX_TRIANGULATED_FACE`` carries them). Measured on the NIST FTC 08
+    tessellated file: all 3370 non-degenerate triangles disagree with their
+    stored normals, and the unflipped mesh has a negative volume
+    (-503281 mm3). False when no normals are stored."""
+    try:
+        if not T.HasNormals():
+            return False
+        nn = T.NbNodes()
+        P = np.empty((nn, 3))
+        N = np.empty((nn, 3))
+        for i in range(1, nn + 1):
+            p = T.Node(i)
+            P[i - 1] = (p.X(), p.Y(), p.Z())
+            d = T.Normal(i)
+            N[i - 1] = (d.X(), d.Y(), d.Z())
+    except Exception as exc:
+        logger.debug("stored triangulation normals unreadable: %s", exc)
+        return False
+    g = np.cross(P[idx[:, 1]] - P[idx[:, 0]], P[idx[:, 2]] - P[idx[:, 0]])
+    s = np.einsum("ij,ij->i", g, N[idx].sum(axis=1))
+    return int(np.count_nonzero(s < 0)) > int(np.count_nonzero(s > 0))
 
 
 # ---------------------------------------------------------------------------
@@ -371,21 +755,54 @@ def _sniff_raw(path: str) -> Optional[str]:
         return None
 
 
-def _normalize_unit(token: Optional[str]) -> str:
+# Normalised length-unit names and their factor to mm. The spellings are the
+# ones OCCT's FileUnits returns ('millimetre', 'centimetre', 'metre',
+# 'kilometre', 'micrometre', 'INCH', 'FOOT', 'MILE', 'MIL' - measured with
+# files written by STEPControl_Writer in each write.step.unit) and the tokens
+# of the text sniff ('MM', 'CM', 'M', 'KM', 'UM', 'DM', 'NM' from SI prefixes,
+# CONVERSION_BASED_UNIT names such as 'INCH' / 'FOOT').
+UNIT_FACTORS: Dict[str, float] = {
+    "mm": 1.0, "cm": 10.0, "dm": 100.0, "m": 1000.0, "km": 1.0e6, "um": 1.0e-3,
+    "nm": 1.0e-6, "inch": 25.4, "ft": 304.8, "yd": 914.4, "mile": 1609344.0,
+    "mil": 0.0254, "microinch": 2.54e-5,
+}
+_UNIT_ALIASES = {
+    "mm": ("MM", "MILLIMETRE", "MILLIMETER", "MILLIMETRES", "MILLIMETERS"),
+    "cm": ("CM", "CENTIMETRE", "CENTIMETER", "CENTIMETRES", "CENTIMETERS"),
+    "dm": ("DM", "DECIMETRE", "DECIMETER"),
+    "m": ("M", "METRE", "METER", "METRES", "METERS"),
+    "km": ("KM", "KILOMETRE", "KILOMETER"),
+    "um": ("UM", "MICROMETRE", "MICROMETER", "MICRON", "MICRONS"),
+    "nm": ("NM", "NANOMETRE", "NANOMETER"),
+    "inch": ("INCH", "IN", "INCHES"),
+    "ft": ("FOOT", "FT", "FEET"),
+    "yd": ("YARD", "YD", "YARDS"),
+    "mile": ("MILE", "MI", "MILES"),
+    "mil": ("MIL", "MILS", "THOU"),
+    "microinch": ("MICROINCH", "UIN", "MICROINCHES"),
+}
+_UNIT_LOOKUP = {alias: name for name, aliases in _UNIT_ALIASES.items() for alias in aliases}
+
+
+def normalize_unit(token: Optional[str]) -> "tuple[str, Optional[float]]":
+    """``(name, factor_to_mm)`` of a length-unit token, e.g. ('m', 1000.0),
+    ('inch', 25.4); ('unknown', None) for an empty or unrecognised token."""
     if not token:
-        return "unknown"
-    t = token.strip().upper()
-    if t in ("MM", "MILLIMETRE", "MILLIMETER"):
-        return "mm"
-    if t in ("INCH", "IN", "INCHES"):
-        return "inch"
-    return "unknown"
+        return "unknown", None
+    name = _UNIT_LOOKUP.get(" ".join(str(token).split()).upper())
+    if name is None:
+        return "unknown", None
+    return name, UNIT_FACTORS[name]
+
+
+def _normalize_unit(token: Optional[str]) -> str:
+    return normalize_unit(token)[0]
 
 
 def step_unit_sniff(path: str) -> str:
-    """Length unit from the Part 21 text: "mm" | "inch" | "unknown".
-
-    Any other unit (metre, foot, ...) and unreadable files give "unknown".
+    """Length unit from the Part 21 text, normalised: "mm", "inch", "m",
+    "cm", "ft", ... (keys of ``UNIT_FACTORS``) or "unknown" for an
+    unrecognised unit and unreadable files.
     """
     return _normalize_unit(_sniff_raw(path))
 
@@ -415,12 +832,25 @@ def load_step(path: str) -> BrepModel:
     sniff (``step_unit_sniff``) is the fallback when FileUnits is empty or
     names an unsupported unit, and an independent cross-check otherwise: a
     disagreement adds a "length unit disagreement" warning.
+    ``source_unit_factor`` is its factor to mm (OCCT already scaled the
+    geometry by it).
+
+    The model's ``shape`` is the drawn part of the transfer
+    (``select_drawn_shape``: the solids when there are any, loose curve sets
+    and supplemental surface shells left out); ``bodies`` says what was left
+    out and a "supplemental geometry not drawn" warning names it.
+    ``original_shape`` is the full transfer.
+
+    Raises ``TessellatedOnlyError`` (a ``ValueError``) when every drawn face
+    is a triangulation without a surface; its ``mesh`` holds the triangles
+    for the mesh route.
     """
     import os
     if not os.path.isfile(path):
         raise ValueError(f"STEP file not found: {path}")
     from OCP.IFSelect import IFSelect_RetDone
     from OCP.STEPControl import STEPControl_Reader
+    from OCP.TopAbs import TopAbs_FACE
     from src.io.occt_utils import quiet_occt
 
     quiet_occt()
@@ -446,13 +876,36 @@ def load_step(path: str) -> BrepModel:
     occt_unit = _normalize_unit(file_units[0]) if file_units else "unknown"
     text_unit = step_unit_sniff(path)
     source_unit = occt_unit if occt_unit != "unknown" else text_unit
-    model = analyze_shape(shape, source_unit=source_unit, roots=roots)
+    factor = UNIT_FACTORS.get(source_unit)
+
+    drawn, bodies = select_drawn_shape(shape)
+    n_faces = _count_unique(drawn, TopAbs_FACE)
+    if n_faces and count_tessellated_faces(drawn) == n_faces:
+        try:
+            mesh, used, n_tri = triangulation_mesh(drawn)
+        except Exception as exc:
+            mesh, used, n_tri = None, 0, 0
+            logger.warning("tessellated STEP: no mesh could be built: %s", exc)
+        raise TessellatedOnlyError(
+            f"tessellated-only STEP: all {n_faces} face(s) are triangulations without a "
+            f"surface (AP242 TESSELLATED_SOLID / TRIANGULATED_FACE); use the mesh route",
+            mesh, faces=used, triangles=n_tri, source_unit=source_unit,
+            source_unit_factor=factor, roots=roots, bodies=bodies)
+
+    model = analyze_shape(drawn, source_unit=source_unit, roots=roots)
+    model.source_unit_factor = factor
+    model.bodies = bodies
+    model.original_shape = shape
+    msg = _dropped_warning(bodies)
+    if msg:
+        model.warnings.append(msg)
     if file_units and text_unit != "unknown" and occt_unit != text_unit:
         model.warnings.append(f"length unit disagreement: OCCT FileUnits says "
                               f"{file_units[0]!r}, the text sniff says {text_unit}")
     if model.census["faces"] == 0:
         raise ValueError("STEP file contains no faces")
     return model
+
 
 
 # ---------------------------------------------------------------------------

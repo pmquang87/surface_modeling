@@ -29,6 +29,9 @@ Measured facts this module relies on (HLR probe, OCP 7.9.3, REPORT-hlr.md):
   with negative ranges, so the layout translates every view by its own bbox.
 * First- versus third-angle placement changes only the sheet cell, never the
   gp_Ax2 values.
+* ``auto_orientation`` fixes only the axis permutation; ``flip_depth`` turns
+  the result 180 degrees about Z when the pipeline finds the features on
+  the far side (QA issue 14, scored on the geometry by the caller).
 
 The mesh route uses the same ``ViewSpec`` (x = Vx, y = N x Vx, depth = N.p,
 larger = nearer the viewer) so both routes agree to the sign.
@@ -280,6 +283,22 @@ def auto_orientation(extents: np.ndarray, mode: str = "auto", up: str = "z") -> 
     o = _orientation_from_matrix(m, mode)
     log.debug("orientation %s: permutation %s flips %s", mode, o.permutation, o.flips)
     return o
+
+
+#: 180-degree turn about the drawing Z axis (x, y, z) -> (-x, -y, z): det +1.
+_TURN_Z = np.diag([-1.0, -1.0, 1.0])
+
+
+def flip_depth(o: Orientation) -> Orientation:
+    """``o`` followed by a 180-degree turn about the drawing Z (up) axis.
+
+    The front viewer (at -Y of the drawing) then sees the side of the part
+    that the back viewer saw: the depth sign flips together with X, so the
+    matrix stays a proper rotation (det +1) and the up direction is kept.
+    Used after ``auto_orientation`` when the far side of a part carries the
+    features (QA issue 14). Applying it twice gives ``o`` back.
+    """
+    return _orientation_from_matrix(_TURN_Z @ np.asarray(o.matrix, float), o.mode)
 
 
 # ------------------------------------------------------------------ view cells

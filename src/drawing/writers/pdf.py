@@ -35,6 +35,7 @@ import numpy as np
 from ..model import (Arc, Circle, HatchLines, LineStyle, Polygon, Polyline, Segment, Sheet, Text)
 from ..style import DEFAULT_STYLE, SheetStyle
 from . import arc_span, clean_text, fmt, line_props, valid_item
+from .svg import polyline_points
 
 log = logging.getLogger(__name__)
 
@@ -200,8 +201,7 @@ def _draw_item(pw: PdfWriter, item, sheet_style: SheetStyle) -> None:
     if isinstance(item, Segment):
         pw.line(item.a, item.b)
     elif isinstance(item, Polyline):
-        pw.polyline(np.asarray(item.points, dtype=np.float64).reshape(-1, 2).tolist(),
-                    bool(item.closed))
+        pw.polyline(polyline_points(item).tolist(), bool(item.closed))
     elif isinstance(item, Circle):
         pw.arc(float(item.center[0]), float(item.center[1]), float(item.radius), 0.0, 360.0,
                closed=True)

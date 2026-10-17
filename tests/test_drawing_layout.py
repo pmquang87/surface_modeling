@@ -171,6 +171,10 @@ def _diam(plan):
     return [d for d in plan.dims if d.kind == "diameter"]
 
 
+def _holes_undim(plan):
+    return [u for u in plan.undimensioned if u["kind"] == "hole_group"]
+
+
 def test_plan_overall_extents_once_each_in_the_right_view():
     plan = _plan(hole_positions=False)
     lin = _linear(plan)
@@ -201,11 +205,16 @@ def test_plan_hole_callouts_grouped_by_radius():
     assert all(x.view == "top" for x in d)
     four = next(x for x in d if x.count == 4)
     assert four.radius == pytest.approx(3.25) and four.value == pytest.approx(6.5)
-    assert four.center == pytest.approx((92.0, 52.0))       # circle nearest the top-right corner
+    # the top-left circle with a 45 degree leader: the shortest leader whose text runs over
+    # the view instead of past its right edge (the top-right circle would widen the sheet)
+    assert four.center == pytest.approx((8.0, 52.0))
     assert four.leader_angle_deg == pytest.approx(45.0)
     one = next(x for x in d if x.count == 1)
     assert one.center == pytest.approx((50.0, 30.0)) and one.value == pytest.approx(20.0)
-    assert plan.undimensioned == []
+    # a different direction: its leader would otherwise cross the first one above the view
+    assert one.leader_angle_deg != pytest.approx(45.0)
+    # the boss is recorded, not silently dropped (QA issue 26); no hole is undimensioned
+    assert [u["kind"] for u in plan.undimensioned] == ["boss_group"]
 
 
 def test_plan_hole_positions_on_and_off():
@@ -216,24 +225,29 @@ def test_plan_hole_positions_on_and_off():
     pos_off = [d for d in _linear(off) if round(d.value, 6) not in overall]
     assert len(pos_on) == 4                       # precondition for the "off" assertion
     assert pos_off == []
-    assert sorted(round(d.value, 6) for d in pos_on) == [30.0, 50.0, 52.0, 92.0]
+    # QA issue 23: one datum per view and axis. Holes (8, 52) and (50, 30): along X both are
+    # nearer the left edge (8, 50); along Y one is nearer the top and one ties, no majority for
+    # the top edge, so both are measured from the bottom (52, 30)
+    assert sorted(round(d.value, 6) for d in pos_on) == [8.0, 30.0, 50.0, 52.0]
     assert all(d.view == "top" for d in pos_on)
     horizontal = sorted(round(d.value, 6) for d in pos_on if d.angle_deg == 0.0)
-    assert horizontal == [50.0, 92.0]
-    # bands: shorter dims nearer the outline, the overall depth outermost on the left of the top view
-    bands = {round(d.value, 6): b for d, b in zip(on.dims, on.bands) if d.view == "top" and d.kind == "linear"}
-    assert bands[30.0] == ("left", 0) and bands[52.0] == ("left", 1) and bands[60.0] == ("left", 2)
-    assert bands[50.0] == ("bottom", 0) and bands[92.0] == ("bottom", 1)
+    assert horizontal == [8.0, 50.0]
+    bands = {(round(d.value, 6), d.angle_deg): b for d, b in zip(on.dims, on.bands)
+             if d.view == "top" and d.kind == "linear"}
+    # shorter dims nearer the outline, the overall depth outermost on the left of the top view
+    assert bands[(30.0, 90.0)] == ("left", 0) and bands[(52.0, 90.0)] == ("left", 1)
+    assert bands[(60.0, 90.0)] == ("left", 2)
+    assert bands[(50.0, 0.0)] == ("bottom", 0) and bands[(8.0, 0.0)] == ("top", 0)
 
 
 def test_plan_cap_moves_groups_to_undimensioned():
     full = _plan(max_hole_callouts=6)
-    assert len(_diam(full)) == 2 and full.undimensioned == []     # precondition
+    assert len(_diam(full)) == 2 and _holes_undim(full) == []     # precondition
     capped = _plan(max_hole_callouts=1)
     d = _diam(capped)
     assert len(d) == 1 and d[0].count == 4                        # bigger group first
-    assert len(capped.undimensioned) == 1
-    u = capped.undimensioned[0]
+    assert len(_holes_undim(capped)) == 1
+    u = _holes_undim(capped)[0]
     assert u["reason"] == "cap" and u["radius"] == pytest.approx(10.0) and u["count"] == 1
     assert u["kind"] == "hole_group"
     # the dropped group gets no position dims either
@@ -263,13 +277,17 @@ def test_plan_x_axis_hole_goes_to_the_right_view_only_when_drawn():
     del views["right"]
     plan2 = _plan(views=views, features=_features([xhole]))
     assert not [x for x in _diam(plan2) if x.text == "Ø5"]
-    assert [e["reason"] for e in plan2.undimensioned] == ["no_axial_view"]
+    assert [e["reason"] for e in _holes_undim(plan2)] == ["no_axial_view"]
 
 
-def test_plan_ignores_bosses_and_mesh_route_has_no_callouts():
+def test_plan_bosses_are_undimensioned_not_supported_and_mesh_route_has_no_callouts():
     plan = _plan(features=[f for f in _features() if f.kind == "boss"])
-    assert _diam(plan) == [] and plan.undimensioned == []
+    assert _diam(plan) == []
+    assert plan.undimensioned == [{"kind": "boss_group", "radius": 15.0, "count": 1,
+                                   "reason": "not_supported", "view": None}]
     assert len(_linear(plan)) == 3
+    mesh = _plan(features=[])
+    assert _diam(mesh) == [] and mesh.undimensioned == [] and len(_linear(mesh)) == 3
 
 
 # ---------------------------------------------------- render_dimension --
@@ -656,19 +674,22 @@ def test_compose_section_label_marker_and_hatch():
         assert abs(tip[0] - tail[0]) < TOL
     letters = [t for t in sh.items if isinstance(t, Text) and t.text == "A"]
     assert len(letters) == 2 and all(t.height == pytest.approx(ST.label_height) for t in letters)
-    # hatch: spacing from the section's shorter extent on the sheet (25 mm -> 3 mm)
+    # hatch: one HatchLines per region (outer loop + holes, QA issue 29), all at the
+    # section spacing from the section's shorter extent on the sheet (25 mm -> 3 mm):
+    # both regions are wide enough, so ISO 128-50 "one part, one hatching" holds
     hatches = [i for i in sh.items if isinstance(i, HatchLines)]
-    assert len(hatches) == 1
-    h = hatches[0]
-    assert h.segments.shape[0] > 10 and len(h.loops) == 2
+    assert len(hatches) == 2 and all(len(h.loops) == 1 for h in hatches)
+    segs = np.vstack([h.segments for h in hatches])
+    assert all(h.segments.shape[0] > 5 for h in hatches)
     spacing = hatch_spacing(ST, 25.0 * s)
     assert spacing == 3.0
-    d = h.segments[:, 1, :] - h.segments[:, 0, :]
+    d = segs[:, 1, :] - segs[:, 0, :]
     ang = np.degrees(np.arctan2(d[:, 1], d[:, 0])) % 180.0
     assert np.allclose(ang, 45.0, atol=1e-6)
     nrm = np.array([-math.sin(math.pi / 4), math.cos(math.pi / 4)])
-    offs = np.unique(np.round(h.segments[:, 0, :] @ nrm, 6))
+    offs = np.unique(np.round(segs[:, 0, :] @ nrm, 6))
     assert np.allclose(np.diff(offs), spacing, atol=1e-5)
+    assert res.sheet.meta["section_layout"]["hatch_spacings"] == [3.0, 3.0]
     outlines = [i for i in sh.items if isinstance(i, Polyline) and i.style == LineStyle.SECTION]
     assert len(outlines) == 2 and all(o.closed for o in outlines)
 
@@ -686,7 +707,7 @@ def test_compose_dimensions_in_sheet_coordinates():
     assert w.base[1] == pytest.approx(foy - ST.dim_first_offset)        # band 0 below the front view
     four = next(d for d in sh.dimensions if d.kind == "diameter" and d.count == 4)
     (tox, toy), _ = res.placements["top"]
-    assert four.center == pytest.approx((tox + 92 * s, toy + 52 * s))
+    assert four.center == pytest.approx((tox + 8 * s, toy + 52 * s))
     assert four.radius == pytest.approx(3.25 * s)
     assert four.value == pytest.approx(6.5)                              # value stays model mm
     dim_texts = [t.text for t in sh.items if isinstance(t, Text)]
@@ -712,15 +733,17 @@ def test_compose_band_offsets_10_plus_7k():
             assert d.base[0] == pytest.approx(g.xmin - off), (d.text, b)
         elif side == "bottom":
             assert d.base[1] == pytest.approx(g.ymin - off), (d.text, b)
+        elif side == "right":
+            assert d.base[0] == pytest.approx(g.xmax + off), (d.text, b)
         else:
-            raise AssertionError(f"unexpected side {side}")
-        seen[(d.view, d.text)] = (side, k)
-    # precondition: several bands per side, so a layout ignoring k fails
-    assert seen[("top", "30")] == ("left", 0) and seen[("top", "52")] == ("left", 1)
-    assert seen[("top", "60")] == ("left", 2)
-    assert seen[("top", "50")] == ("bottom", 0) and seen[("top", "92")] == ("bottom", 1)
+            assert d.base[1] == pytest.approx(g.ymax + off), (d.text, b)
+        seen[(d.view, d.text, d.angle_deg)] = (side, k)
+    # precondition: several bands on the left, so a layout ignoring k fails
+    assert seen[("top", "30", 90.0)] == ("left", 0) and seen[("top", "52", 90.0)] == ("left", 1)
+    assert seen[("top", "60", 90.0)] == ("left", 2)
+    assert seen[("top", "50", 0.0)] == ("bottom", 0) and seen[("top", "8", 0.0)] == ("top", 0)
     lefts = sorted(d.base[0] for d in sh.dimensions if d.view == "top" and d.kind == "linear"
-                   and d.angle_deg == 90.0)
+                   and d.angle_deg == 90.0 and d.base[0] < tb.xmin)
     assert np.diff(lefts) == pytest.approx([ST.dim_pitch, ST.dim_pitch])   # distinct lines, 7 mm apart
 
 
@@ -729,16 +752,26 @@ def test_compose_callout_leader_ends_outside_the_outline():
     res, views, _ = _compose("first")
     sh = res.sheet
     tb = _geom_box(res, views, "top")
-    u = np.array([math.cos(math.radians(45.0)), math.sin(math.radians(45.0))])
     callouts = [d for d in sh.dimensions if d.kind == "diameter"]
     assert len(callouts) == 2
+    assert len({d.leader_angle_deg for d in callouts}) == 2               # one direction each
     for d in callouts:
+        u = np.array([math.cos(math.radians(d.leader_angle_deg)), math.sin(math.radians(d.leader_angle_deg))])
         base = np.asarray(d.base, float)
         tip = np.asarray(d.center, float) + d.radius * u
         assert not tb.contains(tuple(base))                       # the leader leaves the view
-        q = base - LEADER_EXIT_MARGIN * u                          # ... where it crosses the outline
-        assert tb.expanded(1e-6).contains(tuple(q))
-        assert min(abs(q[0] - tb.xmax), abs(q[1] - tb.ymax)) < 1e-6, d.text
+        # where it crosses the outline: LEADER_EXIT_MARGIN before its end for an upward leader;
+        # a downward one runs on until the text above its shelf clears the outline
+        ts = [((tb.xmax if u[0] > 0 else tb.xmin) - tip[0]) / u[0], ((tb.ymax if u[1] > 0 else tb.ymin) - tip[1]) / u[1]]
+        t_exit = min(ts)
+        length = float(np.linalg.norm(base - tip))
+        if u[1] > 0:
+            assert length == pytest.approx(t_exit + LEADER_EXIT_MARGIN, abs=1e-6), d.text
+        else:
+            assert length >= t_exit + LEADER_EXIT_MARGIN - 1e-6, d.text
+            g = sh.meta["dimension_items"][sh.dimensions.index(d)]
+            t = next(sh.items[i] for i in g if isinstance(sh.items[i], Text))
+            assert not _boxes_overlap(BBox2D.of_primitives([t]), tb), d.text
         # the rendered leader runs from the circle to that base
         g = sh.meta["dimension_items"][sh.dimensions.index(d)]
         leaders = [sh.items[i] for i in g if isinstance(sh.items[i], Segment)
@@ -806,9 +839,15 @@ def test_compose_iso_view_is_labelled_with_its_own_scale():
     res, views, _ = _compose("first")
     sh = res.sheet
     iso_s = sh.meta["iso_scale"]
-    assert res.scale == 1.0 and iso_s == pytest.approx(0.5)     # measured: iso drops to 1:2 on A3
+    # measured: the iso view used to drop to 1:2 on A3 (only eight fixed float positions and
+    # the callout reach added to the bands); with the float sweep and the exact callout room
+    # it is drawn at the sheet scale (QA issue 7)
+    assert res.scale == 1.0 and iso_s == pytest.approx(1.0)
     labels = [t for t in sh.items if isinstance(t, Text) and t.text.startswith("ISO (")]
-    assert [t.text for t in labels] == [f"ISO ({scale_text(iso_s)})"] == ["ISO (1:2)"]
+    assert [t.text for t in labels] == [f"ISO ({scale_text(iso_s)})"] == ["ISO (1:1)"]
+    a4, _, _ = _compose("first", sheet="A4")
+    assert a4.sheet.meta["iso_scale"] == pytest.approx(0.2)
+    assert [t.text for t in a4.sheet.items if isinstance(t, Text) and t.text.startswith("ISO (")] == ["ISO (1:5)"]
     (ox, oy), _ = res.placements["iso"]
     bb = views["iso"].bbox
     top = oy + iso_s * bb.ymax
@@ -886,7 +925,7 @@ def test_compose_without_section_has_no_marker():
     w = with_sec.sheet.items
     assert "section" in with_sec.placements
     assert len([i for i in w if isinstance(i, Segment) and i.style == LineStyle.CUTTING]) == 4
-    assert len([i for i in w if isinstance(i, HatchLines)]) == 1
+    assert len([i for i in w if isinstance(i, HatchLines)]) == 2
     assert len([i for i in w if isinstance(i, Text) and i.text == "A-A"]) == 1
     res, _, _ = _compose("first", section=None)
     assert {"front", "top", "right"} <= set(res.placements)   # the rest of the drawing is still there
@@ -904,3 +943,578 @@ def test_dimension_plan_type():
     assert len(plan.bands) == len(plan.dims)
     for d, b in zip(plan.dims, plan.bands):
         assert (b is None) == (d.kind == "diameter")
+    assert plan.flags == []
+
+
+# =========================================================================
+# QA round 1 (task F3): issues 2, 4, 7, 8, 9, 23, 26, 29
+# =========================================================================
+
+def _hole(x, y, r, z=7.5, length=15.0, axis=(0.0, 0.0, 1.0)):
+    return CylFeature(np.array([x, y, z], float), np.array(axis, float), r, length, "hole", True, 1)
+
+
+def _text_boxes(sheet, skip_title=True):
+    x0 = sheet.width - ST.margin - ST.title_block_w
+    y1 = ST.margin + ST.title_block_h + ST.strip_h
+    out = []
+    for t in sheet.items:
+        if not isinstance(t, Text):
+            continue
+        if skip_title and t.position[0] >= x0 - 1e-6 and t.position[1] <= y1 + 1e-6:
+            continue                                   # title block and strip
+        out.append((t.text, BBox2D.of_primitives([t])))
+    return out
+
+
+def _boxes_overlap(a, b):
+    return a.xmin < b.xmax and a.xmax > b.xmin and a.ymin < b.ymax and a.ymax > b.ymin
+
+
+def _overlapping_texts(sheet):
+    boxes = _text_boxes(sheet)
+    return [(boxes[i][0], boxes[j][0]) for i in range(len(boxes)) for j in range(i + 1, len(boxes))
+            if _boxes_overlap(boxes[i][1], boxes[j][1])]
+
+
+def _seg_hits_box(seg, box):
+    """numpy segment-vs-rectangle clip (shapely-free)."""
+    a, b = np.asarray(seg.a, float), np.asarray(seg.b, float)
+    d = b - a
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-d[0], a[0] - box.xmin), (d[0], box.xmax - a[0]), (-d[1], a[1] - box.ymin), (d[1], box.ymax - a[1])):
+        if abs(p) < 1e-12:
+            if q <= 0:
+                return False
+            continue
+        t = q / p
+        if p < 0:
+            t0 = max(t0, t)
+        else:
+            t1 = min(t1, t)
+        if t0 >= t1:
+            return False
+    return True
+
+
+# ---- issue 2: values from the exact model extents, mismatch is a returned flag --
+
+def test_plan_overall_values_come_from_model_extents_not_the_view_bbox():
+    views = _plate_views()
+    control = _plan(views=views, hole_positions=False)
+    assert control.flags == []                                   # control: boxes agree
+    v = views["top"]
+    # the top view's box 5 % too big (an arc boxed as a full circle, QA files 12 / 16)
+    views["top"] = ProjectedView(v.spec, v.visible, v.hidden, BBox2D(0, 0, 105, 63), "hlr_exact")
+    plan = _plan(views=views, hole_positions=False)
+    depth = [d for d in _linear(plan) if d.view == "top" and d.angle_deg == 90.0]
+    assert len(depth) == 1 and depth[0].value == pytest.approx(60.0) and depth[0].text == "60"
+    flags = [f for f in plan.flags if f[0] == "dimension_extent_mismatch"]
+    assert len(flags) == 1 and flags[0][1] == "warning" and "depth in view top" in flags[0][2]
+    # 0.3 mm (a discretised spline falling short) stays below the 0.5 mm flag threshold
+    views["top"] = ProjectedView(v.spec, v.visible, v.hidden, BBox2D(0, 0, 100, 59.7), "hlr_exact")
+    short = _plan(views=views, hole_positions=False)
+    assert short.flags == [] and [d.text for d in _linear(short) if d.view == "top"] == ["60"]
+
+
+def test_compose_forwards_the_planner_flags_to_the_layout_flags():
+    # review of issue 2: the mismatch must reach the report through LayoutResult.flags, which the
+    # pipeline already reports; a flag that stays on the plan is only logged
+    views = _plate_views()
+    v = views["top"]
+    views["top"] = ProjectedView(v.spec, v.visible, v.hidden, BBox2D(0, 0, 105, 63), "hlr_exact")
+    plan = _plan(views=views, hole_positions=False)
+    assert [f[0] for f in plan.flags] == ["dimension_extent_mismatch"]      # precondition
+    res, _, _ = _compose(plan=plan)
+    codes = [f[0] for f in res.flags]
+    assert codes.count("dimension_extent_mismatch") == 1
+    assert tuple(plan.flags[0]) in [tuple(f) for f in res.flags]
+    control, _, _ = _compose(plan=_plan(hole_positions=False))
+    assert "dimension_extent_mismatch" not in [f[0] for f in control.flags]
+
+
+def test_plan_arc_silhouette_gives_the_exact_overall_width():
+    # screw-head analogue: dome arc R 55 centred 45 below the base chord (QA file 12: 109.75 vs 42.3)
+    half = math.sqrt(55.0 ** 2 - 45.0 ** 2)
+    a0 = math.degrees(math.asin(45.0 / 55.0))
+    from src.drawing.model import Arc
+    prims = [Segment((-half, 0.0), (half, 0.0)), Arc((0.0, -45.0), 55.0, a0, 180.0 - a0)]
+    bb = BBox2D.of_primitives(prims)
+    assert bb.width == pytest.approx(2 * half) and bb.height == pytest.approx(10.0)
+    views = {"front": ProjectedView(VIEWS["front"], prims, [], bb, "hlr_exact")}
+    plan = plan_dimensions(views, [], DrawingOptions(), ST, np.array([2 * half, 2 * half, 10.0]))
+    by = {d.angle_deg: d for d in _linear(plan)}
+    assert by[0.0].text == format_value(2 * half) and by[90.0].text == "10"
+    assert plan.flags == []
+    # the dome top is anchored on the arc's 90 degree quadrant point, not a bbox corner
+    assert by[90.0].p2 == pytest.approx((0.0, 10.0))
+
+
+def test_brep_dome_on_a_cylinder_boxes_exactly_end_to_end():
+    """Issue 2 through the real B-rep route: a sphere cap (R 55, base circle R 31.62) fused on a
+    R 20 cylinder, projected from all four sides by brep_views. The cap silhouette arcs set the
+    width and the height; boxed as full circles (the QA file 12 defect) or with swapped ends
+    (a CW arc, the ``_SWAP_CW_ARCS`` case) the box would run to R 55."""
+    pytest.importorskip("OCP")
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Fuse
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeSphere
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+    from src.drawing.brep_views import project_brep
+    from src.drawing.model import Arc
+    sph = BRepPrimAPI_MakeSphere(gp_Pnt(0, 0, -35.0), 55.0).Shape()
+    cap = BRepAlgoAPI_Common(sph, BRepPrimAPI_MakeBox(gp_Pnt(-60, -60, 10.0), 120.0, 120.0, 60.0).Shape()).Shape()
+    cyl = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), 20.0, 10.0).Shape()
+    shape = BRepAlgoAPI_Fuse(cyl, cap).Shape()
+    half = math.sqrt(55.0 ** 2 - 45.0 ** 2)
+    ext = np.array([2 * half, 2 * half, 20.0])
+    for side in ("front", "back", "right", "left"):
+        v = project_brep(shape, VIEWS[side], exact=True, deflection=0.05)
+        arcs = [p for p in v.visible if isinstance(p, Arc)]
+        assert arcs and all(abs(a.radius - 55.0) < 1e-6 for a in arcs), side     # precondition: exact arcs
+        full = BBox2D.of_primitives([Circle(a.center, a.radius) for a in arcs])
+        assert full.width > 100.0, side                                          # what a full-circle box gives
+        bb = BBox2D.of_primitives(list(v.visible) + list(v.hidden))
+        assert (bb.width, bb.height) == pytest.approx((2 * half, 20.0), abs=1e-6), side
+        assert (v.bbox.width, v.bbox.height) == pytest.approx((2 * half, 20.0), abs=1e-6), side
+        for a in arcs:                                                           # each arc boxes inside
+            ab = BBox2D.of_primitives([a])
+            assert ab.ymin >= 10.0 - 1e-6 and ab.ymax <= 20.0 + 1e-6, (side, a)
+        plan = plan_dimensions({side: v}, [], DrawingOptions(), ST, ext)
+        assert plan.flags == [], (side, plan.flags)
+        assert sorted(d.text for d in _linear(plan)) == sorted([format_value(2 * half), "20"]), side
+    views = _plate_views()
+    v = views["top"]
+    # the right edge drawn 0.3 mm short (spline discretisation): the view bbox ends at 99.7
+    vis = [Segment((0, 0), (99.7, 0)), Segment((99.7, 0), (99.7, 60)), Segment((99.7, 60), (0, 60)),
+           Segment((0, 60), (0, 0))] + [p for p in v.visible if isinstance(p, Circle)]
+    views["top"] = ProjectedView(v.spec, vis, [], BBox2D(0, 0, 99.7, 60), "hlr_exact")
+    feats = [_hole(92.0, 52.0, 3.25)]
+    no_bounds = plan_dimensions(views, feats, DrawingOptions(), ST, EXTENTS)
+    x_no = [d.text for d in _linear(no_bounds) if d.view == "top" and d.angle_deg == 0.0]
+    assert x_no == ["7.7"]                                       # precondition: the short bbox shows
+    bounds = np.array([[0.0, 0.0, 0.0], [100.0, 60.0, 15.0]])
+    exact = plan_dimensions(views, feats, DrawingOptions(), ST, EXTENTS, model_bounds=bounds)
+    x_ex = [d for d in _linear(exact) if d.view == "top" and d.angle_deg == 0.0]
+    assert [d.text for d in x_ex] == ["8"] and x_ex[0].p1[0] == pytest.approx(100.0)
+
+
+# ---- issue 23: extension lines start at real geometry, positions from the nearer edge --
+
+def test_plan_overall_dims_anchor_at_real_geometry_points():
+    front_p = _rect(0, 0, 40, 10) + _rect(60, 20, 100, 50)      # two bodies, L arrangement
+    top_p = _rect(0, 0, 40, 30) + _rect(60, 10, 100, 60)
+    views = {"front": ProjectedView(VIEWS["front"], front_p, [], BBox2D.of_primitives(front_p), "hlr_exact"),
+             "top": ProjectedView(VIEWS["top"], top_p, [], BBox2D.of_primitives(top_p), "hlr_exact")}
+    plan = plan_dimensions(views, [], DrawingOptions(), ST, np.array([100.0, 60.0, 50.0]))
+    lin = _linear(plan)
+    assert len(lin) == 3
+    for d in lin:
+        ends = np.array([p for s in views[d.view].visible for p in (s.a, s.b)], float)
+        for p in (d.p1, d.p2):
+            assert np.min(np.linalg.norm(ends - np.asarray(p), axis=1)) < 1e-6, (d.view, d.text, p)
+    width = next(d for d in lin if d.view == "front" and d.angle_deg == 0.0)
+    assert width.p2 == pytest.approx((100.0, 20.0))             # not the empty corner (100, 0)
+    height = next(d for d in lin if d.view == "front" and d.angle_deg == 90.0)
+    assert height.p2 == pytest.approx((60.0, 50.0))             # not the empty corner (0, 50)
+
+
+def test_plan_hole_positions_from_the_nearer_edge_keep_extension_lines_short():
+    views = _box_views(100.0, 60.0, 15.0, iso=False)
+    top = views["top"]
+    views["top"] = ProjectedView(top.spec, list(top.visible) + [Circle((90.0, 50.0), 3.0)], [], top.bbox, "hlr_exact")
+    plan = plan_dimensions(views, [_hole(90.0, 50.0, 3.0)], DrawingOptions(), ST, EXTENTS)
+    pos = [(d, b) for d, b in zip(plan.dims, plan.bands)
+           if d.kind == "linear" and d.view == "top" and round(d.value, 6) == 10.0]
+    assert len(pos) == 2
+    sides = sorted(b[0] for _, b in pos)
+    assert sides == ["right", "top"]
+    for d, (side, _) in pos:
+        nrm = 1 if d.angle_deg == 0.0 else 0          # the extension runs across the dimension line
+        line = 60.0 if side == "top" else 100.0
+        ext = max(abs(line - d.p1[nrm]), abs(line - d.p2[nrm]))
+        assert ext < 0.5 * min(100.0, 60.0), (d.text, side, ext)
+
+
+def _positions_by_axis(plan):
+    """{axis: {(datum edge coordinate, value text)}} of the top view's hole positions."""
+    out = {0: set(), 1: set()}
+    for d in _linear(plan):
+        if d.view != "top" or round(d.value, 6) in (100.0, 60.0):
+            continue
+        axis = 0 if d.angle_deg == 0.0 else 1
+        out[axis].add((round(float(d.p1[axis]), 6), d.text))
+    return out
+
+
+def test_plan_hole_positions_use_one_datum_per_view_and_axis():
+    # review of issue 23: one group near the bottom-left, one near the top-right corner. The
+    # nearer-edge-per-hole rule measured X '10' from the left and '15' from the right, Y '10'
+    # from the bottom and '10' from the top: two datums per axis in one view.
+    views = _box_views(100.0, 60.0, 15.0, iso=False)
+    holes = [_hole(10.0, 10.0, 3.0), _hole(85.0, 50.0, 2.0)]
+    near = {0: {h.center[0] < 50.0 for h in holes}, 1: {h.center[1] < 30.0 for h in holes}}
+    assert near == {0: {True, False}, 1: {True, False}}          # precondition: nearer edges differ
+    pos = _positions_by_axis(plan_dimensions(views, holes, DrawingOptions(), ST, EXTENTS))
+    assert {e for e, _ in pos[0]} == {0.0} and {e for e, _ in pos[1]} == {0.0}   # tie: left, bottom
+    assert pos[0] == {(0.0, "10"), (0.0, "85")} and pos[1] == {(0.0, "10"), (0.0, "50")}
+    # a third hole near the top-right gives that corner the majority: every position from there
+    holes3 = holes + [_hole(90.0, 45.0, 1.5)]
+    pos3 = _positions_by_axis(plan_dimensions(views, holes3, DrawingOptions(), ST, EXTENTS))
+    assert {e for e, _ in pos3[0]} == {100.0} and {e for e, _ in pos3[1]} == {60.0}
+    assert {t for _, t in pos3[0]} == {"90", "15", "10"} and {t for _, t in pos3[1]} == {"50", "10", "15"}
+
+
+# ---- issue 9: coaxial clusters (counterbores, stepped bores) -----------------
+
+_CB = [(15.0, 15.0), (85.0, 15.0), (15.0, 45.0), (85.0, 45.0)]
+
+
+def _cb_views():
+    views = _box_views(100.0, 60.0, 20.0, iso=False)
+    top = views["top"]
+    circles = [Circle(c, r) for c in _CB for r in (5.0, 8.0)]
+    views["top"] = ProjectedView(top.spec, list(top.visible) + circles, [], top.bbox, "hlr_exact")
+    return views
+
+
+def _cb_features():
+    out = []
+    for x, y in _CB:
+        out.append(_hole(x, y, 5.0, z=7.5, length=15.0))          # through part, z 0..15
+        out.append(_hole(x, y, 8.0, z=17.5, length=5.0))          # counterbore, z 15..20
+    return out
+
+
+def test_plan_counterbore_is_one_feature_with_one_callout():
+    plan = plan_dimensions(_cb_views(), _cb_features(), DrawingOptions(), ST, np.array([100.0, 60.0, 20.0]))
+    d = _diam(plan)
+    assert len(d) == 1
+    assert d[0].text == "4 x Ø10 / Ø16 counterbore" and d[0].count == 4
+    assert d[0].value == pytest.approx(10.0) and d[0].radius == pytest.approx(8.0)   # arrow on the Ø16
+    keys = [(x.view, x.angle_deg, x.text) for x in _linear(plan)]
+    assert len(keys) == len(set(keys)), keys                     # no duplicated position dims
+    assert len([x for x in _linear(plan) if x.view == "top"]) == 3     # depth + one X + one Y
+    u = [e for e in plan.undimensioned if e["kind"] == "counterbore_depth"]
+    assert len(u) == 1 and u[0]["reason"] == "not_supported" and u[0]["count"] == 4
+
+
+def test_plan_stepped_bore_and_same_edge_position_dedupe():
+    views = _cb_views()
+    stepped = [_hole(50.0, 30.0, 3.0, z=5.0, length=10.0), _hole(50.0, 30.0, 5.0, z=12.5, length=5.0),
+               _hole(50.0, 30.0, 8.0, z=2.5, length=5.0)]
+    plan = plan_dimensions(views, stepped, DrawingOptions(), ST, np.array([100.0, 60.0, 20.0]))
+    assert [x.text for x in _diam(plan)] == ["Ø6 / Ø10 / Ø16 stepped"]
+    assert [e["kind"] for e in plan.undimensioned] == ["step_depth"]
+    # two groups whose callout circles share x = 90 (10 from the right edge): one X dimension
+    feats = [_hole(90.0, 50.0, 3.0), _hole(90.0, 10.0, 3.0), _hole(90.0, 40.0, 2.0), _hole(90.0, 25.0, 2.0)]
+    p2 = plan_dimensions(_box_views(100.0, 60.0, 15.0, iso=False), feats, DrawingOptions(), ST, EXTENTS)
+    callouts = _diam(p2)
+    assert len(callouts) == 2 and {c.center[0] for c in callouts} == {90.0}   # precondition: same x
+    xs = [x for x in _linear(p2) if x.view == "top" and x.angle_deg == 0.0]
+    assert [x.text for x in xs] == ["10"]
+    keys = [(x.view, x.angle_deg, x.text) for x in _linear(p2)]
+    assert len(keys) == len(set(keys))
+
+
+def test_plan_counterbore_from_a_real_occt_shape():
+    pytest.importorskip("OCP")
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+    from src.drawing.brep_features import cylinder_features
+    shape = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 100.0, 60.0, 20.0).Shape()
+    for x, y in _CB:
+        thru = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x, y, -1.0), gp_Dir(0, 0, 1)), 5.0, 22.0).Shape()
+        cb = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x, y, 15.0), gp_Dir(0, 0, 1)), 8.0, 6.0).Shape()
+        shape = BRepAlgoAPI_Cut(shape, thru).Shape()
+        shape = BRepAlgoAPI_Cut(shape, cb).Shape()
+    feats = cylinder_features(shape)
+    holes = [f for f in feats if f.kind == "hole"]
+    assert sorted(round(f.radius, 6) for f in holes) == [5.0] * 4 + [8.0] * 4      # precondition
+    plan = plan_dimensions(_cb_views(), feats, DrawingOptions(), ST, np.array([100.0, 60.0, 20.0]))
+    d = _diam(plan)
+    assert len(d) == 1 and "Ø10" in d[0].text and "Ø16" in d[0].text and "counterbore" in d[0].text
+    keys = [(x.view, x.angle_deg, round(x.value, 6)) for x in _linear(plan)]
+    assert len(keys) == len(set(keys))
+
+
+# ---- issue 8: distinct circles and leader angles, no overlapping texts ----
+
+def _crowded():
+    views = _box_views(120.0, 80.0, 20.0, iso=False)
+    holes = [_hole(100.0, 60.0, 5.0), _hole(110.0, 70.0, 5.0), _hole(90.0, 70.0, 3.0), _hole(110.0, 50.0, 3.0),
+             _hole(95.0, 50.0, 2.0), _hole(80.0, 70.0, 2.0), _hole(105.0, 40.0, 1.5)]
+    top = views["top"]
+    views["top"] = ProjectedView(top.spec, list(top.visible) + [Circle((h.center[0], h.center[1]), h.radius)
+                                                                for h in holes], [], top.bbox, "hlr_exact")
+    return views, holes
+
+
+def test_plan_callout_text_runs_over_the_view_at_the_hinted_scale():
+    feats = [h for x in (8.0, 60.0) for h in (_hole(x, 52.0, 3.0, z=5.0, length=10.0),
+                                               _hole(x, 52.0, 5.0, z=12.5, length=5.0))]
+    at_1 = plan_dimensions(_plate_views(), feats, DrawingOptions(), ST, EXTENTS, scale_hint=1.0)
+    at_50 = plan_dimensions(_plate_views(), feats, DrawingOptions(), ST, EXTENTS, scale_hint=50.0)
+    assert [d.text for d in _diam(at_1)] == ["2 x Ø6 / Ø10 counterbore"]
+    # at 1:1 the 50 mm text would stick out past the right edge from the x = 60 circle
+    assert _diam(at_1)[0].center == pytest.approx((8.0, 52.0))
+    # at 50:1 it is 1 view mm wide: the circle nearest the top-right corner wins the tie
+    assert _diam(at_50)[0].center == pytest.approx((60.0, 52.0))
+    assert _diam(at_1)[0].leader_angle_deg == _diam(at_50)[0].leader_angle_deg == 45.0
+
+
+def test_plan_callouts_get_distinct_circles_and_leader_angles():
+    views, holes = _crowded()
+    plan = plan_dimensions(views, holes, DrawingOptions(), ST, np.array([120.0, 80.0, 20.0]))
+    d = _diam(plan)
+    assert len(d) == 4                                            # precondition: at least 3 callouts
+    assert len({tuple(x.center) for x in d}) == 4                 # one circle per group
+    assert {x.leader_angle_deg for x in d} <= {45.0, 135.0, -45.0, -135.0}
+    assert len({x.leader_angle_deg for x in d}) >= 2              # not all on one fixed 45 degrees
+    # short leaders: the lone Ø3 near the right edge points right, not across the plate
+    lone = next(x for x in d if x.count == 1)
+    assert math.cos(math.radians(lone.leader_angle_deg)) > 0
+    # no two leaders cross (out to 30 mm beyond the circle)
+    from src.drawing.dimensions import _segments_cross
+    segs = []
+    for x in d:
+        u = np.array([math.cos(math.radians(x.leader_angle_deg)), math.sin(math.radians(x.leader_angle_deg))])
+        c = np.asarray(x.center, float)
+        segs.append((c + x.radius * u, c + (x.radius + 30.0) * u))
+    assert not any(_segments_cross(segs[i], segs[j]) for i in range(4) for j in range(i + 1, 4))
+
+
+def _cluster():
+    """Four two-hole groups whose circles nearest the top-right corner sit 8 mm apart."""
+    views = _box_views(120.0, 80.0, 20.0, iso=False)
+    holes = [_hole(112.0, 72.0, 2.0), _hole(20.0, 20.0, 2.0), _hole(104.0, 72.0, 1.5), _hole(20.0, 40.0, 1.5),
+             _hole(112.0, 64.0, 1.0), _hole(40.0, 20.0, 1.0), _hole(104.0, 64.0, 1.25), _hole(40.0, 40.0, 1.25)]
+    top = views["top"]
+    views["top"] = ProjectedView(top.spec, list(top.visible) + [Circle((h.center[0], h.center[1]), h.radius)
+                                                                for h in holes], [], top.bbox, "hlr_exact")
+    return views, holes
+
+
+def _old_style_callouts(plan, holes, corner):
+    """The QA round 1 planner: every callout on its group's circle nearest ``corner``, leader at 45."""
+    import dataclasses
+    dims = []
+    for d in plan.dims:
+        if d.kind == "diameter":
+            cs = [(float(h.center[0]), float(h.center[1])) for h in holes if abs(2.0 * h.radius - d.value) < 1e-9]
+            c = min(cs, key=lambda p: math.hypot(corner[0] - p[0], corner[1] - p[1]))
+            d = dataclasses.replace(d, center=c, base=c, leader_angle_deg=45.0)
+        dims.append(d)
+    return DimensionPlan(dims=dims, undimensioned=plan.undimensioned, bands=plan.bands)
+
+
+def test_compose_crowded_callouts_never_overlap(monkeypatch):
+    import src.drawing.layout as layout_mod
+    views, holes = _cluster()
+    plan = plan_dimensions(views, holes, DrawingOptions(), ST, np.array([120.0, 80.0, 20.0]))
+    assert len(_diam(plan)) == 4
+    old = _old_style_callouts(plan, holes, (120.0, 80.0))
+    # precondition: placed the QA round 1 way and composed without the collision pass, the
+    # callout texts of this fixture overlap on the sheet (measured: 4 overlapping pairs)
+    monkeypatch.setattr(layout_mod, "_resolve_text_collisions", lambda *a, **k: {}, raising=False)
+    bare, _, _ = _compose(views=views, section=None, plan=old)
+    monkeypatch.undo()
+    assert len(_overlapping_texts(bare.sheet)) >= 2
+    # the real planner and the real collision pass: no overlap, no flag
+    for p in (plan, old):                                          # the pass alone also clears the old plan
+        res, _, _ = _compose(views=views, section=None, plan=p)
+        assert len([x for x in res.sheet.dimensions if x.kind == "diameter"]) == 4
+        assert _overlapping_texts(res.sheet) == []
+        assert "layout_text_collision" not in [f[0] for f in res.flags]
+
+
+def test_compose_moves_coincident_callouts_apart():
+    # the QA round 1 failure: two callouts on the same circle with the same 45 degree leader
+    views = _plate_views()
+    plan = _plan(views=views, hole_positions=False)
+    dims = [d for d in plan.dims if d.kind == "linear"] + [
+        Dimension("diameter", "4 x Ø6.5", 6.5, center=(92.0, 52.0), radius=3.25, base=(92.0, 52.0),
+                  leader_angle_deg=45.0, view="top", count=4),
+        Dimension("diameter", "4 x Ø12.7", 12.7, center=(92.0, 52.0), radius=3.25, base=(92.0, 52.0),
+                  leader_angle_deg=45.0, view="top", count=4)]
+    bands = [b for d, b in zip(plan.dims, plan.bands) if d.kind == "linear"] + [None, None]
+    crowded = DimensionPlan(dims=dims, undimensioned=[], bands=bands)
+    # precondition: rendered as planned, the two texts coincide
+    t = [next(i for i in render_dimension(d, ST) if isinstance(i, Text)) for d in dims[-2:]]
+    assert _boxes_overlap(BBox2D.of_primitives([t[0]]), BBox2D.of_primitives([t[1]]))
+    res, _, _ = _compose(plan=crowded)
+    assert _overlapping_texts(res.sheet) == []
+    assert res.sheet.meta["text_collisions"]["callouts_moved"] >= 1
+    assert "layout_text_collision" not in [f[0] for f in res.flags]
+
+
+def test_compose_without_the_collision_pass_would_overlap(monkeypatch):
+    """No-op control for the two tests above: the pass is what separates the texts."""
+    import src.drawing.layout as layout_mod
+    monkeypatch.setattr(layout_mod, "_resolve_text_collisions", lambda *a, **k: {})
+    views = _plate_views()
+    plan = _plan(views=views, hole_positions=False)
+    dims = [d for d in plan.dims if d.kind == "linear"] + [
+        Dimension("diameter", "4 x Ø6.5", 6.5, center=(92.0, 52.0), radius=3.25, base=(92.0, 52.0),
+                  leader_angle_deg=45.0, view="top", count=4),
+        Dimension("diameter", "4 x Ø12.7", 12.7, center=(92.0, 52.0), radius=3.25, base=(92.0, 52.0),
+                  leader_angle_deg=45.0, view="top", count=4)]
+    bands = [b for d, b in zip(plan.dims, plan.bands) if d.kind == "linear"] + [None, None]
+    res, _, _ = _compose(plan=DimensionPlan(dims=dims, undimensioned=[], bands=bands))
+    assert _overlapping_texts(res.sheet)
+    assert ("layout_text_collision", "info") in [f[:2] for f in res.flags]
+
+
+# ---- issue 4: the cutting-line connector does not run through a dimension text --
+
+def test_compose_cutting_line_avoids_the_depth_dimension_text():
+    views = _box_views(60.0, 20.0, 30.0, iso=False)
+    loops = [np.array([[0, 0], [60, 0], [60, 30], [0, 30]], float)]
+    sec = SectionView(VIEWS["front"], np.array([30.0, 10.0, 15.0]), np.array([0.0, -1.0, 0.0]),
+                      loops, None, label="A", marker_view="top")
+    res, _, plan = _compose(views=views, section=sec)
+    depth = [d for d in res.sheet.dimensions if d.view == "top" and d.angle_deg == 90.0]
+    assert len(depth) == 1 and depth[0].text == "20"
+    # precondition: the plane is at mid-depth = the depth dimension's midpoint, so the centred
+    # text (text_offset 0) sits on the cutting line
+    y_cut = res.placements["top"][0][1] + res.scale * 10.0
+    assert 0.5 * (depth[0].p1[1] + depth[0].p2[1]) == pytest.approx(y_cut)
+    marker = [i for i in res.sheet.items if isinstance(i, Segment) and i.style in (LineStyle.CUTTING, LineStyle.CENTER)]
+    centred = next(i for i in render_dimension(Dimension(**{**depth[0].__dict__, "text_offset": 0.0}), ST)
+                   if isinstance(i, Text))
+    assert any(_seg_hits_box(m, BBox2D.of_primitives([centred])) for m in marker)
+    assert depth[0].text_offset != 0.0
+    for name, box in _text_boxes(res.sheet):
+        for m in marker:
+            assert not _seg_hits_box(m, box), (name, m)
+    # the shifted text stays on its (extended) dimension line
+    g = res.sheet.meta["dimension_items"][res.sheet.dimensions.index(depth[0])]
+    t = next(res.sheet.items[i] for i in g if isinstance(res.sheet.items[i], Text))
+    from src.drawing.dimensions import linear_text_position
+    assert t.position == pytest.approx(linear_text_position(depth[0], ST))
+    lines = [res.sheet.items[i] for i in g if isinstance(res.sheet.items[i], Segment)
+             and abs(res.sheet.items[i].a[0] - res.sheet.items[i].b[0]) < 1e-9
+             and abs(res.sheet.items[i].a[0] - depth[0].base[0]) < 1e-9]
+    assert len(lines) == 1
+    lo, hi = sorted([lines[0].a[1], lines[0].b[1]])
+    assert lo - 1e-9 <= t.position[1] <= hi + 1e-9
+
+
+# ---- issue 7: scale --------------------------------------------------------
+
+def _ftc_boxes():
+    return {"front": BBox2D(0, 0, 127, 35), "top": BBox2D(0, 0, 127, 63.5), "right": BBox2D(0, 0, 63.5, 35)}
+
+
+def test_choose_scale_iso_finds_free_space_at_the_sheet_scale(monkeypatch):
+    import src.drawing.layout as layout_mod
+    s, info = choose_scale(_ftc_boxes(), {}, SHEETS["A3"], ST, "first", False, False)
+    assert s == 1.0                                               # the empty-band case fits 1:1
+    s2, info2 = choose_scale(_ftc_boxes(), {}, SHEETS["A3"], ST, "first", True, True)
+    assert s2 == 1.0 and info2["iso_scale"] == 1.0
+    _assert_iso_clear(info2["rects"], SHEETS["A3"])
+    # a 40 x 80 x 35 part on A4: the sweep finds room for the iso view at 1:1 ...
+    tall = {"front": BBox2D(0, 0, 40, 35), "top": BBox2D(0, 0, 40, 80), "right": BBox2D(0, 0, 80, 35)}
+    s4, info4 = choose_scale(tall, {}, SHEETS["A4"], ST, "first", False, True)
+    assert s4 == 1.0 and info4["iso_scale"] == 1.0 and info4["iso_mode"] == "free"
+    _assert_iso_clear(info4["rects"], SHEETS["A4"])
+    # ... control: with the eight fixed spots only it dropped to 1:2 (measured)
+    monkeypatch.setattr(layout_mod, "_float_spots", lambda *a, **k: None)
+    s5, info5 = choose_scale(tall, {}, SHEETS["A4"], ST, "first", False, True)
+    assert s5 == 1.0 and info5["iso_scale"] == 0.5
+
+
+def test_callout_room_is_the_exact_rendered_reach():
+    # the callout room used to be a fixed reach measured from the circle and ADDED to the
+    # bands (measured: the plate on A4 fell to 1:10 with four-sided bands); it is now the
+    # rendered callout's reach beyond the outline at each scale, taken as max with the bands
+    from src.drawing.layout import _callout_room
+    for sheet in ("A3", "A4"):
+        res, views, plan = _compose("first", sheet=sheet)
+        boxes = {n: v.bbox for n, v in views.items()}
+        room = _callout_room(plan, boxes, ST)(res.scale)
+        g_top = _geom_box(res, views, "top")
+        reach = [0.0, 0.0, 0.0, 0.0]
+        for d, g in zip(res.sheet.dimensions, res.sheet.meta["dimension_items"]):
+            if d.kind != "diameter":
+                continue
+            bb = BBox2D.of_primitives([res.sheet.items[i] for i in g])
+            _assert_inside(bb, res.placements[d.view][1], d.text)
+            for i, v in enumerate((g_top.xmin - bb.xmin, g_top.ymin - bb.ymin, bb.xmax - g_top.xmax,
+                                   bb.ymax - g_top.ymax)):
+                reach[i] = max(reach[i], v)
+        assert max(reach) > 0.0                                   # precondition: callouts reach out
+        assert room["top"] == pytest.approx(tuple(reach), abs=1e-6)
+    assert res.scale == pytest.approx(1 / 5)
+
+
+# ---- issue 26: bosses / fillets recorded, concentric bore without positions --
+
+def test_plan_bosses_and_fillets_go_to_undimensioned():
+    fil = [CylFeature(np.array([x, 0.0, 7.5]), np.array([0.0, 0.0, 1.0]), 2.0, 15.0, "fillet", False, 1)
+           for x in (0.0, 100.0)]
+    plan = _plan(features=_features(fil))
+    u = {e["kind"]: e for e in plan.undimensioned}
+    assert u["boss_group"]["reason"] == "not_supported" and u["boss_group"]["radius"] == pytest.approx(15.0)
+    assert u["fillet_group"]["reason"] == "not_supported" and u["fillet_group"]["count"] == 2
+
+
+def test_plan_concentric_bore_gets_no_position_dims():
+    def views_for(outline):
+        front = ProjectedView(VIEWS["front"], _rect(0, 0, 40, 10), [], BBox2D(0, 0, 40, 10), "hlr_exact")
+        top = ProjectedView(VIEWS["top"], outline + [Circle((20.0, 20.0), 5.0)], [], BBox2D(0, 0, 40, 40), "hlr_exact")
+        return {"front": front, "top": top}
+    bore = [_hole(20.0, 20.0, 5.0, z=5.0, length=10.0)]
+    washer = plan_dimensions(views_for([Circle((20.0, 20.0), 20.0)]), bore, DrawingOptions(), ST,
+                             np.array([40.0, 40.0, 10.0]))
+    assert [d.text for d in _diam(washer)] == ["Ø10"]
+    assert [d.text for d in _linear(washer) if d.view == "top"] == ["40"]        # the depth only
+    # control: the same bore in a square plate keeps its two position dims
+    square = plan_dimensions(views_for(_rect(0, 0, 40, 40)), bore, DrawingOptions(), ST,
+                             np.array([40.0, 40.0, 10.0]))
+    assert sorted(d.text for d in _linear(square) if d.view == "top") == ["20", "20", "40"]
+
+
+# ---- issue 29: small section regions ------------------------------------------
+
+def test_section_hatch_small_region_gets_lines_or_fill():
+    from src.drawing.geometry2d import hatch_lines
+    from src.drawing.layout import _section_items
+    big = np.array([[0, 0], [80, 0], [80, 40], [0, 40]], float)
+    x0 = 97.5
+    small = np.array([[x0, 0], [x0 + 4, 0], [x0 + 4, 4], [x0, 4]], float)
+    tiny = np.array([[120, 0], [121.5, 0], [121.5, 1.5], [120, 1.5]], float)
+    spacing = hatch_spacing(ST, 40.0)
+    assert spacing == 3.0
+    assert len(hatch_lines([small], spacing, 45.0)) <= 1          # precondition: the old single spacing
+    sec = SectionView(VIEWS["front"], np.zeros(3), np.array([0.0, -1.0, 0.0]), [big, small, tiny], None)
+    items, stats = _section_items(sec, (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 121.5, 40))
+    hatches = [i for i in items if isinstance(i, HatchLines)]
+    assert len(hatches) == 2
+    by_loop = {round(float(h.loops[0][:, 0].min()), 6): h for h in hatches}
+    assert len(by_loop[x0].segments) >= 2
+    assert stats["hatch_spacings"][0] == 3.0                     # the big region keeps the section spacing
+    fills = [i for i in items if isinstance(i, Polygon)]
+    assert len(fills) == 1 and np.allclose(fills[0].points, tiny) and stats["filled_regions"] == 1
+    assert stats["hatch_spacing"] == 3.0 and stats["loops"] == 3
+
+
+def test_section_thin_strip_is_filled_at_any_angle():
+    # review of issue 29: the fill test used the shorter bbox side, so a 1.5 mm strip at 45 degrees
+    # (bbox about 43.5 x 43.5) got 0.7 mm hatching while the same strip lying flat was filled
+    from src.drawing.layout import _min_width, _section_items
+    big = np.array([[0, 0], [80, 0], [80, 40], [0, 40]], float)
+    u, n = np.array([1.0, 1.0]) / math.sqrt(2.0), np.array([-1.0, 1.0]) / math.sqrt(2.0)
+    o = np.array([100.0, 0.0])
+    diag = np.array([o, o + 60.0 * u, o + 60.0 * u + 1.5 * n, o + 1.5 * n])
+    flat = np.array([[0, 50], [60, 50], [60, 51.5], [0, 51.5]], float)
+    db = BBox2D.from_points(diag)
+    assert min(db.width, db.height) > 40.0                       # precondition: the bbox rule hatches it
+    assert _min_width(diag) == pytest.approx(1.5) and _min_width(flat) == pytest.approx(1.5)
+    assert _min_width(big) == pytest.approx(40.0)
+    for strip in (diag, flat):
+        sec = SectionView(VIEWS["front"], np.zeros(3), np.array([0.0, -1.0, 0.0]), [big, strip], None)
+        items, stats = _section_items(sec, (0.0, 0.0), 1.0, ST, BBox2D.from_points(np.vstack([big, strip])))
+        fills = [i for i in items if isinstance(i, Polygon)]
+        assert len(fills) == 1 and np.allclose(fills[0].points, strip) and stats["filled_regions"] == 1
+        assert len([i for i in items if isinstance(i, HatchLines)]) == 1          # only the big region

@@ -7,34 +7,61 @@ the report, and it returns ``(exit_code, report_dict)`` with the
 1 failed). The report is also written to ``<out_dir>/<stem>.report.json``.
 
 Order (spec 3.2-3.4): sniff -> limits -> load (B-rep or mesh) -> orientation
-(``projection.auto_orientation`` on the file bbox, applied with
-``transform_shape`` / ``transform_mesh``) -> bbox of the oriented model ->
-cylinder features (true B-rep only) -> the requested views -> section
-(unless ``off``) -> ``plan_dimensions`` -> ``compose`` -> writers -> report.
+(``projection.auto_orientation`` on the file bbox, then the depth sign: a
+180-degree turn about Z when the far side carries clearly more features,
+QA issue 14) applied with ``transform_shape`` / ``transform_mesh`` -> bbox
+of the oriented model (STEP: the exact file box mapped by the signed axis
+permutation, ``_permuted_box``; no second ``AddOptimal``) -> cylinder features (true B-rep only) -> the
+requested views -> section (unless ``off``) -> ``plan_dimensions`` ->
+``compose`` -> writers -> report.
 
 Routing:
 
-* STEP -> ``brep_load.load_step`` -> exact HLR (``HLRBRep_Algo``) up to
-  ``exact_hlr_max_faces`` faces, poly HLR above (flag ``hlr_poly_used``). A
-  view that fails or exceeds ``hlr_time_budget_s`` is skipped and flagged
-  (``view_failed`` / ``hlr_timeout``); no view at all -> exit 1.
-* STL -> ``mesh_load.load_mesh_model`` (census + prismatic/organic
-  classifier). ``stl_to_step``: ``auto`` converts prismatic meshes with at
-  most ``faceted_max_triangles`` triangles to a faceted STEP
+* STEP -> ``brep_load.load_step`` (the DRAWN shape: the solids when there
+  are any; loose curve sets and supplemental shells are left out and
+  flagged ``loose_curves_ignored`` / ``supplemental_shells_ignored``) ->
+  exact HLR (``HLRBRep_Algo``) up to ``exact_hlr_max_faces`` faces, poly
+  HLR above (flag ``hlr_poly_used``). A view that fails or exceeds
+  ``hlr_time_budget_s`` in the native HLR is skipped and flagged
+  (``view_failed`` / ``hlr_timeout``); a budget overrun later (extraction,
+  clean-up) keeps the view without hidden lines (``hidden_lines_dropped``),
+  and so does a view with more than ``max_hidden_primitives`` (default
+  20000) raw hidden primitives; no view at all -> exit 1. A tessellated-only STEP (``TessellatedOnlyError``)
+  goes to the mesh route (``route.source`` ``step_tessellated_mesh``, flag
+  ``step_tessellated_only``).
+* STL -> ``mesh_load.load_mesh_model`` (census + prismatic/organic/not_solid
+  classifier). The unit is ``stl_unit`` when given (the mesh is scaled to
+  mm), else assumed mm (``source_unit`` ``assumed_mm``, flag
+  ``unit_assumed_mm``). ``stl_to_step``: ``auto`` converts prismatic meshes
+  with at most ``faceted_max_triangles`` triangles to a faceted STEP
   (``src.io.faceted_step.export_step_faceted(verify=False)`` into
   ``<out_dir>/<stem>.step``) and draws the faceted body with the poly HLR
   (``brep_load.faceted_shape_from_mesh`` -> shell / solid with the smooth
   facet edges coded C1, ``project_brep(exact=False)``); otherwise the mesh
-  route with ``stl_to_step.skipped_reason`` ``organic`` /
+  route with ``stl_to_step.skipped_reason`` ``organic`` / ``not_solid`` /
   ``too_many_triangles``. ``faceted`` forces the conversion, ``nurbs`` runs
   the smooth converter of ``src/convert.py`` (QuadWrapper +
   SubDToNURBSConverter, G1, reference fit) and draws that B-rep with exact
   HLR, ``off`` always uses the mesh route. ANY exception of the B-rep stage
   on an STL input (conversion, empty body, a failed or timed-out view, the
   section) falls back to the mesh route (``route.fallbacks``, flag
-  ``fallback_to_mesh``).
+  ``fallback_to_mesh``). A ``not_solid`` mesh (triangle soup) is drawn on
+  the mesh route without section and overall dimensions (flag
+  ``not_a_solid``, level ``minimal``).
 * Mesh route: ``mesh_views.project_mesh`` (depth buffer) and
   ``mesh_sections``; no hole features (flag ``holes_not_detected_mesh_route``).
+
+Unit plausibility (QA issue 5): ``mesh_load.unit_plausibility`` on the
+model extents in mm, with the declared STEP unit (or the STL unit when
+given); a suspicious size raises ``unit_suspect`` (warning) with the
+alternative reading in the detail. After the layout, ``views_tiny``
+(warning) when the sheet scale is the largest standard scale and the view
+geometry covers less than 10 % of the drawing frame (``_views_tiny``).
+
+Mesh ``inverted_solid`` is raised only for a consistently wound mesh
+(``winding_conflicts == 0``); for a badly wound one the census "inverted"
+verdict only describes its dominant piece, so a warning text about the
+inconsistent winding is written instead.
 
 The faceted body that is drawn is built from the ORIENTED mesh by
 ``faceted_shape_from_mesh`` (one face per triangle, smooth edges coded C1:
@@ -42,12 +69,25 @@ the measured requirement of the poly HLR), while the STEP file written for
 the user is ``export_step_faceted`` of the mesh in its FILE coordinates
 (coplanar faces merged). ``export_step_faceted`` does not return its shape,
 and the merged faces would lose the regularity coding the poly HLR needs.
+Its volume is audited against the winding-repaired mesh volume of the
+census (``mesh_load.mesh_volume_repaired``), and the drawn B-rep volume is
+the single ``geometry.volume_mm3`` of that route.
 
 HLR discretization: ``deflection = 0.05 / scale_guess`` mm, where
 ``scale_guess`` is ``layout.choose_scale`` on the bbox-only view boxes of
 the oriented model before any HLR (A3 when ``sheet=auto``: its scale is at
 least the A4 one, so the deflection is never coarser than needed), clamped
-to [0.001, 5] mm.
+to [0.001, 5] mm. The same ``scale_guess`` is passed to the views as
+``paper_scale`` (paper-mm tolerances, dash chaining) and to the dimension
+planner as ``scale_hint``.
+
+Progress (sandboxed runs): at every stage boundary the pipeline writes
+``Report.progress_snapshot`` (stage, view, flags, unit, geometry, timing,
+plus ``counts``; the stage times so far are copied into the report's
+``timing`` first, ``views_s`` updated before every view) to the file named
+by ``report.PROGRESS_ENV`` (no-op when
+the variable is unset); the CLI parent merges the last snapshot into the
+failure report when the child is killed (QA issue 17).
 
 No output to stdout (the CLI owns it): progress goes to ``logging`` or the
 ``log`` callable; the NURBS converter (which prints) runs under
@@ -64,16 +104,28 @@ import time
 import types
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .options import DrawingOptions
-from .report import Report
+from .options import STL_UNIT_FACTORS, DrawingOptions
+from .report import Report, progress_path_from_env, write_progress
 
 logger = logging.getLogger(__name__)
 
 SOURCE_NOTES = {"step": "STEP", "stl_faceted_step": "STL->faceted STEP",
-                "stl_nurbs_step": "STL->NURBS STEP", "stl_mesh": "STL mesh projection"}
+                "stl_nurbs_step": "STL->NURBS STEP", "stl_mesh": "STL mesh projection",
+                "step_tessellated_mesh": "tessellated STEP mesh projection"}
 _SECTION_VIEWS = {"auto": "front", "front": "front", "top": "top", "right": "right"}
 _DEFLECTION_PER_SCALE = 0.05
 _DEFLECTION_RANGE = (1e-3, 5.0)
+
+# depth sign (QA issue 14): B-rep faces facing each side (brep_features.score_depth_sign)
+_DEPTH_FLIP_RATIO = 1.25          # flip when the far side scores more than 1.25 x ...
+_DEPTH_FLIP_MIN_DIFF = 2.0        # ... and at least 2 (about two faces) more
+_DEPTH_SIGN_MAX_FACES = 5000      # above: skipped (7.5 s on the 10665-face RC buggy)
+_DEPTH_MESH_MARGIN = 1.2          # mesh route: mesh_load.choose_depth_sign_mesh margin
+
+# flags the B-rep stage of an STL input produces; forgotten on the mesh fallback
+_BREP_STAGE_FLAGS = ("hlr_poly_used", "section_nudged", "section_open_wires", "section_empty",
+                     "holes_not_detected_mesh_route", "facet_edges_suppressed",
+                     "hidden_lines_dropped", "section_fallback")
 
 
 class _Failure(Exception):
@@ -101,7 +153,31 @@ class _Ctx:
         self.section = None
         self.features: List[Any] = []
         self.extents = None             # oriented model extents (3,)
+        self.bounds = None              # oriented model box (2, 3): lo, hi
+        self.scale_guess: Optional[float] = None
         self.source: Optional[str] = None
+        self.skip_section: Optional[str] = None      # reason, e.g. "not_a_solid"
+        self.skip_overall_dims: Optional[str] = None
+        self.progress_path = progress_path_from_env()
+
+    def progress(self, stage: str, view: Optional[str] = None) -> bool:
+        """Write the progress snapshot (no-op without ``report.PROGRESS_ENV``)."""
+        if not self.progress_path:
+            return False
+        try:
+            # the stage times so far: a killed child's report keeps them (QA issue 17)
+            for k, v in self.timing.items():
+                self.rep.data["timing"][k] = round(float(v), 3)
+            snap = self.rep.progress_snapshot(stage, view)
+            snap["counts"] = {"views": len(self.views),
+                              "section_loops": (len(self.section.loops)
+                                                if self.section is not None else 0),
+                              "dimensions": len(self.rep.data.get("dimensions") or []),
+                              "flags": len(self.rep.data["quality"]["flags"])}
+            return write_progress(self.progress_path, snap)
+        except Exception as exc:                     # progress is best effort
+            logger.debug("progress snapshot failed: %s", exc)
+            return False
 
 
 # ---------------------------------------------------------------- helpers --
@@ -122,12 +198,100 @@ def _orientation(ctx: _Ctx, extents):
     return o
 
 
+def _record_orientation(ctx: _Ctx, o, depth: dict) -> None:
+    d = o.to_dict()
+    d.update(depth)
+    ctx.rep.data["route"]["orientation"] = d
+
+
+def _depth_sign_brep(ctx: _Ctx, shape, o, faces: Optional[int]):
+    """``(orientation, info)``: keep or turn the part 180 deg about Z (QA issue 14).
+
+    ``brep_features.score_depth_sign`` on the FILE shape with the front
+    viewer's direction mapped back (``o.matrix.T @ VIEWS["front"].n``):
+    ``plus`` = faces facing the current front viewer, ``minus`` = the far
+    side. Turned when ``minus > 1.25 * plus`` and ``minus - plus >= 2``.
+    Only for ``orient=auto``.
+    """
+    import numpy as np
+    from .projection import VIEWS, flip_depth
+
+    info = {"depth_flipped": False, "depth_method": "brep_faces", "depth_scores": None,
+            "depth_reason": None}
+    if ctx.options.orient != "auto":
+        info["depth_reason"] = "orient fixed: the file axes are kept"
+        return o, info
+    if faces is not None and faces > _DEPTH_SIGN_MAX_FACES:
+        info["depth_reason"] = f"not scored: {faces} faces > {_DEPTH_SIGN_MAX_FACES}"
+        return o, info
+    try:
+        from .brep_features import score_depth_sign
+        n_file = np.asarray(o.matrix, float).T @ np.asarray(VIEWS["front"].n, float)
+        plus, minus = score_depth_sign(shape, n_file)
+    except Exception as exc:
+        info["depth_reason"] = f"scoring failed: {type(exc).__name__}: {exc}"
+        logger.warning("depth sign scoring failed: %s", exc)
+        return o, info
+    flip = bool(minus > _DEPTH_FLIP_RATIO * plus and minus - plus >= _DEPTH_FLIP_MIN_DIFF)
+    info["depth_scores"] = {"kept": float(plus), "flipped": float(minus)}
+    info["depth_reason"] = (f"faces facing the front viewer: {plus:.4g} on the kept side, "
+                            f"{minus:.4g} on the far side"
+                            + ("; turned 180 deg about Z" if flip else ""))
+    if flip:
+        o = flip_depth(o)
+        info["depth_flipped"] = True
+    return o, info
+
+
+def _depth_sign_mesh(ctx: _Ctx, mesh, o):
+    """``(orientation, info)`` from ``mesh_load.choose_depth_sign_mesh`` (orient auto only)."""
+    import numpy as np
+    from .projection import flip_depth
+
+    info = {"depth_flipped": False, "depth_method": "mesh_feature_edges", "depth_scores": None,
+            "depth_reason": None}
+    if ctx.options.orient != "auto":
+        info["depth_reason"] = "orient fixed: the file axes are kept"
+        return o, info
+    try:
+        from .mesh_load import choose_depth_sign_mesh
+        r = choose_depth_sign_mesh(mesh, o.matrix, margin=_DEPTH_MESH_MARGIN)
+    except Exception as exc:
+        info["depth_reason"] = f"scoring failed: {type(exc).__name__}: {exc}"
+        logger.warning("mesh depth sign scoring failed: %s", exc)
+        return o, info
+    info["depth_scores"] = {"kept": float(r.get("score_kept") or 0.0),
+                            "flipped": float(r.get("score_flipped") or 0.0)}
+    info["depth_reason"] = r.get("reason")
+    if r.get("flip"):
+        o2 = flip_depth(o)
+        if not np.allclose(np.asarray(r.get("matrix"), float), o2.matrix, atol=1e-9):
+            logger.warning("mesh depth flip matrix disagrees with projection.flip_depth")
+        o = o2
+        info["depth_flipped"] = True
+    return o, info
+
+
 def _corners(lo, hi):
     import numpy as np
     lo = np.asarray(lo, float)
     hi = np.asarray(hi, float)
     return np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
                      for z in (lo[2], hi[2])])
+
+
+def _permuted_box(matrix, lo, hi):
+    """``(lo', hi')`` of the box ``[lo, hi]`` under ``world' = matrix @ world``
+    when ``matrix`` is a signed axis permutation (every ``Orientation``), else
+    None. Exact: such a matrix maps an axis-aligned box onto one."""
+    import numpy as np
+    m = np.asarray(matrix, float)
+    if m.shape != (3, 3) or not np.allclose(np.abs(m), np.round(np.abs(m)), atol=1e-12) \
+            or not np.allclose(np.abs(m).sum(axis=0), 1.0) \
+            or not np.allclose(np.abs(m).sum(axis=1), 1.0):
+        return None
+    pts = _corners(lo, hi) @ np.round(m).T
+    return pts.min(axis=0), pts.max(axis=0)
 
 
 def _scale_guess(ctx: _Ctx, lo, hi) -> float:
@@ -161,8 +325,24 @@ def _deflection(scale: float) -> float:
 
 
 def _view_entry(name: str, pv, seconds: float) -> dict:
-    return {"name": name, "algorithm": pv.algorithm, "visible": len(pv.visible),
-            "hidden": len(pv.hidden), "seconds": round(float(seconds), 4)}
+    st = pv.stats or {}
+    e = {"name": name, "algorithm": pv.algorithm, "visible": len(pv.visible),
+         "hidden": len(pv.hidden), "seconds": round(float(seconds), 4)}
+    if st.get("hidden_dropped"):
+        e["hidden_dropped"] = st.get("hidden_dropped_reason") or True
+    return e
+
+
+def _view_flags(ctx: _Ctx, name: str, pv) -> None:
+    """Report flags a projected view asks for (QA issues 3 and 13)."""
+    st = pv.stats or {}
+    if st.get("hidden_dropped"):
+        ctx.rep.flag("hidden_lines_dropped", "warning",
+                     f"view {name}: hidden lines omitted ({st.get('hidden_dropped_reason')})")
+    if st.get("interior_silhouettes_omitted"):
+        ctx.rep.flag("interior_silhouettes_omitted", "info",
+                     "organic mesh too large for silhouette candidates: interior and hidden "
+                     "silhouettes (through holes, overlapping lobes) are not drawn")
 
 
 def _section_spec(normal):
@@ -175,15 +355,23 @@ def _section_spec(normal):
     raise ValueError(f"section normal {n.tolist()} is not a principal view direction")
 
 
-def _section_report(ctx: _Ctx, sec) -> None:
+def _section_report(ctx: _Ctx, sec, info: Optional[dict] = None) -> None:
     st = sec.stats or {}
-    ctx.rep.data["section"] = {
-        "label": sec.label, "view": sec.spec.name, "marker_view": sec.marker_view,
-        "plane_point": [float(v) for v in sec.plane_point],
-        "plane_normal": [float(v) for v in sec.plane_normal],
-        "loops": len(sec.loops), "open_wires_dropped": int(st.get("open_wires_dropped", 0) or 0),
-        "hatch_segments": 0, "nudged": bool(st.get("nudged", False)),
-        "seconds": st.get("seconds")}
+    info = info or {}
+    d = {"label": sec.label, "view": sec.spec.name, "marker_view": sec.marker_view,
+         "plane_point": [float(v) for v in sec.plane_point],
+         "plane_normal": [float(v) for v in sec.plane_normal],
+         "loops": len(sec.loops), "open_wires_dropped": int(st.get("open_wires_dropped", 0) or 0),
+         "hatch_segments": 0, "nudged": bool(st.get("nudged", False)),
+         "seconds": st.get("seconds"), "reason": info.get("reason"),
+         "hole_kind": info.get("hole_kind"),
+         "retried_at_body": bool(st.get("retried_at_body", False))}
+    for key in ("kept_length_ratio", "kept_area_ratio", "bridged_gaps", "bridge_max_gap",
+                "bridge_rejected", "excess_bodies", "half_space_excess_mm",
+                "half_space_excess_tol_mm"):
+        if key in st:
+            d[key] = st.get(key)
+    ctx.rep.data["section"] = d
     if st.get("nudged"):
         ctx.rep.flag("section_nudged", "info", "the plane gave no closed loop (or lay in a "
                      "planar face) and was moved by 1 % of the depth")
@@ -193,29 +381,37 @@ def _section_report(ctx: _Ctx, sec) -> None:
     if not sec.loops:
         ctx.rep.flag("section_empty", "warning", "the section plane cuts no closed loop; "
                      "no section view drawn")
+    if int(st.get("excess_bodies", 0) or 0) > 0:
+        # report.FLAGS has no code for an inexact half-space cut yet: a warning text
+        ctx.rep.warn(f"section cut inexact: {st.get('excess_bodies')} kept body(ies) reach "
+                     f"{st.get('half_space_excess_mm')} mm past the plane (tolerance "
+                     f"{st.get('half_space_excess_tol_mm')} mm)")
 
 
 # ------------------------------------------------------------ B-rep stage --
 
 def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
-                strict: bool) -> None:
+                strict: bool, solids: Optional[int] = None) -> None:
     """Features, views and section of an oriented OCCT shape.
 
     ``strict`` (STL inputs): any failure raises ``_BrepStageError`` so the
     caller falls back to the mesh route. Otherwise a failed view is skipped
-    and flagged and a failed section is flagged.
+    and flagged and a failed section is flagged. ``solids``: the census
+    solid count (an auto section is skipped for a model without solid).
     """
     import numpy as np
     from . import brep_views
     from .brep_features import cylinder_features
-    from .brep_sections import choose_section_plane_brep, section_brep
+    from .brep_sections import choose_section_plane_brep_info, section_brep
     from .projection import VIEWS
 
     opts = ctx.options
     lo = np.asarray(lo, float)
     hi = np.asarray(hi, float)
     ctx.extents = hi - lo
+    ctx.bounds = np.array([lo, hi])
     scale = _scale_guess(ctx, lo, hi)
+    ctx.scale_guess = scale
     defl = _deflection(scale)
     faces = None
     try:
@@ -243,19 +439,26 @@ def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
         ctx.rep.data["geometry"]["features"] = {"holes": kinds.count("hole"),
                                                 "bosses": kinds.count("boss"),
                                                 "fillets": kinds.count("fillet")}
+        if kinds.count("filled_hole"):
+            ctx.rep.data["geometry"]["features"]["filled_holes"] = kinds.count("filled_hole")
     else:
         # detection skipped (faceted body): "unknown", not "none" - same as the mesh route
         ctx.features = []
         ctx.rep.data["geometry"]["features"] = {"holes": None, "bosses": None, "fillets": None}
 
     t0 = time.perf_counter()
+    views_base = ctx.timing["views_s"]
     for name in opts.views:
         spec = VIEWS[name]
+        ctx.timing["views_s"] = views_base + (time.perf_counter() - t0)   # live for progress
+        ctx.progress("views", view=name)
         tv = time.perf_counter()
         try:
             pv = brep_views.project_brep(shape, spec, exact=exact, deflection=defl,
                                          hidden=bool(opts.hidden_lines and name != "iso"),
-                                         time_budget_s=opts.hlr_time_budget_s)
+                                         time_budget_s=opts.hlr_time_budget_s,
+                                         paper_scale=scale,
+                                         max_hidden_primitives=opts.max_hidden_primitives)
         except TimeoutError as exc:
             if strict:
                 raise _BrepStageError(f"view {name}: {exc}") from exc
@@ -272,25 +475,44 @@ def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
             ctx.rep.flag("view_failed", "warning", f"view {name}: HLR returned no edges")
             continue
         ctx.views[name] = pv
+        _view_flags(ctx, name, pv)
         ctx.rep.data["views"].append(_view_entry(name, pv, time.perf_counter() - tv))
-    ctx.timing["views_s"] += time.perf_counter() - t0
+    ctx.timing["views_s"] = views_base + (time.perf_counter() - t0)
     if not ctx.views:
         raise (_BrepStageError if strict else _Failure)("no view could be drawn")
 
     if opts.section == "off":
         return
+    ctx.progress("section")
     t1 = time.perf_counter()
     try:
-        model = types.SimpleNamespace(census={"bbox_min": lo.tolist(), "bbox_max": hi.tolist()},
-                                      shape=shape)
-        point, normal, marker = choose_section_plane_brep(model, ctx.features, opts.section)
-        spec = _section_spec(normal)
-        depth = float(abs(np.dot(hi - lo, np.asarray(normal, float))))
-        sec = section_brep(shape, point, normal, spec, exact=exact, deflection=defl,
-                           depth_extent=depth, hidden=False)
-        sec.marker_view = marker
-        _section_report(ctx, sec)
-        ctx.section = sec if sec.loops else None
+        census = {"bbox_min": lo.tolist(), "bbox_max": hi.tolist()}
+        if solids is not None:
+            census["solids"] = int(solids)
+        model = types.SimpleNamespace(census=census, shape=shape)
+        point, normal, marker, info = choose_section_plane_brep_info(model, ctx.features,
+                                                                     opts.section)
+        if opts.section == "auto" and info.get("skip_hint") == "no_solid":
+            ctx.rep.flag("section_fallback", "info", "no solid: an open surface model has no "
+                         "closed section; no section view drawn")
+            ctx.rep.data["section"] = None
+            ctx.section = None
+        else:
+            spec = _section_spec(normal)
+            depth = float(abs(np.dot(hi - lo, np.asarray(normal, float))))
+            sec = section_brep(shape, point, normal, spec, exact=exact, deflection=defl,
+                               depth_extent=depth, hidden=False)
+            sec.marker_view = marker
+            _section_report(ctx, sec, info)
+            if info.get("reason") == "bbox_centre_fallback":
+                ctx.rep.flag("section_fallback", "info",
+                             "no hole axis fits the section mode: the plane goes through the "
+                             "bbox centre")
+            elif info.get("reason") == "thin_part":
+                ctx.rep.flag("section_fallback", "info",
+                             "no hole axis fits the section mode and the part is thin: the top "
+                             "plane goes through the bbox centre")
+            ctx.section = sec if sec.loops else None
     except Exception as exc:
         if strict:
             raise _BrepStageError(f"section: {type(exc).__name__}: {exc}") from exc
@@ -310,6 +532,9 @@ def _mesh_stage(ctx: _Ctx, mesh, organic: bool) -> None:
     opts = ctx.options
     bounds = np.asarray(mesh.bounds, float)
     ctx.extents = bounds[1] - bounds[0]
+    ctx.bounds = bounds.copy()
+    scale = _scale_guess(ctx, bounds[0], bounds[1])
+    ctx.scale_guess = scale
     ctx.features = []
     ctx.views = {}
     ctx.section = None
@@ -318,14 +543,19 @@ def _mesh_stage(ctx: _Ctx, mesh, organic: bool) -> None:
     ctx.rep.data["geometry"]["features"] = {"holes": None, "bosses": None, "fillets": None}
     ctx.rep.flag("holes_not_detected_mesh_route", "info",
                  "the mesh route has no hole features: no diameter callouts")
-    ctx.say(f"mesh views: depth buffer {opts.raster_px} px, organic={organic}")
+    ctx.say(f"mesh views: depth buffer {opts.raster_px} px, organic={organic}, "
+            f"scale guess {scale:g}")
     t0 = time.perf_counter()
+    views_base = ctx.timing["views_s"]
     for name in opts.views:
+        ctx.timing["views_s"] = views_base + (time.perf_counter() - t0)   # live for progress
+        ctx.progress("views", view=name)
         tv = time.perf_counter()
         try:
             pv = project_mesh(mesh, VIEWS[name], raster_px=opts.raster_px,
                               feature_angle_deg=opts.feature_angle_deg, organic=organic,
-                              hidden=bool(opts.hidden_lines and name != "iso"))
+                              hidden=bool(opts.hidden_lines and name != "iso"),
+                              paper_scale=scale, time_budget_s=opts.hlr_time_budget_s)
         except Exception as exc:
             ctx.rep.flag("view_failed", "warning", f"view {name}: {type(exc).__name__}: {exc}")
             continue
@@ -333,13 +563,18 @@ def _mesh_stage(ctx: _Ctx, mesh, organic: bool) -> None:
             ctx.rep.flag("view_failed", "warning", f"view {name}: nothing projected")
             continue
         ctx.views[name] = pv
+        _view_flags(ctx, name, pv)
         ctx.rep.data["views"].append(_view_entry(name, pv, time.perf_counter() - tv))
-    ctx.timing["views_s"] += time.perf_counter() - t0
+    ctx.timing["views_s"] = views_base + (time.perf_counter() - t0)
     if not ctx.views:
         raise _Failure("no view could be drawn from the mesh")
 
     if opts.section == "off":
         return
+    if ctx.skip_section:
+        logger.info("section skipped: %s", ctx.skip_section)
+        return
+    ctx.progress("section")
     t1 = time.perf_counter()
     try:
         point, normal, marker = choose_section_plane_mesh(mesh, opts.section)
@@ -349,7 +584,7 @@ def _mesh_stage(ctx: _Ctx, mesh, organic: bool) -> None:
                            feature_angle_deg=opts.feature_angle_deg, organic=organic,
                            depth_extent=depth)
         sec.marker_view = marker
-        _section_report(ctx, sec)
+        _section_report(ctx, sec, {"reason": "bbox_centre"})
         ctx.section = sec if sec.loops else None
     except Exception as exc:
         ctx.rep.flag("section_failed", "warning", f"{type(exc).__name__}: {exc}")
@@ -359,26 +594,70 @@ def _mesh_stage(ctx: _Ctx, mesh, organic: bool) -> None:
 
 # ----------------------------------------------------------------- inputs --
 
+def _unit_check(ctx: _Ctx, extents_mm, declared: Optional[str]) -> None:
+    """``unit_plausibility`` on the extents in mm; ``unit_suspect`` when implausible."""
+    try:
+        from .mesh_load import unit_plausibility
+        verdict, detail, alt = unit_plausibility(list(map(float, extents_mm)),
+                                                 declared_unit=declared)
+    except Exception as exc:
+        logger.debug("unit plausibility failed: %s", exc)
+        return
+    ctx.rep.data["input"]["unit_plausibility"] = {"verdict": verdict, "detail": detail,
+                                                  "alternative": alt}
+    if verdict == "suspicious":
+        ctx.rep.flag("unit_suspect", "warning", detail)
+
+
 def _run_step(ctx: _Ctx) -> None:
     import numpy as np
-    from .brep_load import exact_bbox, load_step, transform_shape
+    from .brep_load import TessellatedOnlyError, load_step, transform_shape, exact_bbox
 
     t0 = time.perf_counter()
     try:
+        # the OCP-free text sniff first, so a child killed during the load still
+        # reports a unit (progress file, QA issue 17); load_step replaces it
+        from .brep_load import step_unit_sniff
+        ctx.rep.data["input"]["source_unit"] = step_unit_sniff(ctx.input_path)
+    except Exception as exc:
+        logger.debug("unit sniff failed: %s", exc)
+    ctx.progress("load")
+    try:
         model = load_step(ctx.input_path)
+    except TessellatedOnlyError as exc:
+        ctx.timing["load_s"] += time.perf_counter() - t0
+        _run_step_tessellated(ctx, exc)
+        return
     except ValueError as exc:
         raise _Failure(str(exc)) from exc
     rep, c = ctx.rep, model.census
     rep.data["input"]["source_unit"] = model.source_unit
+    rep.data["input"]["unit_factor"] = model.source_unit_factor
     rep.data["route"].update(pipeline="brep", source="step")
     ctx.source = "step"
     g = rep.data["geometry"]
     for key in ("bbox_min", "bbox_max", "volume_mm3", "area_mm2", "solids", "shells", "faces",
-                "edges", "face_types", "brepcheck_valid", "free_edges", "closed"):
+                "edges", "face_types", "brepcheck_valid", "free_edges", "closed",
+                "loose_faces", "volume_scope"):
         g[key] = c.get(key)
+    bodies = dict(model.bodies or {})
+    if bodies:
+        g["bodies"] = bodies
     for w in model.warnings:
         rep.warn(w)
-    if model.roots > 1 or (c.get("solids") or 0) > 1:
+    dropped = bodies.get("dropped") or {}
+    n_edges, n_verts = int(dropped.get("loose_edges", 0)), int(dropped.get("loose_vertices", 0))
+    if n_edges or n_verts:
+        rep.flag("loose_curves_ignored", "info",
+                 f"{n_edges} loose edge(s), {n_verts} loose vertex(es) (curve sets, sketch or "
+                 f"PMI geometry) not drawn and not part of the bbox")
+    supp = {k: int(dropped.get(k, 0)) for k in ("free_shells", "free_faces", "tessellated_bodies")
+            if dropped.get(k)}
+    if supp:
+        rep.flag("supplemental_shells_ignored", "info",
+                 ", ".join(f"{n} {k.replace('_', ' ')}" for k, n in supp.items())
+                 + f" next to the {bodies.get('drawn') or 'drawn bodies'} not drawn")
+    if (c.get("solids") or 0) > 1:
         rep.flag("multiple_bodies", "warning",
                  f"{model.roots} root(s), {c.get('solids')} solid(s); drawn as one part")
     if c.get("brepcheck_valid") is False:
@@ -395,32 +674,148 @@ def _run_step(ctx: _Ctx) -> None:
         raise _Failure("the shape has no bounding box")
     lo, hi = np.asarray(c["bbox_min"], float), np.asarray(c["bbox_max"], float)
     g["extents"] = (hi - lo).tolist()
+    _unit_check(ctx, hi - lo, model.source_unit)
 
     o = _orientation(ctx, hi - lo)
     shape = model.shape
+    o, depth = _depth_sign_brep(ctx, shape, o, c.get("faces"))
+    _record_orientation(ctx, o, depth)
     if not _is_identity(o.matrix):
         try:
             shape = transform_shape(shape, o.matrix)
         except ValueError as exc:
             raise _Failure(f"orientation failed: {exc}") from exc
-        bb = exact_bbox(shape)
-        if bb is None:
-            raise _Failure("the oriented shape has no bounding box")
-        lo, hi = bb[0], bb[1]
+        mapped = _permuted_box(o.matrix, lo, hi)
+        if mapped is not None:
+            # a signed axis permutation maps the exact file box onto the exact
+            # oriented box: no second AddOptimal (29 s on the 10665-face RC buggy)
+            lo, hi = mapped
+        else:
+            bb = exact_bbox(shape)
+            if bb is None:
+                raise _Failure("the oriented shape has no bounding box")
+            lo, hi = bb[0], bb[1]
     g["drawing_bbox_min"], g["drawing_bbox_max"] = list(map(float, lo)), list(map(float, hi))
     ctx.timing["load_s"] += time.perf_counter() - t0
-    ctx.say(f"STEP loaded: {c.get('faces')} faces, unit {model.source_unit}")
-    _brep_stage(ctx, shape, lo, hi, exact_ok=True, features_on=True, strict=False)
+    ctx.say(f"STEP loaded: {c.get('faces')} faces, unit {model.source_unit}"
+            + (", depth turned 180 deg" if depth.get("depth_flipped") else ""))
+    ctx.progress("loaded")
+    _brep_stage(ctx, shape, lo, hi, exact_ok=True, features_on=True, strict=False,
+                solids=c.get("solids"))
+
+
+def _run_step_tessellated(ctx: _Ctx, exc) -> None:
+    """A tessellated-only STEP (QA issue 16): draw its triangles on the mesh route."""
+    import numpy as np
+    from .mesh_load import classify, mesh_census, transform_mesh
+
+    rep, opts = ctx.rep, ctx.options
+    rep.data["input"]["source_unit"] = getattr(exc, "source_unit", None)
+    rep.data["input"]["unit_factor"] = getattr(exc, "source_unit_factor", None)
+    mesh = getattr(exc, "mesh", None)
+    if mesh is None or len(getattr(mesh, "faces", [])) == 0:
+        raise _Failure(f"{exc}; no triangles could be extracted")
+    t0 = time.perf_counter()
+    rep.flag("step_tessellated_only", "warning",
+             f"{getattr(exc, 'faces', 0)} tessellated face(s), {getattr(exc, 'triangles', 0)} "
+             f"triangle(s) without B-rep surfaces: drawn from the triangles (mesh route)")
+    rep.fallback("brep", "mesh", "tessellated-only STEP (no B-rep surfaces)")
+    if getattr(exc, "source_unit", "mm") not in ("mm", None):
+        rep.flag("unit_not_mm", "warning", f"source length unit {exc.source_unit}; OCCT "
+                 f"converted the geometry to mm on read")
+    census = mesh_census(mesh)
+    cls = classify(mesh, opts.classifier_threshold, census=census)
+    rep.data["route"]["classifier"] = dict(cls)
+    _mesh_geometry(ctx, census)
+    organic, not_solid = _mesh_flags(ctx, census, cls)
+    _unit_check(ctx, census.get("extents") or [0, 0, 0], getattr(exc, "source_unit", None))
+    bounds = np.asarray(mesh.bounds, float)
+    o = _orientation(ctx, bounds[1] - bounds[0])
+    o, depth = _depth_sign_mesh(ctx, mesh, o)
+    _record_orientation(ctx, o, depth)
+    mesh_o = mesh if _is_identity(o.matrix) else transform_mesh(mesh, o.matrix)
+    ob = np.asarray(mesh_o.bounds, float)
+    rep.data["geometry"]["drawing_bbox_min"] = ob[0].tolist()
+    rep.data["geometry"]["drawing_bbox_max"] = ob[1].tolist()
+    rep.data["route"].update(pipeline="mesh", source="step_tessellated_mesh")
+    ctx.source = "step_tessellated_mesh"
+    ctx.timing["load_s"] += time.perf_counter() - t0
+    ctx.progress("loaded")
+    _mesh_stage(ctx, mesh_o, organic)
 
 
 def _mesh_geometry(ctx: _Ctx, census: dict) -> None:
     g = ctx.rep.data["geometry"]
     for key in ("bbox_min", "bbox_max", "extents", "volume_mm3", "area_mm2", "triangles",
-                "watertight", "components"):
+                "watertight", "components", "volume_approximate", "volume_source"):
         g[key] = census.get(key)
+    if census.get("boundary_edges") is not None:
+        g["closed"] = int(census.get("boundary_edges") or 0) == 0
 
 
-def _faceted(ctx: _Ctx, mesh_file, mesh_o) -> Tuple[Any, Any, Any]:
+def _mesh_flags(ctx: _Ctx, census: dict, cls: dict) -> Tuple[bool, bool]:
+    """Census / classifier flags of a mesh; returns ``(organic, not_solid)``.
+
+    ``organic`` is True for ``organic`` AND ``not_solid`` verdicts (the mesh
+    route without conversion); ``not_solid`` also skips the section and the
+    overall dimensions and caps the level at minimal (flag ``not_a_solid``).
+    """
+    from .mesh_load import watertight_detail
+    rep = ctx.rep
+    if not census.get("watertight"):
+        rep.flag("mesh_not_watertight", "warning", watertight_detail(census))
+    if int(census.get("nonmanifold_edges") or 0) > 0:
+        rep.flag("mesh_non_manifold", "warning",
+                 f"{census.get('nonmanifold_edges')} non-manifold edge(s) (more than two "
+                 f"faces on one edge)")
+    if census.get("inverted"):
+        conflicts = int(census.get("winding_conflicts") or 0)
+        if conflicts == 0:
+            rep.flag("inverted_solid", "warning", "the mesh is inside out (negative signed "
+                     f"volume); |volume| {census.get('volume_mm3')} mm3 reported")
+        else:
+            # the "inverted" verdict of a badly wound mesh only says its dominant
+            # piece is wound inward: the defect is the inconsistent winding, not an
+            # inside-out solid (QA corpus 21); report.FLAGS has no winding code
+            def g(v):
+                return "n/a" if v is None else f"{float(v):.6g}"
+            rep.warn(f"face winding is inconsistent ({conflicts} edge(s) whose two faces run it "
+                     f"in the same direction): the volume {g(census.get('volume_mm3'))} mm3 "
+                     f"comes from a winding-repaired copy (raw |signed sum| "
+                     f"{g(census.get('volume_raw_mm3'))} mm3)")
+    comps = int(census.get("components") or 0)
+    if comps > 1:
+        rep.flag("multiple_bodies", "warning", f"{comps} mesh components (bodies of the vertex "
+                 f"graph); drawn as one part")
+    verdict = cls.get("verdict")
+    not_solid = verdict == "not_solid"
+    organic = verdict in ("organic", "not_solid")
+    if verdict == "organic":
+        rep.flag("organic_classified", "info",
+                 f"planar_big {cls.get('planar_big', 0.0):.3f} < threshold {cls.get('threshold')}")
+    if not_solid:
+        reason = cls.get("not_solid_reason") or "no closed component"
+        rep.flag("not_a_solid", "warning", f"{reason}: no section, no overall dimensions")
+        ctx.skip_section = "not_a_solid"
+        ctx.skip_overall_dims = "not_a_solid"
+    return organic, not_solid
+
+
+def _scaled_census(census: dict, f: float) -> dict:
+    """The census of a mesh scaled by ``f`` (lengths f, areas f^2, volumes f^3)."""
+    c = dict(census)
+    for key in ("bbox_min", "bbox_max", "extents"):
+        if c.get(key) is not None:
+            c[key] = [float(v) * f for v in c[key]]
+    if c.get("area_mm2") is not None:
+        c["area_mm2"] = float(c["area_mm2"]) * f * f
+    for key in ("volume_mm3", "volume_raw_mm3"):
+        if c.get(key) is not None:
+            c[key] = float(c[key]) * f ** 3
+    return c
+
+
+def _faceted(ctx: _Ctx, mesh_file, mesh_o, census: Optional[dict] = None) -> Tuple[Any, Any, Any]:
     """Write the faceted STEP (file coordinates) and build the drawn body (oriented)."""
     import numpy as np
     from src.io.faceted_step import export_step_faceted
@@ -448,6 +843,8 @@ def _faceted(ctx: _Ctx, mesh_file, mesh_o) -> Tuple[Any, Any, Any]:
     g = ctx.rep.data["geometry"]
     g["faces"], g["solids"], g["shells"] = report.get("faces"), report.get("solids"), report.get("shells")
     g["brepcheck_valid"] = report.get("brepcheck_valid")
+    if report.get("faces") is not None:
+        g["face_types"] = {"Plane": int(report.get("faces") or 0)}
     if report.get("skipped_degenerate"):
         ctx.rep.flag("degenerate_faces_removed", "info",
                      f"{report['skipped_degenerate']} degenerate triangle(s) skipped")
@@ -456,7 +853,19 @@ def _faceted(ctx: _Ctx, mesh_file, mesh_o) -> Tuple[Any, Any, Any]:
         logger.info("faceted body: %s", msg)
 
     shape = faceted_shape_from_mesh(mesh_o, math.radians(ctx.options.facet_smooth_angle_deg), warn)
-    _audit_drawn_body(ctx, shape, mesh_o)
+    _audit_drawn_body(ctx, shape, mesh_o, census)
+    drawn = st["audit"].get("drawn_body") or {}
+    if (drawn.get("solids") or 0) > 1 and not ctx.rep.has_flag("multiple_bodies"):
+        ctx.rep.flag("multiple_bodies", "warning",
+                     f"faceted body: {drawn.get('solids')} solids; drawn as one part")
+    if "error" not in drawn:
+        if drawn.get("free_edges") is not None:
+            g["free_edges"] = int(drawn["free_edges"])
+            g["closed"] = bool(drawn["free_edges"] == 0 and (drawn.get("solids") or 0) >= 1)
+        if drawn.get("brep_volume_mm3") is not None:
+            # the single authoritative volume of this route: the drawn B-rep
+            g["volume_mm3"] = abs(float(drawn["brep_volume_mm3"]))
+            g["volume_source"] = "faceted_brep"
     bounds = np.asarray(mesh_o.bounds, float)
     ctx.rep.flag("facet_edges_suppressed", "info",
                  f"facet edges below {ctx.options.facet_smooth_angle_deg:g} deg coded smooth "
@@ -467,16 +876,20 @@ def _faceted(ctx: _Ctx, mesh_file, mesh_o) -> Tuple[Any, Any, Any]:
 _AUDIT_VOLUME_TOL_PCT = 1e-3     # the faceted body reproduces the mesh volume to round-off
 
 
-def _audit_drawn_body(ctx: _Ctx, shape, mesh) -> None:
+def _audit_drawn_body(ctx: _Ctx, shape, mesh, census: Optional[dict] = None) -> None:
     """Independent check of the faceted body that is drawn (spec 3.2 in-process audit).
 
     ``export_step_faceted(verify=False)`` reports on itself only; this runs
     ``src.io.step_audit.measure_shape`` on the OCCT body handed to the HLR
-    and compares its volume with the mesh volume. Measured cost: 0.45 s for
-    the 1544-face plate, 6.9 s for a 20480-face icosphere (BRepCheck
-    dominates). A failed measurement is logged and leaves ``None`` values;
-    a body that disagrees with a watertight mesh is flagged
-    ``faceted_audit_mismatch`` (warning). Never raises.
+    and compares its volume with the WINDING-REPAIRED mesh volume
+    (``census["volume_mm3"]`` = ``mesh_load.mesh_volume_repaired``; the raw
+    signed sum of a badly wound multi-body mesh is meaningless, QA issue
+    12). Measured cost: 0.45 s for the 1544-face plate, 6.9 s for a
+    20480-face icosphere (BRepCheck dominates). A failed measurement is
+    logged and leaves ``None`` values; a body that disagrees with a closed
+    mesh is flagged ``faceted_audit_mismatch`` (warning): the topology
+    criteria need a watertight mesh, the volume criterion a reference
+    volume that is not approximate. Never raises.
     """
     st = ctx.rep.data["route"]["stl_to_step"]
     t0 = time.perf_counter()
@@ -489,30 +902,39 @@ def _audit_drawn_body(ctx: _Ctx, shape, mesh) -> None:
         return
     audit = {k: m.get(k) for k in ("readable", "faces", "solids", "shells", "free_edges",
                                    "brepcheck_valid", "brep_volume_mm3")}
-    watertight = bool(getattr(mesh, "is_watertight", False))
-    # magnitudes: the body is built outward-oriented even from an inside-out mesh
-    mesh_vol = abs(float(mesh.volume)) if watertight else None
+    if census is None:
+        try:
+            from .mesh_load import mesh_census
+            census = mesh_census(mesh)
+        except Exception as exc:
+            logger.warning("mesh census for the audit failed: %s", exc)
+            census = {}
+    watertight = bool(census.get("watertight", getattr(mesh, "is_watertight", False)))
+    ref = census.get("volume_mm3")
+    mesh_vol = abs(float(ref)) if ref is not None else None
+    approximate = bool(census.get("volume_approximate"))
     audit["mesh_volume_mm3"] = mesh_vol
+    audit["mesh_volume_source"] = census.get("volume_source")
     vol = m.get("brep_volume_mm3")
     audit["volume_delta_pct"] = (100.0 * (abs(vol) - mesh_vol) / mesh_vol
                                  if vol is not None and mesh_vol else None)
     audit["seconds"] = round(time.perf_counter() - t0, 3)
     st["audit"]["drawn_body"] = audit
-    if not watertight:
-        return                                       # open mesh: already flagged, no reference
     problems = []
-    if not (audit["solids"] or 0) >= 1:
-        problems.append(f"{audit['solids']} solid(s)")
-    if audit["free_edges"] is None or audit["free_edges"] != 0:
-        problems.append(f"free edges {audit['free_edges']}")
-    if not audit["brepcheck_valid"]:
-        problems.append("BRepCheck invalid")
-    d = audit["volume_delta_pct"]
-    if d is None or not abs(d) <= _AUDIT_VOLUME_TOL_PCT:
-        problems.append(f"volume delta {d} %")
+    if watertight:
+        if not (audit["solids"] or 0) >= 1:
+            problems.append(f"{audit['solids']} solid(s)")
+        if audit["free_edges"] is None or audit["free_edges"] != 0:
+            problems.append(f"free edges {audit['free_edges']}")
+        if not audit["brepcheck_valid"]:
+            problems.append("BRepCheck invalid")
+    if mesh_vol is not None and not approximate:
+        d = audit["volume_delta_pct"]
+        if d is None or not abs(d) <= _AUDIT_VOLUME_TOL_PCT:
+            problems.append(f"volume delta {d} %")
     if problems:
         ctx.rep.flag("faceted_audit_mismatch", "warning",
-                     "drawn faceted body vs watertight mesh: " + "; ".join(problems))
+                     "drawn faceted body vs closed mesh: " + "; ".join(problems))
 
 
 def _nurbs(ctx: _Ctx, mesh_file, o) -> Tuple[Any, Any, Any]:
@@ -567,25 +989,41 @@ def _run_stl(ctx: _Ctx) -> None:
 
     opts, rep = ctx.options, ctx.rep
     t0 = time.perf_counter()
+    ctx.progress("load")
     try:
         mm = load_mesh_model(ctx.input_path, opts.classifier_threshold)
     except ValueError as exc:
         raise _Failure(str(exc)) from exc
     census, cls = mm.census, mm.classifier
-    rep.data["input"]["source_unit"] = "unknown"     # STL carries no unit; read as mm
+    # STL carries no unit: the given stl_unit (mesh scaled to mm) or assumed mm
+    if opts.stl_unit:
+        factor = float(STL_UNIT_FACTORS[opts.stl_unit])
+        rep.data["input"]["source_unit"] = opts.stl_unit
+        if factor != 1.0:
+            mm.mesh.apply_scale(factor)
+            census = _scaled_census(census, factor)
+            mm.census = census
+    else:
+        factor = 1.0
+        rep.data["input"]["source_unit"] = "assumed_mm"
+    rep.data["input"]["unit_factor"] = factor
+    rep.data["input"]["stl_unit"] = opts.stl_unit
     rep.data["route"]["classifier"] = dict(cls)
     _mesh_geometry(ctx, census)
+    conflicts = int(census.get("winding_conflicts") or 0)
     for w in mm.warnings:
+        if conflicts and w.startswith("mesh is inside out"):
+            continue                 # inconsistent winding, worded by _mesh_flags instead
         rep.warn(w)
-    if not census.get("watertight"):
-        rep.flag("mesh_not_watertight", "warning",
-                 f"{census.get('boundary_edges')} boundary edge(s)")
-    organic = cls.get("verdict") == "organic"
-    if organic:
-        rep.flag("organic_classified", "info",
-                 f"planar_big {cls.get('planar_big', 0.0):.3f} < threshold {cls.get('threshold')}")
+    if not opts.stl_unit:
+        rep.flag("unit_assumed_mm", "info", "STL carries no unit: read as mm (--stl-unit "
+                 "sets it)")
+    _unit_check(ctx, census.get("extents") or [0.0, 0.0, 0.0], opts.stl_unit)
+    organic, not_solid = _mesh_flags(ctx, census, cls)
     bounds = np.asarray(mm.mesh.bounds, float)
     o = _orientation(ctx, bounds[1] - bounds[0])
+    o, depth = _depth_sign_mesh(ctx, mm.mesh, o)
+    _record_orientation(ctx, o, depth)
     mesh_o = mm.mesh if _is_identity(o.matrix) else transform_mesh(mm.mesh, o.matrix)
     ob = np.asarray(mesh_o.bounds, float)
     rep.data["geometry"]["drawing_bbox_min"] = ob[0].tolist()
@@ -595,7 +1033,9 @@ def _run_stl(ctx: _Ctx) -> None:
     mode = opts.stl_to_step
     tri = int(census.get("triangles") or 0)
     convert = None
-    if mode == "off":
+    if not_solid:
+        st["skipped_reason"] = "not_solid"            # no conversion of a triangle soup
+    elif mode == "off":
         st["skipped_reason"] = "off"
     elif mode == "auto":
         if organic:
@@ -609,12 +1049,13 @@ def _run_stl(ctx: _Ctx) -> None:
     else:
         convert = mode                               # "faceted" | "nurbs" (forced)
     ctx.timing["load_s"] += time.perf_counter() - t0
+    ctx.progress("loaded")
 
     if convert is not None:
         t1 = time.perf_counter()
         try:
             if convert == "faceted":
-                shape, lo, hi = _faceted(ctx, mm.mesh, mesh_o)
+                shape, lo, hi = _faceted(ctx, mm.mesh, mesh_o, census)
                 source, exact, features_on = "stl_faceted_step", False, False
             else:
                 shape, lo, hi = _nurbs(ctx, mm.mesh, o)
@@ -640,10 +1081,7 @@ def _run_stl(ctx: _Ctx) -> None:
             # forget everything the B-rep stage produced
             ctx.views, ctx.section, ctx.features = {}, None, []
             ctx.rep.data["quality"]["flags"] = [
-                f for f in ctx.rep.data["quality"]["flags"]
-                if f["code"] not in ("hlr_poly_used", "section_nudged", "section_open_wires",
-                                     "section_empty", "holes_not_detected_mesh_route",
-                                     "facet_edges_suppressed")]
+                f for f in ctx.rep.data["quality"]["flags"] if f["code"] not in _BREP_STAGE_FLAGS]
             ctx.timing["load_s"] += time.perf_counter() - t1
 
     rep.data["route"].update(pipeline="mesh", source="stl_mesh")
@@ -660,15 +1098,23 @@ def _sheet_and_write(ctx: _Ctx) -> None:
 
     opts, rep = ctx.options, ctx.rep
     t0 = time.perf_counter()
-    try:
-        plan = dimensions.plan_dimensions(ctx.views, ctx.features, opts, DEFAULT_STYLE,
-                                          ctx.extents)
-    except Exception as exc:          # spec 3.10: the views exist, so the sheet is still written
-        logger.exception("dimension planning failed")
-        reason = f"{type(exc).__name__}: {exc}"
-        rep.warn(f"dimension planning failed: {reason}")
-        rep.flag("dimensions_failed", "warning", f"drawing written without dimensions: {reason}")
-        plan = dimensions.DimensionPlan(dims=[], undimensioned=[])
+    ctx.progress("dimensions")
+    if ctx.skip_overall_dims:
+        # not a solid (triangle soup): no overall dimensions (the mesh route has no others)
+        plan = dimensions.DimensionPlan(dims=[], undimensioned=[
+            {"kind": "overall", "reason": ctx.skip_overall_dims, "view": None}])
+    else:
+        try:
+            plan = dimensions.plan_dimensions(ctx.views, ctx.features, opts, DEFAULT_STYLE,
+                                              ctx.extents, model_bounds=ctx.bounds,
+                                              scale_hint=ctx.scale_guess)
+        except Exception as exc:      # spec 3.10: the views exist, so the sheet is still written
+            logger.exception("dimension planning failed")
+            reason = f"{type(exc).__name__}: {exc}"
+            rep.warn(f"dimension planning failed: {reason}")
+            rep.flag("dimensions_failed", "warning",
+                     f"drawing written without dimensions: {reason}")
+            plan = dimensions.DimensionPlan(dims=[], undimensioned=[])
     rep.data["dimensions"] = [{"kind": d.kind, "view": d.view, "value_mm": float(d.value),
                                "text": d.text, "count": int(d.count)} for d in plan.dims]
     rep.data["undimensioned"] = [dict(u) for u in plan.undimensioned]
@@ -677,28 +1123,36 @@ def _sheet_and_write(ctx: _Ctx) -> None:
         rep.flag("dimensions_capped", "warning",
                  f"{len(capped)} hole group(s) above max_hole_callouts {opts.max_hole_callouts}")
 
+    ctx.progress("layout")
     meta = {"ident": ctx.stem, "title": opts.title or ctx.stem,
             "input_file": os.path.basename(ctx.input_path),
             "source_note": SOURCE_NOTES.get(ctx.source or "", ""),
             "supplementary_title": SOURCE_NOTES.get(ctx.source or "", "")}
     lay = compose(ctx.views, ctx.section, plan, opts, DEFAULT_STYLE, meta)
+    # compose already forwards plan.flags (dimension_extent_mismatch): one loop only
     for code, severity, detail in lay.flags:
         rep.flag(code, severity, detail)
     if not lay.sheet.meta.get("approval"):
         rep.flag("approval_blank", "info", "the approval field is blank (auto-generated drawing)")
     m = lay.sheet.meta
+    tiny = _views_tiny(ctx, lay)
+    if tiny is not None:
+        rep.flag("views_tiny", "warning", tiny)
     rep.data["sheet"] = {"size": lay.sheet_size.name, "orientation": lay.sheet_size.orientation,
                          "scale": lay.scale_text, "projection": m.get("projection"),
                          "iso5457": bool(lay.sheet_size.iso5457),
                          "iso_scale": (None if m.get("iso_scale") is None
                                        else _scale_text(m.get("iso_scale"))),
                          "views_placed": sorted(lay.placements)}
+    if isinstance(m.get("text_collisions"), dict):
+        rep.data["sheet"]["text_collisions"] = dict(m["text_collisions"])
     if rep.data.get("section") is not None:
         sl = m.get("section_layout") or {}
         rep.data["section"]["hatch_segments"] = int(sl.get("hatch_segments") or 0)
         rep.data["section"]["hatch_spacing_mm"] = sl.get("hatch_spacing")
 
     from . import writers
+    ctx.progress("write")
     fns = {"pdf": writers.write_pdf, "svg": writers.write_svg, "dxf": writers.write_dxf}
     written = 0
     os.makedirs(ctx.out_dir, exist_ok=True)
@@ -722,6 +1176,63 @@ def _sheet_and_write(ctx: _Ctx) -> None:
         raise _Failure("no output file could be written")
 
 
+_VIEWS_TINY_FILL = 0.10          # placed view geometry / drawing frame area (QA issue 5)
+
+
+def _views_tiny(ctx: _Ctx, lay) -> Optional[str]:
+    """Detail text when the views are tiny on the sheet, else None (QA issue 5 step 5).
+
+    Tiny: the sheet scale is the largest standard scale
+    (``style.STANDARD_SCALES[0]``, 50:1) AND the geometry of the placed
+    views (their model bboxes at the sheet scale, the iso view at its own
+    scale, the section at the sheet scale; dimension bands not counted)
+    covers less than ``_VIEWS_TINY_FILL`` of the drawing frame. A part that
+    small is usually a unit error (a metre or inch file read as mm).
+    """
+    try:
+        from .layout import _frame_rect
+        from .style import DEFAULT_STYLE, STANDARD_SCALES
+        top = float(STANDARD_SCALES[0])
+        scale = float(lay.scale)
+        if scale < top * (1.0 - 1e-9):
+            return None
+        iso_s = lay.sheet.meta.get("iso_scale")
+        iso_s = scale if iso_s is None else float(iso_s)
+        area = 0.0
+        for name in lay.placements:
+            if name == "section":
+                body = getattr(ctx.section, "body", None)
+                bb = getattr(body, "bbox", None)
+                if bb is None and ctx.section is not None and ctx.section.loops:
+                    import numpy as np
+                    pts = np.vstack([np.asarray(lp, float)[:, :2] for lp in ctx.section.loops])
+                    w, h = np.ptp(pts[:, 0]), np.ptp(pts[:, 1])
+                    area += float(w * h) * scale * scale
+                    continue
+            else:
+                pv = ctx.views.get(name)
+                bb = getattr(pv, "bbox", None)
+            if bb is None:
+                continue
+            s = iso_s if name == "iso" else scale
+            area += float(bb.xmax - bb.xmin) * float(bb.ymax - bb.ymin) * s * s
+        f = _frame_rect(lay.sheet_size, DEFAULT_STYLE)
+        frame = float(f.xmax - f.xmin) * float(f.ymax - f.ymin)
+        if not frame > 0.0:
+            return None
+        fill = area / frame
+    except Exception as exc:                   # a missing flag, never a failed run
+        logger.debug("views_tiny check failed: %s", exc)
+        return None
+    if fill >= _VIEWS_TINY_FILL:
+        return None
+    ext = ctx.extents
+    size = ("" if ext is None else
+            " (model " + " x ".join(f"{float(v):.4g}" for v in ext) + " mm)")
+    return (f"views fill {100.0 * fill:.2g} % of the drawing area at the largest standard "
+            f"scale {_scale_text(scale)}{size}: check the unit")
+
+
 def _scale_text(s) -> Optional[str]:
     from .style import scale_text
     try:
@@ -731,6 +1242,23 @@ def _scale_text(s) -> Optional[str]:
 
 
 # -------------------------------------------------------------------- run --
+
+def input_error_text(s) -> Optional[str]:
+    """Error text for a sniffed input that cannot be drawn, else None (QA issue 25).
+
+    The single source of the texts is ``sniff.unreadable_reason``:
+    ``"empty STL (0 facets)"``, ``"binary STL truncated: header declares N
+    triangles (X bytes), file is Y bytes"`` and the generic "unsupported or
+    corrupt input" text; any other kind that is neither STEP nor STL gets
+    the generic text too. Kept under this name for backward compatibility.
+    Standard library only (the sandbox parent calls it).
+    """
+    from .sniff import unreadable_reason
+    reason = unreadable_reason(s)
+    if reason is None and getattr(s, "kind", "unknown") not in ("step", "stl_binary", "stl_ascii"):
+        return "unsupported or corrupt input (neither STEP nor STL by content)"
+    return reason
+
 
 def _finish(ctx: _Ctx, ok: bool, error: Optional[str] = None) -> Tuple[int, dict]:
     for k, v in ctx.timing.items():
@@ -743,6 +1271,7 @@ def _finish(ctx: _Ctx, ok: bool, error: Optional[str] = None) -> Tuple[int, dict
         logger.error("report could not be written: %s", exc)
         ctx.rep.data["warnings"].append(f"report could not be written: {exc}")
         data = ctx.rep.data
+    ctx.progress("done" if ok else "failed")
     return code, data
 
 
@@ -759,20 +1288,19 @@ def _run(ctx: _Ctx) -> Tuple[int, dict]:
     rep.data["input"].update(detected_format=s.kind, extension=s.extension or None,
                              size_bytes=s.size_bytes, sha256=s.sha256 or None,
                              triangles_declared=s.triangles)
+    ctx.progress("sniff")
     if s.extension_mismatch:
         rep.flag("extension_mismatch", "info", f"content is {s.kind}, extension {s.extension!r}")
-    err = check_limits(s, opts.max_input_mb, opts.max_triangles)
+    err = check_limits(s, opts.max_input_mb, opts.max_triangles) or input_error_text(s)
     if err:
         raise _Failure(err)
     ctx.timing["load_s"] += time.perf_counter() - t0
     if s.kind == "step":
         ctx.say("input: STEP")
         _run_step(ctx)
-    elif s.kind in ("stl_binary", "stl_ascii"):
+    else:
         ctx.say(f"input: {s.kind}, {s.triangles} triangles")
         _run_stl(ctx)
-    else:
-        raise _Failure("unsupported or corrupt input (neither STEP nor STL by content)")
     _sheet_and_write(ctx)
     return _finish(ctx, True)
 
@@ -802,4 +1330,4 @@ def run(input_path: str, out_dir: str, options: DrawingOptions, log=None) -> Tup
         return _finish(ctx, False, f"{type(exc).__name__}: {exc}")
 
 
-__all__ = ["run", "SOURCE_NOTES"]
+__all__ = ["run", "SOURCE_NOTES", "input_error_text"]

@@ -49,6 +49,18 @@ def _stroke(item, sheet_style: SheetStyle) -> str:
     return s
 
 
+def polyline_points(item) -> np.ndarray:
+    """(n, 2) points of a Polyline; a closed one drops a repeated closing point.
+
+    ``<polygon>`` closes itself, so writing the first point again at the end
+    would add a zero-length closing segment.
+    """
+    pts = np.asarray(item.points, dtype=np.float64).reshape(-1, 2)
+    if bool(item.closed) and pts.shape[0] >= 4 and bool(np.all(np.abs(pts[0] - pts[-1]) <= 1e-9)):
+        pts = pts[:-1]
+    return pts
+
+
 def _pts(arr) -> str:
     pts = np.asarray(arr, dtype=np.float64).reshape(-1, 2)
     return " ".join(f"{fmt(x)},{fmt(y)}" for x, y in pts)
@@ -64,7 +76,7 @@ def _geom(item, sheet_style: SheetStyle) -> str:
         return f'<line x1="{fmt(x0)}" y1="{fmt(y0)}" x2="{fmt(x1)}" y2="{fmt(y1)}" {st}/>'
     if isinstance(item, Polyline):
         tag = "polygon" if item.closed else "polyline"
-        return f'<{tag} points="{_pts(item.points)}" {st}/>'
+        return f'<{tag} points="{_pts(polyline_points(item))}" {st}/>'
     if isinstance(item, Circle):
         cx, cy = item.center
         return f'<circle cx="{fmt(cx)}" cy="{fmt(cy)}" r="{fmt(item.radius)}" {st}/>'

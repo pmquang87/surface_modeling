@@ -338,10 +338,15 @@ def test_exact_false_meshes_an_unmeshed_shape():
 
 
 def _outline_sag(prims, r):
-    """Max radial sag of the chord midpoints of an outline around the origin."""
+    """Max radial sag of the chord midpoints of an outline around the origin.
+
+    Chords may arrive as Segments or chained into Polylines (QA issue 6)."""
+    from src.drawing.geometry2d import primitives_to_segments
+    chords = primitives_to_segments([p for p in prims if isinstance(p, (Segment, Polyline))], 1.0)
+    assert len(chords), "no chords"
     worst = 0.0
-    for s in _segs(prims):
-        mid = 0.5 * (np.asarray(s.a) + np.asarray(s.b))
+    for a, b in chords:
+        mid = 0.5 * (a + b)
         worst = max(worst, r - float(np.hypot(*mid)))
     return worst
 
@@ -360,7 +365,9 @@ def test_exact_false_remeshes_a_coarser_existing_triangulation():
     assert fine.stats["meshed"] is True
     sag = _outline_sag(fine.visible, 10.0)
     assert 0.0 < sag <= 0.01 * 1.05
-    assert len(_segs(fine.visible)) > len(_segs(coarse.visible))
+    # chord counts (Segments or chained Polylines, QA issue 6)
+    from src.drawing.geometry2d import primitives_to_segments
+    assert len(primitives_to_segments(fine.visible, 1.0)) > len(primitives_to_segments(coarse.visible, 1.0))
     # an equally fine mesh is reused, not rebuilt
     again = project_brep(cyl, VIEWS["top"], exact=False, deflection=0.01)
     assert again.stats["meshed"] is False
@@ -389,6 +396,188 @@ def test_time_budget_raises_timeout():
     # a sane budget does not raise
     pv = project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02, time_budget_s=60.0)
     assert pv.visible
+
+
+# ------------------------------------- QA round 1 fixes (task F1-views-perf)
+
+def _blind_hole_from_below():
+    """60x40x20 box with a r5 blind hole from the bottom face (depth 10): hidden in the top view."""
+    return _cut(_box(0, 0, 0, 60, 40, 20), _cyl((30, 20, -5), (0, 0, 1), 5.0, 15.0))
+
+
+def test_budget_overrun_in_cleanup_drops_hidden_instead_of_raising(monkeypatch):
+    """Issue 3: the budget covers the Python clean-up; an overrun there returns the view
+    without hidden lines (stats flag) instead of raising or running on."""
+    import time
+    import src.drawing.brep_views as bv
+    ok = bv.project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02, time_budget_s=60.0)
+    assert ok.hidden and ok.stats["hidden_dropped"] is False         # precondition
+    real = bv.subtract_covered
+
+    def slow(*a, **k):
+        time.sleep(0.6)
+        return real(*a, **k)
+
+    monkeypatch.setattr(bv, "subtract_covered", slow)
+    t = time.perf_counter()
+    pv = bv.project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02, time_budget_s=0.3)
+    assert time.perf_counter() - t < 5.0
+    assert pv.hidden == []
+    assert pv.stats["hidden_dropped"] is True
+    assert pv.stats["hidden_dropped_reason"] == "time_budget"
+    assert len(pv.visible) == len(ok.visible)                         # visible lines intact
+    # without a budget the slow clean-up still finishes with hidden lines
+    full = bv.project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02)
+    assert full.hidden and full.stats["hidden_dropped"] is False
+
+
+def test_max_hidden_primitives_drops_hidden():
+    from src.drawing.brep_views import project_brep
+    pv = project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02)
+    assert pv.stats["raw_hidden"] > 1                                 # precondition
+    capped = project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02,
+                          max_hidden_primitives=1)
+    assert capped.hidden == [] and capped.stats["hidden_dropped"] is True
+    assert capped.stats["hidden_dropped_reason"] == "max_hidden_primitives"
+    same = project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02,
+                        max_hidden_primitives=10_000)
+    assert len(same.hidden) == len(pv.hidden)
+
+
+def test_poly_hidden_circle_is_one_polyline(monkeypatch):
+    """Issue 6: on the poly route the hidden hole circle came out as dozens of chord
+    Segments (each restarting the dash pattern); it must be chained into Polylines."""
+    import src.drawing.brep_views as bv
+    from src.drawing.model import LineStyle
+    pv = bv.project_brep(_blind_hole_from_below(), VIEWS["top"], exact=False, deflection=0.05)
+    assert pv.stats["raw_hidden"] >= 16                               # precondition: chords
+    polys = [p for p in pv.hidden if isinstance(p, Polyline)]
+    assert polys and all(p.style == LineStyle.HIDDEN for p in pv.hidden)
+    assert max(len(p.points) for p in polys) >= 16
+    assert len(pv.hidden) <= 2
+    rad = np.linalg.norm(np.vstack([p.points for p in polys]) - [30.0, 20.0], axis=1)
+    assert np.allclose(rad, 5.0, atol=0.06)
+    # the visible outline (4 long edges) stays 4 Segments
+    assert len(_segs(pv.visible)) == 4 and len(pv.visible) == 4
+    # negative control: without chaining every chord is its own Segment
+    monkeypatch.setattr(bv, "_DASH_PERIOD_PAPER_MM", 0.0)
+    pv0 = bv.project_brep(_blind_hole_from_below(), VIEWS["top"], exact=False, deflection=0.05)
+    assert len(_segs(pv0.hidden)) >= 16
+
+
+def _faceted(mesh):
+    from src.drawing.brep_load import faceted_shape_from_mesh
+    return faceted_shape_from_mesh(mesh, 0.35, lambda *a, **k: None)
+
+
+def test_poly_hidden_edge_next_to_visible_edge_is_dropped(monkeypatch):
+    """Issue 27: on the poly route a hidden edge 0.1 mm (on paper) beside a visible one
+    was kept; within 0.3 mm on paper the visible line has priority."""
+    import trimesh
+    import src.drawing.brep_views as bv
+    spec = VIEWS["front"]
+    big = trimesh.creation.box(extents=(20, 20, 20))
+    small = trimesh.creation.box(extents=(10, 10, 10))
+    small.vertices = small.vertices @ np.eye(3)                       # axis aligned
+    centre = -25.0 * np.asarray(spec.n, float) + (10.0 - 5.0 - 0.1) * np.asarray(spec.y, float)
+    small.apply_translation(centre)
+    mesh = trimesh.util.concatenate([big, small])
+
+    def near_top(pv):
+        out = []
+        for a, b in g2_segments(pv.hidden):
+            if abs(a[1] - 9.9) < 1e-3 and abs(b[1] - 9.9) < 1e-3:
+                out.append((a, b))
+        return out
+
+    monkeypatch.setattr(bv, "_COVER_PAPER_MM", 0.0)                   # negative control first
+    strict = bv.project_brep(_faceted(mesh), spec, exact=False, deflection=0.05)
+    assert len(near_top(strict)) == 1                                 # precondition: it exists
+    monkeypatch.undo()
+    pv = bv.project_brep(_faceted(mesh), spec, exact=False, deflection=0.05)
+    assert near_top(pv) == []
+    assert len(g2_segments(pv.hidden)) == len(g2_segments(strict.hidden)) - 1
+
+
+def g2_segments(prims):
+    from src.drawing.geometry2d import primitives_to_segments
+    return primitives_to_segments(prims, 0.01) if prims else np.zeros((0, 2, 2))
+
+
+def test_isolated_fragment_filter_keeps_short_connected_edges():
+    """Issue 35: the isolated-fragment filter must not remove real short edges such as
+    0.6 mm pin sections (closed loops) or short edges connected to the outline."""
+    from src.drawing.brep_views import project_brep
+    shape = _box(0, 0, 0, 20, 10, 5)
+    for i in range(3):                                                 # 0.6 mm pins
+        shape = _fuse(shape, _box(2.0 + 6.0 * i, 10.0, 2.2, 0.6, 4.0, 0.6))
+    for name in ("front", "top", "right"):
+        on = project_brep(shape, VIEWS[name], exact=True, deflection=0.05)
+        off = project_brep(shape, VIEWS[name], exact=True, deflection=0.05, min_fragment_mm=0.0)
+        assert on.stats["fragments_dropped"] == 0, name
+        assert len(on.visible) == len(off.visible) and len(on.hidden) == len(off.hidden), name
+    # a huge threshold still keeps everything connected (only isolated items go)
+    big = project_brep(shape, VIEWS["right"], exact=True, deflection=0.05, min_fragment_mm=50.0)
+    assert big.stats["fragments_dropped"] == 0
+
+
+def _box_with_free_edge(length):
+    """20x10x5 box plus a free straight edge of ``length`` at x = 30 (nothing touches it)."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+    from OCP.gp import gp_Pnt
+    edge = BRepBuilderAPI_MakeEdge(gp_Pnt(30.0, 5.0, 2.0), gp_Pnt(30.0 + length, 5.0, 2.0)).Edge()
+    return _compound(_box(0, 0, 0, 20, 10, 5), edge)
+
+
+@pytest.mark.parametrize("exact", [True, False])
+def test_isolated_fragment_filter_removes_a_real_fragment_at_view_level(exact):
+    """Issue 35 (de-vacuated): project_brep must actually remove an isolated open fragment
+    shorter than min_fragment_mm on paper, and keep it when the filter is off or when the
+    fragment is longer than the threshold."""
+    from src.drawing.brep_views import project_brep
+
+    def lone(pv):
+        return [p for p in pv.visible if isinstance(p, Segment) and min(p.a[0], p.b[0]) > 25.0]
+
+    off = project_brep(_box_with_free_edge(0.2), VIEWS["front"], exact=exact, deflection=0.05,
+                       paper_scale=1.0, min_fragment_mm=0.0)
+    assert len(lone(off)) == 1                                       # precondition: it is drawn
+    assert off.stats["fragments_dropped"] == 0
+    on = project_brep(_box_with_free_edge(0.2), VIEWS["front"], exact=exact, deflection=0.05,
+                      paper_scale=1.0)
+    assert lone(on) == [] and on.stats["fragments_dropped"] == 1
+    assert len(on.visible) == len(off.visible) - 1
+    # 0.2 model mm at paper scale 5 is 1 mm on paper: above the 0.3 mm threshold, kept
+    big = project_brep(_box_with_free_edge(0.2), VIEWS["front"], exact=exact, deflection=0.05,
+                       paper_scale=5.0)
+    assert len(lone(big)) == 1 and big.stats["fragments_dropped"] == 0
+
+
+def test_poly_hidden_fine_faceted_circle_is_not_deleted_by_the_cover_tolerance():
+    """F1 review: on the poly route the 0.3 mm (paper) cover tolerance was also used as
+    the minimum hidden length, so a hidden cylinder rim faceted into 0.245 mm chords
+    vanished completely (0 hidden primitives) although no visible edge is near it."""
+    import trimesh
+    import src.drawing.brep_views as bv
+    r, n = 10.0, 256
+    chord = 2.0 * r * math.sin(math.pi / n)
+    assert chord < bv._COVER_PAPER_MM                               # precondition at scale 1
+    mesh = trimesh.util.concatenate([trimesh.creation.box(extents=(40, 40, 30)),
+                                     trimesh.creation.cylinder(radius=r, height=10.0, sections=n)])
+    pv = bv.project_brep(_faceted(mesh), VIEWS["top"], exact=False, deflection=0.05, paper_scale=1.0)
+    assert pv.stats["cover_tol"] == pytest.approx(0.3)
+    assert pv.stats["paper_scale"] == 1.0 and pv.stats["paper_scale_guessed"] is False
+    hid = g2_segments(pv.hidden)
+    total = float(np.linalg.norm(hid[:, 1] - hid[:, 0], axis=1).sum()) if len(hid) else 0.0
+    assert total == pytest.approx(n * chord, abs=0.05)              # 62.83 = the full rim
+    rad = np.linalg.norm(hid.reshape(-1, 2), axis=1)
+    assert np.allclose(rad, r, atol=0.01)
+    assert len(pv.hidden) == 1 and isinstance(pv.hidden[0], Polyline)
+    # the visible outline (40 x 40 square) is unchanged
+    assert len(pv.visible) == 4
+    # without paper_scale the deflection rule is inverted and the guess is disclosed
+    pg = bv.project_brep(_faceted(mesh), VIEWS["top"], exact=False, deflection=0.05)
+    assert pg.stats["paper_scale_guessed"] is True and pg.stats["paper_scale"] == pytest.approx(1.0)
 
 
 def test_edges_to_primitives_null_and_style():
@@ -427,14 +616,18 @@ def test_choose_section_plane_auto_through_largest_hole():
 
 def test_choose_section_plane_fallbacks_and_modes():
     from src.drawing.brep_sections import choose_section_plane_brep
-    # no hole perpendicular to Y (only the boss and a Y-axis hole) -> bbox centre
+    # no hole perpendicular to Y (only the boss and a Y-axis hole): mode front -> bbox
+    # centre; mode auto (QA issue 10) -> the top plane through the Y-axis hole instead
     feats = [CylFeature(np.array([20.0, 30.0, 7.5]), np.array([0.0, 1.0, 0.0]), 4.0, 60.0,
                         "hole", True, 1),
              CylFeature(np.array([78.0, 30.0, 20.0]), np.array([0.0, 0.0, 1.0]), 15.0, 10.0,
                         "boss", True, 1)]
-    point, normal, marker = choose_section_plane_brep(_plate_model(), feats, "auto")
+    point, normal, marker = choose_section_plane_brep(_plate_model(), feats, "front")
     assert np.allclose(point, [50.0, 30.0, 12.5])
     assert np.allclose(normal, [0.0, -1.0, 0.0]) and marker == "top"
+    point, normal, marker = choose_section_plane_brep(_plate_model(), feats, "auto")
+    assert np.allclose(point, [20.0, 30.0, 7.5])
+    assert np.allclose(normal, VIEWS["top"].n) and marker == "front"
     # mode top: horizontal plane, cutting line drawn in the front view
     point, normal, marker = choose_section_plane_brep(_plate_model(), _plate_features(), "top")
     assert np.allclose(normal, VIEWS["top"].n) and marker == "front"
@@ -501,7 +694,8 @@ def test_section_body_negative_control_wrong_half(monkeypatch):
                            deflection=0.02, depth_extent=60.0)
     assert {40.0, 60.0} <= _vertical_xs(good.body.visible), "precondition: correct half shows the walls"
     orig = bs._half_space_cut
-    monkeypatch.setattr(bs, "_half_space_cut", lambda s, p, n: orig(s, p, -np.asarray(n)))
+    monkeypatch.setattr(bs, "_half_space_cut",
+                        lambda s, p, n, **kw: orig(s, p, -np.asarray(n), **kw))
     bad = bs.section_brep(plate, (50.0, 30.0, 7.5), (0.0, -1.0, 0.0), VIEWS["front"], exact=True,
                           deflection=0.02, depth_extent=60.0)
     assert len(bad.loops) == 2                      # the loops do not depend on the kept half
@@ -607,3 +801,233 @@ def test_section_rejects_normal_not_matching_spec():
     with pytest.raises(ValueError):
         section_brep(_plate(), (50.0, 30.0, 7.5), (1.0, 0.0, 0.0), VIEWS["front"], exact=True,
                      deflection=0.02, depth_extent=60.0)
+
+
+# ----------------------------------------------------------------- QA round 1 (F2) sections
+
+def _washer():
+    """R30 x 3 disc with an R15 bore, axis along Y (the front view normal):
+    the drawing orientation of a washer seen face on."""
+    return _cut(_cyl((0, 0, 0), (0, 1, 0), 30.0, 3.0), _cyl((0, -1, 0), (0, 1, 0), 15.0, 5.0))
+
+
+def test_auto_section_turns_to_top_when_the_hole_axis_is_the_front_normal():
+    """Issue 10: the washer's bore runs along the front normal; auto cuts with
+    the TOP plane through the bore (two 15 x 3 rectangles, cutting line in
+    the front view) instead of repeating the front outline as an annulus."""
+    from src.drawing.brep_features import cylinder_features
+    from src.drawing.brep_sections import choose_section_plane_brep_info, section_brep
+    shape = _washer()
+    feats = cylinder_features(shape)
+    holes = [f for f in feats if f.kind == "hole"]
+    assert len(holes) == 1 and abs(holes[0].axis[1]) == pytest.approx(1.0)   # precondition
+    model = types.SimpleNamespace(shape=shape, census={})
+    point, normal, marker, info = choose_section_plane_brep_info(model, feats, "auto")
+    assert np.allclose(normal, VIEWS["top"].n) and marker == "front"
+    assert info["reason"] == "hole_axis" and info["view"] == "top"
+    assert info["hole_radius"] == pytest.approx(15.0)
+    assert np.allclose(point, holes[0].center, atol=1e-9)
+    sv = section_brep(shape, point, normal, VIEWS["top"], exact=True, deflection=0.02,
+                      depth_extent=60.0)
+    assert _areas(sv.loops) == pytest.approx([45.0, 45.0], abs=1e-6)
+    # negative control: the old rule (front plane through the bbox centre) gives the annulus
+    p2, n2, _, info2 = choose_section_plane_brep_info(model, feats, "front")
+    assert info2["reason"] == "bbox_centre_fallback"
+    front = section_brep(shape, p2, n2, VIEWS["front"], exact=True, deflection=0.02,
+                         depth_extent=3.0)
+    assert len(front.loops) == 2
+    assert max(_areas(front.loops)) == pytest.approx(math.pi * 30.0 ** 2, rel=1e-3)
+
+
+def test_auto_section_thin_part_and_fallback_reasons():
+    from src.drawing.brep_sections import choose_section_plane_brep_info
+    thin = types.SimpleNamespace(shape=None, census={"bbox_min": [0, 0, 0],
+                                                     "bbox_max": [100, 2, 60]})
+    point, normal, marker, info = choose_section_plane_brep_info(thin, [], "auto")
+    assert info["reason"] == "thin_part" and np.allclose(normal, VIEWS["top"].n)
+    assert marker == "front" and np.allclose(point, [50, 1, 30])
+    cube = types.SimpleNamespace(shape=None, census={"bbox_min": [0, 0, 0],
+                                                     "bbox_max": [100, 40, 60]})
+    point, normal, marker, info = choose_section_plane_brep_info(cube, [], "auto")
+    assert info["reason"] == "bbox_centre_fallback" and np.allclose(normal, VIEWS["front"].n)
+    assert marker == "top" and info["hole_radius"] is None
+    # explicit modes never apply the thin-part rule
+    _, normal, _, info = choose_section_plane_brep_info(thin, [], "front")
+    assert info["reason"] == "bbox_centre_fallback" and np.allclose(normal, VIEWS["front"].n)
+
+
+def test_section_in_a_gap_between_bodies_is_retried_at_a_body(monkeypatch):
+    """Issue 10: two boxes with a gap along the depth; the bbox-centre plane
+    and its 1 % nudge are empty, the retry moves the plane into a body."""
+    import src.drawing.brep_sections as bs
+    shape = _compound(_box(0, 0, 0, 50, 10, 20), _box(0, 30, 0, 50, 15, 20))
+    monkeypatch.setattr(bs, "_RETRY_AT_BODY", False)
+    raw = bs.section_brep(shape, (25.0, 20.0, 10.0), (0.0, -1.0, 0.0), VIEWS["front"],
+                          exact=True, deflection=0.02, depth_extent=45.0)
+    assert raw.loops == [] and raw.stats["nudged"] is True        # precondition: empty
+    monkeypatch.setattr(bs, "_RETRY_AT_BODY", True)
+    sv = bs.section_brep(shape, (25.0, 20.0, 10.0), (0.0, -1.0, 0.0), VIEWS["front"],
+                         exact=True, deflection=0.02, depth_extent=45.0)
+    assert sv.stats["retried_at_body"] is True
+    assert float(sv.plane_point[1]) == pytest.approx(37.5, abs=1e-9)   # the larger box
+    assert _areas(sv.loops) == pytest.approx([1000.0], abs=1e-6)
+    assert sv.body is not None and sv.body.visible
+
+
+def _assembly():
+    """Plate 100x20x10 with a d10 hole at (50,10), a bolt filling it (coincident
+    faces, z -5..15), a nut overlapping the bolt on the plate top, and a
+    separate box entirely at y < 0."""
+    plate = _cut(_box(0, 0, 0, 100, 20, 10), _cyl((50, 10, -5), (0, 0, 1), 5.0, 30.0))
+    bolt = _cyl((50, 10, -5), (0, 0, 1), 5.0, 20.0)
+    nut = _cyl((50, 10, 10), (0, 0, 1), 8.0, 4.0)
+    other = _box(0, -30, 0, 100, 10, 10)
+    return _compound(plate, bolt, other, nut)
+
+
+def _solid_ymins(shape):
+    from OCP.TopAbs import TopAbs_SOLID
+    from OCP.TopExp import TopExp_Explorer
+    from src.drawing.brep_sections import _exact_bbox
+    out = []
+    ex = TopExp_Explorer(shape, TopAbs_SOLID)
+    while ex.More():
+        out.append(float(_exact_bbox(ex.Current())[0][1]))
+        ex.Next()
+    return out
+
+
+def test_assembly_section_cuts_each_solid_and_keeps_the_half_space(monkeypatch):
+    """Issue 15: one boolean of the whole assembly kept the bolt and the nut
+    uncut (ymin 5 and 2 for a cut at y = 10) and merged their section wires
+    into open ones; per body every kept solid lies behind the plane, the
+    separate box is dropped and every loop closes."""
+    import src.drawing.brep_sections as bs
+    asm = _assembly()
+    p, n = np.array([50.0, 10.0, 5.0]), np.array([0.0, -1.0, 0.0])
+    monkeypatch.setattr(bs, "_SECTION_PER_BODY", False)
+    old = bs._half_space_cut(asm, p, n)
+    assert min(_solid_ymins(old)) < 10.0 - 1.0                      # precondition: the bug
+    old_loops, old_stats = bs._section_loops(asm, p, n, VIEWS["front"], 0.02)
+    assert old_stats["open_wires_dropped"] > 0
+    monkeypatch.setattr(bs, "_SECTION_PER_BODY", True)
+    st = {}
+    kept = bs._half_space_cut(asm, p, n, stats=st)
+    ymins = _solid_ymins(kept)
+    assert len(ymins) == 3 and min(ymins) >= 10.0 - 1e-6
+    assert st["dropped_whole"] == 1 and st["cut"] == 3 and st["half_space_excess_mm"] < 1e-6
+    sv = bs.section_brep(asm, p, n, VIEWS["front"], exact=True, deflection=0.02,
+                         depth_extent=50.0, hidden=False)
+    assert sv.stats["open_wires_dropped"] == 0 and sv.stats["bodies_sectioned"] == 3
+    # plate 2 x 45x10, bolt 10x20, nut 16x4
+    assert _areas(sv.loops) == pytest.approx([64.0, 200.0, 450.0, 450.0], abs=1e-6)
+    assert sv.body.bbox.ymin == pytest.approx(-5.0) and sv.body.bbox.ymax == pytest.approx(15.0)
+
+
+def test_half_space_cut_keeps_and_drops_whole_bodies_without_a_boolean(monkeypatch):
+    """Bodies entirely on one side are classified by bbox: no boolean runs."""
+    import src.drawing.brep_sections as bs
+    calls = []
+    orig = bs._cut_one
+    monkeypatch.setattr(bs, "_cut_one", lambda part, half: calls.append(1) or orig(part, half))
+    shape = _compound(_box(0, 20, 0, 10, 10, 10), _box(0, -20, 0, 10, 10, 10))
+    st = {}
+    kept = bs._half_space_cut(shape, (0.0, 5.0, 0.0), (0.0, -1.0, 0.0), stats=st)
+    assert calls == [] and st["kept_whole"] == 1 and st["dropped_whole"] == 1
+    assert _solid_ymins(kept) == pytest.approx([20.0])
+    bs._half_space_cut(_box(0, 0, 0, 10, 10, 10), (0.0, 5.0, 0.0), (0.0, -1.0, 0.0))
+    assert calls == [1]                                            # control: a straddling body
+
+
+def test_auto_section_goes_through_the_axis_of_a_fastener_filled_hole(monkeypatch):
+    """Review F2: in an assembly every hole a bolt fills is 'filled_hole';
+    auto must still cut through the bolt axis (the standard section of a
+    bolted joint) instead of falling back to the bbox centre."""
+    import src.drawing.brep_sections as bs
+    from src.drawing.brep_features import cylinder_features
+    asm = _assembly()
+    feats = cylinder_features(asm)
+    kinds = sorted(f.kind for f in feats)
+    assert "hole" not in kinds and kinds.count("filled_hole") == 1       # precondition
+    bb = bs._exact_bbox(asm)
+    model = types.SimpleNamespace(shape=asm, census={"bbox_min": bb[0].tolist(),
+                                                     "bbox_max": bb[1].tolist(), "solids": 4})
+    point, normal, marker, info = bs.choose_section_plane_brep_info(model, feats, "auto")
+    assert info["reason"] == "hole_axis" and info["hole_kind"] == "filled_hole"
+    assert info["view"] == "front" and np.allclose(normal, VIEWS["front"].n)
+    assert info["hole_radius"] == pytest.approx(5.0) and info["skip_hint"] is None
+    assert np.allclose(point[:2], [50.0, 10.0], atol=1e-9)              # on the bolt axis
+    sv = bs.section_brep(asm, point, normal, VIEWS["front"], exact=True, deflection=0.02,
+                         depth_extent=50.0, hidden=False)
+    assert sv.stats["open_wires_dropped"] == 0 and sv.stats["bodies_sectioned"] == 3
+    assert _areas(sv.loops) == pytest.approx([64.0, 200.0, 450.0, 450.0], abs=1e-6)
+    # a real hole of the same radius comes first, a larger filled hole before a smaller hole
+    real = CylFeature(center=np.array([10.0, 10.0, 5.0]), axis=np.array([0.0, 0.0, 1.0]),
+                      radius=5.0, length=10.0, kind="hole", full_circle=True, n_faces=1)
+    _, _, _, i2 = bs.choose_section_plane_brep_info(model, list(feats) + [real], "auto")
+    assert i2["hole_kind"] == "hole"
+    small = CylFeature(center=np.array([10.0, 10.0, 5.0]), axis=np.array([0.0, 0.0, 1.0]),
+                       radius=2.0, length=10.0, kind="hole", full_circle=True, n_faces=1)
+    _, _, _, i3 = bs.choose_section_plane_brep_info(model, list(feats) + [small], "auto")
+    assert i3["hole_kind"] == "filled_hole"
+    # negative control: real holes only -> the bbox-centre fallback of the review
+    monkeypatch.setattr(bs, "_SECTION_HOLE_KINDS", ("hole",))
+    _, _, _, i4 = bs.choose_section_plane_brep_info(model, feats, "auto")
+    assert i4["reason"] == "bbox_centre_fallback" and i4["hole_kind"] is None
+
+
+def test_half_space_excess_is_checked_on_a_triangulation(monkeypatch):
+    """Review F2: AddOptimal (no triangulation) keeps the full-sphere box of
+    a trimmed sphere face, so a sphere r10 cut at y = -2 seemed to reach 8 mm
+    past the plane (the RC buggy run reported 1.96 mm on bodies whose
+    triangulation was clean). The excess is checked on a triangulation of a
+    copy: 0, no Common retry, no excess body, and the kept body gets no
+    triangulation from the check."""
+    import src.drawing.brep_sections as bs
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeSphere
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
+    from OCP.gp import gp_Pnt
+    sphere = BRepPrimAPI_MakeSphere(gp_Pnt(0, 0, 0), 10.0).Shape()
+    p, n = np.array([0.0, -2.0, 0.0]), np.array([0.0, -1.0, 0.0])
+    res = bs._cut_one(sphere, bs._half_space_solid(p, n))
+    assert bs._excess(res, p, n, 0.02, refine=False) == pytest.approx(8.0, abs=1e-6)  # precondition
+    assert bs._excess(res, p, n, 0.02) < 0.02
+    # the triangulation box carries ~2 x the deflection; the node scan + deflection is tighter
+    box_only = bs._mesh_excess(res, p, n, 0.005)
+    assert box_only > 0.008                                         # precondition
+    assert bs._mesh_excess(res, p, n, 0.005, tol=0.001) <= 0.005 + 1e-6
+    ex = TopExp_Explorer(res, TopAbs_FACE)
+    while ex.More():
+        assert BRep_Tool.Triangulation_s(TopoDS.Face_s(ex.Current()), TopLoc_Location()) is None
+        ex.Next()
+    st = {}
+    bs._half_space_cut(sphere, p, n, stats=st)
+    assert st["cut"] == 1 and st["common_retries"] == 0 and st["excess_bodies"] == 0
+    assert st["half_space_excess_mm"] < st["half_space_excess_tol_mm"]
+    # a real overshoot survives the check: the uncut sphere reaches 8 mm past the plane
+    assert bs._excess(sphere, p, n, 0.02) == pytest.approx(8.0, abs=0.02)
+    # negative control: without the triangulation check the clean cut is retried and flagged
+    monkeypatch.setattr(bs, "_mesh_excess", lambda *a, **k: None)
+    st = {}
+    bs._half_space_cut(sphere, p, n, stats=st)
+    assert st["common_retries"] == 1 and st["excess_bodies"] == 1
+
+
+def test_auto_section_skip_hint_for_a_model_without_solid():
+    """Review F2: an open surface model (no solid) gives no closed section
+    loop on any plane; the plane choice says so with skip_hint 'no_solid'."""
+    from src.drawing.brep_sections import choose_section_plane_brep_info
+    box = {"bbox_min": [0, 0, 0], "bbox_max": [100, 2, 60]}
+    _, _, _, info = choose_section_plane_brep_info(
+        types.SimpleNamespace(shape=None, census={**box, "solids": 0}), [], "auto")
+    assert info["reason"] == "thin_part" and info["skip_hint"] == "no_solid"
+    _, _, _, solid = choose_section_plane_brep_info(
+        types.SimpleNamespace(shape=None, census={**box, "solids": 1}), [], "auto")
+    assert solid["skip_hint"] is None
+    _, _, _, unknown = choose_section_plane_brep_info(
+        types.SimpleNamespace(shape=None, census=box), [], "auto")
+    assert unknown["skip_hint"] is None                 # no census count: no hint

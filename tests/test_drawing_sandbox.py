@@ -502,3 +502,336 @@ def test_apply_rlimits_without_resource_module_does_not_raise(monkeypatch):
     monkeypatch.setitem(sys.modules, "resource", None)   # import resource -> ImportError
     env = {sandbox.RLIMIT_ENV: sandbox.posix_rlimit_env(512, 10, 50)}
     assert sandbox.apply_rlimits_from_env(env) == {}
+
+
+# ============================================================ QA round 1 (F5)
+# Issue 20 (font cache / fontTools stderr), 17 (progress of a killed child),
+# 22/21 (flag table, level), using report.py as the parent's failure report.
+
+import logging  # noqa: E402
+import re  # noqa: E402
+import subprocess  # noqa: E402
+import types  # noqa: E402
+
+from src.drawing import report as report_mod  # noqa: E402
+from src.drawing.report import ESCALATABLE_FLAGS, FLAGS, Report  # noqa: E402
+
+_CACHE_PROBE = (
+    "import json, logging, os, sys, time\n"
+    "logging.basicConfig(level=logging.ERROR)\n"           # like the CLI with --quiet
+    "f = os.path.join(os.environ['XDG_CACHE_HOME'], 'ezdxf', 'font_manager_cache.json')\n"
+    "before = os.path.exists(f); m0 = os.path.getmtime(f) if before else None\n"
+    "t = time.perf_counter()\n"
+    "import ezdxf\n"
+    "doc = ezdxf.new('R2010', setup=True)\n"
+    "dt = time.perf_counter() - t\n"
+    "print('RESULT ' + json.dumps({'ok': True, 'cache_at_start': before, 'import_s': dt,\n"
+    "      'rebuilt': os.path.exists(f) and (m0 is None or os.path.getmtime(f) != m0)}))\n")
+
+
+def test_sanitized_env_points_xdg_cache_into_work_dir(tmp_path):
+    env = sanitized_env(str(tmp_path), REPO)
+    assert env["XDG_CACHE_HOME"] == os.path.join(str(tmp_path), ".cache")
+    assert sandbox._inside(env["XDG_CACHE_HOME"], str(tmp_path))
+    assert not sandbox._inside(str(tmp_path), env["XDG_CACHE_HOME"])     # not a constant True
+
+
+def test_font_cache_seeded_and_never_rebuilt_by_the_child(tmp_path):
+    """Issue 20: the child finds ezdxf's font cache and does not rescan the system fonts."""
+    pytest.importorskip("ezdxf")
+    persistent = str(tmp_path / "persistent")
+    # control: without seeding the child starts with no cache and rebuilds it
+    wd0 = tmp_path / "w0"
+    r0 = _run(_CACHE_PROBE, wd0, font_cache=False, timeout_s=90.0)
+    assert r0.exit_code == 0, r0.stderr_tail
+    assert r0.sandbox["font_cache"] == "disabled"
+    assert r0.result["cache_at_start"] is False and r0.result["rebuilt"] is True
+    # seeded: the persistent cache is built once (trusted child), copied into the work dir
+    wd1 = tmp_path / "w1"
+    r1 = _run(_CACHE_PROBE, wd1, font_cache=persistent, timeout_s=90.0)
+    assert r1.exit_code == 0, r1.stderr_tail
+    assert r1.sandbox["font_cache"] == "seeded"
+    assert r1.result["cache_at_start"] is True and r1.result["rebuilt"] is False
+    assert "fontTools" not in r1.stderr_tail and "ERROR" not in r1.stderr_tail
+    src = os.path.join(persistent, "ezdxf", sandbox.FONT_CACHE_FILE)
+    assert sandbox._valid_font_cache(src)
+    m_src = os.path.getmtime(src)
+    # a second job reuses the persistent file (no rebuild) and the child cannot touch it
+    r2 = _run(_CACHE_PROBE, tmp_path / "w2", font_cache=persistent, timeout_s=90.0)
+    assert r2.result["cache_at_start"] is True and r2.result["rebuilt"] is False
+    assert os.path.getmtime(src) == m_src
+    print("ezdxf import+new: unseeded %.3f s, seeded %.3f / %.3f s"
+          % (r0.result["import_s"], r1.result["import_s"], r2.result["import_s"]))
+
+
+def test_font_cache_build_failure_is_not_fatal(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(*a, **kw):
+        calls.append(a)
+        return types.SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(sandbox.subprocess, "run", fake_run)
+    monkeypatch.setattr(sandbox, "_FONT_CACHE_FAILED", {})
+    cache = str(tmp_path / "broken")
+    assert sandbox.ensure_font_cache(cache) is None
+    assert sandbox.ensure_font_cache(cache) is None
+    assert len(calls) == 1                      # the failed build is not retried per job
+    monkeypatch.undo()
+    r = _run("import json; print('RESULT ' + json.dumps({'ok': True}))", tmp_path / "w",
+             font_cache=cache)
+    # undo() restored _FONT_CACHE_FAILED too; a real build into 'broken' may now succeed
+    assert r.result == {"ok": True}
+    assert r.sandbox["font_cache"] in ("seeded", "unavailable")
+
+
+def _box_step(path):
+    pytest.importorskip("OCP")
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.IFSelect import IFSelect_RetDone
+    from OCP.STEPControl import STEPControl_AsIs, STEPControl_Writer
+    w = STEPControl_Writer()
+    w.Transfer(BRepPrimAPI_MakeBox(60.0, 40.0, 20.0).Shape(), STEPControl_AsIs)
+    assert w.Write(str(path)) == IFSelect_RetDone
+    return str(path)
+
+
+@windows_only
+def test_cli_sandboxed_quiet_run_has_empty_stderr_tail(tmp_path):
+    """Issue 20: a normal sandboxed --quiet run leaves nothing in stderr_tail."""
+    step = _box_step(tmp_path / "box.step")
+    out = tmp_path / "out"
+    cache_dir = tmp_path / "font_cache"                         # hermetic: not %LOCALAPPDATA%
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
+               **{sandbox.FONT_CACHE_DIR_ENV: str(cache_dir)})
+    r = subprocess.run([PY, "-m", "src.drawing", step, str(out), "--quiet"], cwd=REPO, env=env,
+                       capture_output=True, timeout=240)
+    line = [ln for ln in r.stdout.decode("utf-8", "replace").splitlines()
+            if ln.startswith("RESULT ")]
+    assert line, r.stderr.decode("utf-8", "replace")[-2000:]
+    res = json.loads(line[-1][len("RESULT "):])
+    assert res["sandbox"]["enabled"] is True                   # precondition: it WAS sandboxed
+    assert res["ok"] is True, res.get("error")
+    assert res["sandbox"]["font_cache"] == "seeded"
+    assert res["sandbox"]["stderr_tail"] == ""
+    # the persistent cache was built in the temp dir (the override took effect)
+    assert any(cache_dir.iterdir()), "font cache not built under the override dir"
+
+
+def test_default_font_cache_dir_env_override(tmp_path, monkeypatch):
+    monkeypatch.delenv(sandbox.FONT_CACHE_DIR_ENV, raising=False)
+    default = sandbox.default_font_cache_dir()
+    assert os.path.normcase(str(tmp_path)) not in os.path.normcase(default)   # precondition
+    monkeypatch.setenv(sandbox.FONT_CACHE_DIR_ENV, str(tmp_path / "fc"))
+    assert sandbox.default_font_cache_dir() == os.path.abspath(str(tmp_path / "fc"))
+    monkeypatch.setenv(sandbox.FONT_CACHE_DIR_ENV, "  ")
+    assert sandbox.default_font_cache_dir() == default
+
+
+# ------------------------------------------------------------- progress --
+
+_PROGRESS_CHILD = (
+    "import os, sys, time\n"
+    "from src.drawing.report import Report, write_progress, progress_path_from_env\n"
+    "rep = Report('box.step', '.', None)\n"
+    "rep.data['input']['source_unit'] = 'mm'\n"
+    "rep.data['geometry']['extents'] = [60.0, 40.0, 20.0]\n"
+    "rep.flag('approval_blank', None, 'blank')\n"
+    "rep.data['timing']['load_s'] = 0.25\n"
+    "assert write_progress(progress_path_from_env(), rep.progress_snapshot('load'))\n"
+    "assert write_progress(progress_path_from_env(), rep.progress_snapshot('views', view='front'))\n"
+    "time.sleep(60)\n")
+
+
+def test_progress_of_a_killed_child_reaches_the_fail_report(tmp_path):
+    """Issue 17: timeout -> SandboxResult.progress -> merge_progress -> a useful report."""
+    r = _run(_PROGRESS_CHILD, tmp_path, timeout_s=4.0, progress_file="progress.json")
+    assert r.sandbox["timed_out"] is True and r.result is None         # precondition
+    assert os.path.isfile(tmp_path / "progress.json")
+    assert isinstance(r.progress, dict) and r.progress["stage"] == "views"
+    assert r.sandbox["last_stage"] == "views" and r.sandbox["progress_error"] is None
+    rep = Report(str(tmp_path / "box.step"), str(tmp_path), None)
+    rep.data["sandbox"] = dict(r.sandbox)
+    rep.merge_progress(r.progress, r.sandbox)
+    code, data = rep.finish(False, "sandbox: " + r.failure_reason())
+    assert code == 1 and data["quality"]["level"] == "none"
+    flags = {f["code"]: f for f in data["quality"]["flags"]}
+    assert "sandbox_timeout" in flags and "views" in flags["sandbox_timeout"]["detail"]
+    assert "front" in flags["sandbox_timeout"]["detail"]
+    assert flags["approval_blank"]["severity"] == "info"              # the child's own flags
+    assert data["quality"]["last_stage"] == "views"
+    assert data["input"]["source_unit"] == "mm"
+    assert data["geometry"]["extents"] == [60.0, 40.0, 20.0]
+    assert data["timing"]["load_s"] == 0.25
+    assert data["timing"]["total_s"] == pytest.approx(r.sandbox["wall_s"]) and \
+        data["timing"]["total_s"] >= 4.0
+
+
+def test_progress_ignored_when_result_present_and_stale_file_removed(tmp_path):
+    # a stale snapshot from an earlier job is removed before the spawn
+    (tmp_path / "progress.json").write_text(json.dumps({"stage": "stale"}), encoding="utf-8")
+    r = _run("import time; time.sleep(30)", tmp_path, timeout_s=2.0, progress_file="progress.json")
+    assert r.sandbox["timed_out"] is True
+    assert r.progress is None and r.sandbox["progress_error"] == "no progress file"
+    # a child that reports a RESULT: the progress file is not read
+    code = ("import json, os\n"
+            "open(os.environ['SRC_DRAWING_PROGRESS_FILE'], 'w').write(json.dumps({'stage': 'x'}))\n"
+            "print('RESULT ' + json.dumps({'ok': True}))\n")
+    r2 = _run(code, tmp_path / "b", progress_file=str(tmp_path / "b" / "p.json"))
+    assert os.path.isfile(tmp_path / "b" / "p.json")                 # precondition: it was written
+    assert r2.result == {"ok": True} and r2.progress is None
+    assert sandbox.PROGRESS_ENV == report_mod.PROGRESS_ENV
+
+
+def test_progress_file_garbage_is_rejected(tmp_path):
+    p = tmp_path / "p.json"
+    p.write_text("[1, 2, 3]", encoding="utf-8")
+    assert sandbox.read_progress(str(p))[0] is None
+    p.write_text("{not json", encoding="utf-8")
+    assert sandbox.read_progress(str(p))[0] is None
+    p.write_text(json.dumps({"stage": "x" * 100}), encoding="utf-8")
+    assert sandbox.read_progress(str(p))[0] == {"stage": "x" * 100}   # control: valid object
+    assert sandbox.read_progress(str(p), max_bytes=10)[0] is None
+
+
+def test_merge_progress_takes_only_plain_known_data(tmp_path):
+    rep = Report(str(tmp_path / "x.step"), str(tmp_path), None)
+    hostile = {"stage": "s" * 5000, "source_unit": 5,
+               "geometry": {"extents": [1.0, 2.0, 3.0], "volume_mm3": {"a": {"b": {"c": 1}}},
+                            "not_a_key": 1},
+               "flags": [{"code": "ok_code", "severity": "warning", "detail": "d" * 5000},
+                         {"code": "bad code!", "severity": "warning"},
+                         {"code": "x", "severity": "fatal"}, "junk"],
+               "warnings": ["w"] + [1, 2], "timing": {"load_s": float("nan"), "views_s": 1.5}}
+    rep.merge_progress(hostile, {"timed_out": True, "killed": True, "wall_s": 9.5,
+                                 "timeout_s": 9.0})
+    code, d = rep.finish(False, "x")
+    assert len(d["quality"]["last_stage"]) == 500
+    assert d["input"]["source_unit"] is None
+    assert d["geometry"]["extents"] == [1.0, 2.0, 3.0] and d["geometry"]["volume_mm3"] is None
+    assert "not_a_key" not in d["geometry"]
+    codes = [f["code"] for f in d["quality"]["flags"]]
+    assert codes.count("ok_code") == 1 and "bad code!" not in codes and "x" not in codes
+    assert len(next(f for f in d["quality"]["flags"] if f["code"] == "ok_code")["detail"]) == 500
+    assert codes.count("sandbox_timeout") == 1 and "sandbox_killed" not in codes
+    assert d["warnings"] == ["w"]
+    assert d["timing"]["load_s"] is None and d["timing"]["views_s"] == 1.5
+    assert d["timing"]["total_s"] == 9.5
+    # no progress at all: the breach flag still names the missing file
+    rep2 = Report(str(tmp_path / "y.step"), str(tmp_path), None)
+    rep2.merge_progress(None, {"memory_exceeded": True, "killed": True, "memory_limit_mb": 512})
+    f = rep2.data["quality"]["flags"][0]
+    assert f["code"] == "sandbox_memory_exceeded" and "no progress file" in f["detail"]
+
+
+# ------------------------------------------------------------ flag table --
+
+_NEW_CODES = {
+    "loose_curves_ignored": "info", "supplemental_shells_ignored": "info",
+    "dimension_extent_mismatch": "warning", "unit_assumed_mm": "info", "unit_suspect": "info",
+    "step_tessellated_only": "warning", "sandbox_timeout": "warning",
+    "hidden_lines_dropped": "warning", "not_a_solid": "warning", "mesh_non_manifold": "warning",
+    "section_fallback": "info", "interior_silhouettes_omitted": "info",
+    "multiple_bodies": "warning", "approval_blank": "info", "faceted_audit_mismatch": "warning",
+    "view_failed": "warning", "section_failed": "warning", "dimensions_failed": "warning",
+    "writer_failed": "warning",
+}
+
+
+def test_flag_table_has_every_code_with_its_severity():
+    for code, sev in _NEW_CODES.items():
+        assert FLAGS.get(code) == sev, code
+    assert set(FLAGS.values()) == {"info", "warning"}
+    assert report_mod.WARNING_FLAGS | report_mod.INFO_FLAGS == set(FLAGS)
+    assert not report_mod.WARNING_FLAGS & report_mod.INFO_FLAGS
+    assert "none" in report_mod.LEVELS
+
+
+def test_every_flag_code_in_the_source_is_in_the_table():
+    """Each ``.flag("code", ...)`` literal in src/drawing is in FLAGS (typo guard)."""
+    pat = re.compile(r"\.flag\(\s*[\"']([A-Za-z0-9_]+)[\"']")
+    found = {}
+    src = os.path.join(REPO, "src", "drawing")
+    for dp, _dn, files in os.walk(src):
+        for fn in files:
+            if fn.endswith(".py"):
+                text = open(os.path.join(dp, fn), encoding="utf-8").read()
+                for m in pat.finditer(text):
+                    found.setdefault(m.group(1), fn)
+    assert len(found) >= 20                                    # precondition: the scan works
+    missing = {c: fn for c, fn in found.items() if c not in FLAGS}
+    assert not missing, missing
+
+
+def test_every_tuple_emitted_flag_code_is_in_the_table_with_its_severity():
+    """Review F5: layout/dimensions/pipeline emit flags as ``("code", "warning"|"info",
+    detail)`` tuples that reach ``Report.flag`` later; each code must be in FLAGS
+    and its literal severity must match the table (or be an allowed escalation)."""
+    pat = re.compile(r"\(\s*[\"']([a-z0-9_]+)[\"']\s*,\s*[\"'](warning|info)[\"']")
+    found = {}
+    src = os.path.join(REPO, "src", "drawing")
+    for dp, _dn, files in os.walk(src):
+        for fn in files:
+            if fn.endswith(".py") and fn != "report.py":
+                text = open(os.path.join(dp, fn), encoding="utf-8").read()
+                for m in pat.finditer(text):
+                    found.setdefault((m.group(1), m.group(2)), fn)
+    codes = {c for c, _s in found}
+    # precondition: the scan sees the layout and dimensions tuple paths
+    assert {"sheet_not_iso5457", "views_overflow", "dimension_extent_mismatch"} <= codes
+    missing = {c: fn for (c, _s), fn in found.items() if c not in FLAGS}
+    assert not missing, missing
+    wrong = {c: (s, FLAGS[c]) for (c, s) in found
+             if s != FLAGS[c] and not (c in ESCALATABLE_FLAGS and s == "warning")}
+    assert not wrong, wrong
+
+
+def test_flag_default_severity_unknown_code_and_escalation(tmp_path, caplog):
+    rep = Report(str(tmp_path / "p.step"), str(tmp_path), None)
+    rep.flag("not_a_solid", detail="50 open components")
+    rep.flag("approval_blank")
+    sev = {f["code"]: f["severity"] for f in rep.data["quality"]["flags"]}
+    assert sev == {"not_a_solid": "warning", "approval_blank": "info"}
+    with pytest.raises(ValueError):
+        rep.flag("no_such_code_xyz")                         # unknown and no severity
+    with caplog.at_level(logging.WARNING, logger="src.drawing.report"):
+        rep.flag("no_such_code_xyz", "info", "typo?")
+        assert any("no_such_code_xyz" in r.getMessage() for r in caplog.records)
+        caplog.clear()
+        rep.flag("unit_assumed_mm", "warning", "5 x 2.5 x 1.375 looks like inch")
+        assert not caplog.records                            # allowed escalation
+        rep.flag("section_fallback", "warning", "wrong")
+        assert any("section_fallback" in r.getMessage() for r in caplog.records)
+    assert rep.has_flag("no_such_code_xyz")
+
+
+def _full_report(tmp_path, **flags):
+    rep = Report(str(tmp_path / "p.step"), str(tmp_path), types.SimpleNamespace(hidden_lines=True))
+    rep.data["route"]["pipeline"] = "brep"
+    rep.data["views"] = [{"name": "front", "algorithm": "hlr_exact"}]
+    rep.data["section"] = {"loops": 2}
+    rep.data["dimensions"] = [{"kind": "linear", "value": 60.0}]
+    for code in flags:
+        rep.flag(code)
+    return rep
+
+
+def test_not_a_solid_caps_level_at_minimal(tmp_path):
+    assert _full_report(tmp_path).finish(True)[1]["quality"]["level"] == "full"   # control
+    code, d = _full_report(tmp_path, not_a_solid=1).finish(True)
+    assert d["quality"]["level"] == "minimal" and code == 2
+    assert _full_report(tmp_path, not_a_solid=1).finish(False, "x")[1]["quality"]["level"] == "none"
+
+
+def test_spawn_failure_sets_the_progress_keys(tmp_path):
+    """Review F5: the spawn-failed path reports the same sandbox keys as the others."""
+    missing_exe = str(tmp_path / "no_such_interpreter.exe")
+    assert not os.path.exists(missing_exe)                      # precondition: spawn must fail
+    r = run_sandboxed([missing_exe, "-c", "pass"], str(tmp_path / "w"), timeout_s=5.0,
+                      memory_limit_mb=256, cpu_limit_s=5.0, output_cap_mb=10,
+                      progress_file="progress.json", font_cache=False)
+    assert r.exit_code == 1 and r.result is None
+    assert str(r.sandbox["result_error"]).startswith("spawn failed")
+    assert r.progress is None
+    assert "last_stage" in r.sandbox and r.sandbox["last_stage"] is None
+    assert r.sandbox["progress_error"] == "spawn failed"
