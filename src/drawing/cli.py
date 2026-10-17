@@ -1,0 +1,321 @@
+"""Command line of the drawing module: ``python -m src.drawing INPUT OUT_DIR [options]``.
+
+Contract (the ``src/convert.py`` pattern):
+
+* stdout carries exactly one line, ``RESULT {json}`` (the quality report),
+  on success and on failure; progress and library output go to stderr
+  (``--quiet`` silences progress).
+* exit 0 = drawing written, no warning flag; 2 = drawing written with
+  warning flags; 1 = failed (usage errors included: ``_Parser`` turns
+  argparse's exit 2 into 1, prints the usage on stderr and nothing on
+  stdout).
+
+Two modes:
+
+* default (sandboxed): the parent sniffs the input and applies the size and
+  triangle caps WITHOUT importing any geometry library, copies the input
+  into a fresh ``tempfile.mkdtemp()`` work directory, writes the options to
+  ``options.json`` there and runs ``python -m src.drawing <copy>
+  <work>/out --no-sandbox --options-json <work>/options.json`` through
+  ``sandbox.run_sandboxed`` (job object, wall timeout, memory limit, CPU
+  backstop = 2 x timeout, output cap on the work directory, sanitized
+  environment). The child's outputs are moved to OUT_DIR, the ``sandbox``
+  section is merged into the result and into ``<stem>.report.json``, and
+  the parent exits with the child's code (1 when the child was killed,
+  timed out, breached a limit or printed no RESULT line).
+* ``--no-sandbox``: ``pipeline.run`` in this process; the report says
+  ``sandbox.enabled false``.
+
+Writing the child's outputs into the work directory (not straight into
+OUT_DIR) is what makes the work-directory output cap of the sandbox cover
+the drawing files.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import logging
+import os
+import shutil
+import sys
+import tempfile
+from typing import List, Optional
+
+from .options import (FORMATS, ORIENTS, PROJECTIONS, SECTIONS, SHEET_CHOICES, STL_TO_STEP, UPS,
+                      VIEW_NAMES, DrawingOptions)
+
+logger = logging.getLogger(__name__)
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 on usage errors, which collides with the 'written
+    with warnings' tier; a usage error means nothing was written -> 1."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _csv(allowed):
+    def parse(text: str):
+        items = tuple(t.strip() for t in str(text).split(",") if t.strip())
+        bad = [t for t in items if t not in allowed]
+        if not items or bad:
+            raise argparse.ArgumentTypeError(
+                f"invalid entry {bad[0] if bad else text!r}; choose from {', '.join(allowed)}")
+        return items
+    return parse
+
+
+def build_parser() -> _Parser:
+    p = _Parser(prog="python -m src.drawing",
+                description="STEP / STL to a 2D engineering drawing (PDF, SVG, DXF) plus a "
+                            "JSON quality report.",
+                epilog="stdout: exactly one line 'RESULT {json}'. exit 0 clean, 2 written "
+                       "with quality warnings, 1 failed.")
+    p.add_argument("input", help="input STEP (.step/.stp) or STL file (detected by content)")
+    p.add_argument("out_dir", help="output directory")
+    p.add_argument("--formats", type=_csv(FORMATS), default=None,
+                   help="comma list of pdf,svg,dxf (default all three)")
+    p.add_argument("--views", type=_csv(VIEW_NAMES), default=None,
+                   help="comma list of views (default front,top,right,iso)")
+    p.add_argument("--section", choices=SECTIONS, default=None, help="section A-A plane (default auto)")
+    p.add_argument("--sheet", choices=SHEET_CHOICES, default=None, help="sheet size (default A3)")
+    p.add_argument("--projection", choices=PROJECTIONS, default=None,
+                   help="first (ISO, default) or third angle")
+    p.add_argument("--orient", choices=ORIENTS, default=None,
+                   help="auto: longest extent = width, shortest = depth (default); fixed: file axes")
+    p.add_argument("--up", choices=UPS, default=None, help="up axis of the file (default z)")
+    p.add_argument("--stl-to-step", dest="stl_to_step", choices=STL_TO_STEP, default=None,
+                   help="STL route: auto (faceted STEP for prismatic meshes), faceted, nurbs, off")
+    p.add_argument("--no-hidden", dest="no_hidden", action="store_true", help="no hidden lines")
+    p.add_argument("--no-hole-positions", dest="no_hole_positions", action="store_true",
+                   help="no hole position dimensions")
+    p.add_argument("--title", default=None, help="drawing title (default: file stem)")
+    p.add_argument("--owner", default=None, help="legal owner field of the title block")
+    p.add_argument("--timeout", dest="timeout_s", type=float, default=None,
+                   help="sandbox wall-clock limit in seconds (default 180, minimum 15)")
+    p.add_argument("--memory-limit-mb", dest="memory_limit_mb", type=int, default=None,
+                   help="sandbox memory limit in MB (default 2048)")
+    p.add_argument("--no-sandbox", dest="no_sandbox", action="store_true",
+                   help="run in this process (no child, no limits)")
+    p.add_argument("--options-json", dest="options_json", default=None, metavar="FILE",
+                   help="DrawingOptions as JSON; explicit flags override it")
+    p.add_argument("--quiet", action="store_true", help="no progress on stderr")
+    return p
+
+
+def options_from_args(args, parser: _Parser) -> DrawingOptions:
+    base = DrawingOptions()
+    if args.options_json:
+        try:
+            with open(args.options_json, "r", encoding="utf-8") as fh:
+                base = DrawingOptions.from_json(fh.read())
+        except (OSError, ValueError) as exc:
+            parser.error(f"--options-json: {exc}")
+    kw = {}
+    for name in ("formats", "views", "section", "sheet", "projection", "orient", "up",
+                 "stl_to_step", "title", "owner", "timeout_s", "memory_limit_mb"):
+        v = getattr(args, name)
+        if v is not None:
+            kw[name] = v
+    if args.no_hidden:
+        kw["hidden_lines"] = False
+    if args.no_hole_positions:
+        kw["hole_positions"] = False
+    if args.quiet:
+        kw["quiet"] = True
+    try:
+        opts = base.with_overrides(**kw)
+        opts.validate()
+    except ValueError as exc:
+        parser.error(str(exc))
+    return opts
+
+
+def _setup_logging(quiet: bool) -> None:
+    root = logging.getLogger()
+    if not any(getattr(h, "_drawing_cli", False) for h in root.handlers):
+        h = logging.StreamHandler(sys.stderr)
+        h._drawing_cli = True                    # type: ignore[attr-defined]
+        h.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        root.addHandler(h)
+    root.setLevel(logging.ERROR if quiet else logging.INFO)
+
+
+@contextlib.contextmanager
+def _stdout_to_stderr(quiet: bool):
+    """Libraries may ``print``; stdout is reserved for the RESULT line."""
+    if quiet:
+        with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink):
+            yield
+    else:
+        with contextlib.redirect_stdout(sys.stderr):
+            yield
+
+
+def _emit(result: dict, stdout) -> None:
+    stdout.write("RESULT " + json.dumps(result, ensure_ascii=False, default=str) + "\n")
+    stdout.flush()
+
+
+def _fail_report(input_path: str, out_dir: str, opts: DrawingOptions, error: str,
+                 sniffed=None, sandbox: Optional[dict] = None):
+    """A failure report built in the parent (no geometry library imported)."""
+    from .report import Report
+    rep = Report(input_path, out_dir, opts)
+    if sniffed is not None:
+        rep.data["input"].update(detected_format=sniffed.kind, size_bytes=sniffed.size_bytes,
+                                 sha256=sniffed.sha256 or None,
+                                 triangles_declared=sniffed.triangles,
+                                 extension=sniffed.extension or None)
+    if sandbox is not None:
+        rep.data["sandbox"] = dict(sandbox)
+    code, data = rep.finish(False, error)
+    try:
+        rep.write(os.path.join(out_dir, f"{rep.stem}.report.json"))
+        data = rep.data
+    except Exception as exc:
+        logger.error("report could not be written: %s", exc)
+    return code, data
+
+
+def _move_outputs(result: dict, out_dir: str, staging: str) -> None:
+    """Move the child's files from the staging dir to ``out_dir``; fix the paths."""
+    os.makedirs(out_dir, exist_ok=True)
+    outputs = result.get("outputs") or {}
+    staging_abs = os.path.abspath(staging)
+    for key, path in list(outputs.items()):
+        if not path:
+            continue
+        src = os.path.abspath(str(path))
+        if os.path.dirname(src) != staging_abs:
+            continue                           # never move anything outside the staging dir
+        dst = os.path.abspath(os.path.join(out_dir, os.path.basename(src)))
+        try:
+            if os.path.isfile(src):
+                shutil.move(src, dst)
+                outputs[key] = dst
+            else:
+                outputs[key] = None
+        except OSError as exc:
+            logger.error("could not move %s to %s: %s", src, dst, exc)
+            outputs[key] = None
+
+
+def _run_sandboxed(input_path: str, out_dir: str, opts: DrawingOptions, stderr) -> tuple:
+    from .report import write_report_json
+    from .sniff import check_limits, sniff
+
+    if not os.path.isfile(input_path):
+        return _fail_report(input_path, out_dir, opts, f"input file not found: {input_path}")
+    try:
+        s = sniff(input_path, max_bytes=int(opts.max_input_mb * 2 ** 20))
+    except OSError as exc:
+        return _fail_report(input_path, out_dir, opts, f"input unreadable: {exc}")
+    err = check_limits(s, opts.max_input_mb, opts.max_triangles)
+    if err is None and s.kind == "unknown":
+        err = "unsupported or corrupt input (neither STEP nor STL by content)"
+    if err:
+        return _fail_report(input_path, out_dir, opts, err, sniffed=s)
+
+    from . import sandbox as sb
+
+    work = tempfile.mkdtemp(prefix="drawing_")
+    try:
+        in_dir = os.path.join(work, "in")
+        staging = os.path.join(work, "out")
+        os.makedirs(in_dir)
+        os.makedirs(staging)
+        local_in = os.path.join(in_dir, os.path.basename(input_path))
+        shutil.copyfile(input_path, local_in)
+        opts_path = os.path.join(work, "options.json")
+        with open(opts_path, "w", encoding="utf-8") as fh:
+            fh.write(opts.to_json())
+        argv = [sys.executable, "-m", "src.drawing", local_in, staging, "--no-sandbox",
+                "--options-json", opts_path]
+        if opts.quiet:
+            argv.append("--quiet")
+        env = sb.sanitized_env(work, REPO_ROOT)
+        res = sb.run_sandboxed(argv, work, timeout_s=float(opts.timeout_s),
+                               memory_limit_mb=int(opts.memory_limit_mb),
+                               cpu_limit_s=2.0 * float(opts.timeout_s),
+                               output_cap_mb=int(opts.output_cap_mb), env=env)
+        box = dict(res.sandbox or {})
+        box["enabled"] = True
+        if not opts.quiet and res.stderr_tail:
+            stderr.write(res.stderr_tail if res.stderr_tail.endswith("\n") else res.stderr_tail + "\n")
+            stderr.flush()
+        result = res.result if isinstance(res.result, dict) else None
+        reason = res.failure_reason()
+        # a clean child failure (RESULT ok false, exit 1) keeps the child's own error
+        if (reason is not None and result is not None and res.exit_code == 1
+                and result.get("ok") is False and not any(
+                    box.get(k) for k in ("timed_out", "memory_exceeded", "cpu_exceeded",
+                                         "output_exceeded", "killed"))):
+            reason = None
+        if result is None:
+            return _fail_report(input_path, out_dir, opts, f"sandbox: {reason or 'no RESULT'}",
+                                sniffed=s, sandbox=box)
+        _move_outputs(result, out_dir, staging)
+        result.setdefault("input", {})["path"] = os.path.abspath(input_path)
+        result["sandbox"] = box
+        code = int(res.exit_code)
+        if reason is not None:                 # limit breach or odd exit code: the run failed
+            child_err = result.get("error")
+            result["ok"] = False
+            result["error"] = f"sandbox: {reason}" + (f"; child: {child_err}" if child_err else "")
+            result["exit_code"] = code = 1
+            result.setdefault("quality", {})["level"] = "none"
+        elif code != int(result.get("exit_code", code)):
+            logger.warning("child exit code %s differs from its RESULT exit_code %s",
+                           code, result.get("exit_code"))
+        stem = os.path.splitext(os.path.basename(input_path))[0] or "drawing"
+        report_path = os.path.abspath(os.path.join(out_dir, f"{stem}.report.json"))
+        result.setdefault("outputs", {})["report"] = report_path
+        write_report_json(result, report_path)
+        return code, result
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    real_stdout = sys.stdout
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    opts = options_from_args(args, parser)
+    _setup_logging(opts.quiet)
+    input_path = os.path.abspath(args.input)
+    out_dir = os.path.abspath(args.out_dir)
+    stderr = sys.stderr
+
+    with _stdout_to_stderr(opts.quiet):
+        try:
+            if args.no_sandbox:
+                from .pipeline import run
+
+                def say(msg):
+                    if not opts.quiet:
+                        print(f"[drawing] {msg}", file=stderr, flush=True)
+
+                code, result = run(input_path, out_dir, opts, log=say)
+            else:
+                code, result = _run_sandboxed(input_path, out_dir, opts, stderr)
+        except Exception as exc:  # noqa: BLE001 - the contract is RESULT, not a traceback
+            logger.exception("drawing CLI failed")
+            code, result = _fail_report(input_path, out_dir, opts, f"{type(exc).__name__}: {exc}")
+    _emit(result, real_stdout)
+    return int(code)
+
+
+__all__ = ["main", "build_parser", "options_from_args"]

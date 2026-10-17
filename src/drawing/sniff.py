@@ -1,0 +1,126 @@
+"""Detect the input kind by content, before any geometry library is imported.
+
+Rules (sandbox probe item 6, all verified on this machine):
+
+* STEP: the text (after an optional UTF-8 BOM and whitespace) starts with
+  ``ISO-10303-21``.
+* Binary STL: file size == 84 + 50 * n where n is the little-endian uint32
+  at byte 80. This rule wins even when the 80-byte header starts with
+  ``solid`` (exporters do that; a header overwritten with ``solid evil``
+  still sniffed as binary).
+* ASCII STL: starts with ``solid`` and has at least one ``facet normal``
+  line; the triangle count is the exact line count (measured: 93 MB /
+  327,680 facets scanned in 0.25 s).
+* Anything else -> ``unknown``: a binary STL truncated by 10 bytes, empty
+  files, random bytes. This matters because ``trimesh.load`` silently
+  returns 0 faces for a truncated binary STL instead of raising.
+
+Only the first 4 kB are read for the kind checks; the whole file is read
+only for the SHA-256 and the ASCII facet count, and neither happens when
+the file is above ``max_bytes`` (pass it from the parent process). The
+facet scan reads lines of at most 64 kB, so memory stays bounded even for
+a "solid..." file without newlines. No numpy, no trimesh.
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import struct
+from dataclasses import dataclass
+from typing import Optional
+
+HEAD_BYTES = 4096
+_CHUNK = 1 << 20
+_MAX_LINE = 1 << 16
+_STEP_MAGIC = b"ISO-10303-21"
+_EXT_FAMILY = {".step": "step", ".stp": "step", ".p21": "step", ".stl": "stl"}
+
+
+@dataclass
+class SniffResult:
+    kind: str                      # "step" | "stl_binary" | "stl_ascii" | "unknown"
+    size_bytes: int
+    triangles: Optional[int]       # declared/scanned for STL, None for STEP
+    sha256: str
+    extension: str                 # lower-case, e.g. ".stp"
+    extension_mismatch: bool
+
+
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(_CHUNK), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _count_facets(path: str) -> int:
+    # readline with a length limit: a "solid..." file without newlines must
+    # not be loaded into memory as one giant line
+    n = 0
+    with open(path, "rb") as fh:
+        while True:
+            line = fh.readline(_MAX_LINE)
+            if not line:
+                break
+            if line.lstrip().startswith(b"facet normal"):
+                n += 1
+    return n
+
+
+def _family(kind: str) -> Optional[str]:
+    if kind == "step":
+        return "step"
+    if kind.startswith("stl"):
+        return "stl"
+    return None
+
+
+def sniff(path: str, compute_hash: bool = True, max_bytes: Optional[int] = None) -> SniffResult:
+    """Classify ``path`` by content. Raises ``OSError`` if it cannot be read.
+
+    ``max_bytes``: when the file is larger, only the 4 kB head is read. The
+    kind comes from the head alone (an ASCII STL is ``stl_ascii`` if the
+    head holds a ``facet normal`` line), ``triangles`` is the binary header
+    count or None, and ``sha256`` is "" (no full-file pass). Callers in the
+    unsandboxed parent pass ``int(max_input_mb * 2**20)`` so an oversized
+    input is never hashed or scanned before ``check_limits`` rejects it.
+    """
+    size = os.path.getsize(path)
+    oversized = max_bytes is not None and size > int(max_bytes)
+    ext = os.path.splitext(path)[1].lower()
+    with open(path, "rb") as fh:
+        head = fh.read(HEAD_BYTES)
+    stripped = head.lstrip(b"\xef\xbb\xbf \t\r\n")
+
+    kind, triangles = "unknown", None
+    if stripped.startswith(_STEP_MAGIC):
+        kind = "step"
+    elif size >= 84 and len(head) >= 84 and 84 + 50 * struct.unpack_from("<I", head, 80)[0] == size:
+        kind, triangles = "stl_binary", int(struct.unpack_from("<I", head, 80)[0])
+    elif stripped[:5].lower() == b"solid":
+        if oversized:
+            if b"facet normal" in head:
+                kind = "stl_ascii"
+        else:
+            n = _count_facets(path)
+            if n > 0:
+                kind, triangles = "stl_ascii", n
+
+    fam = _family(kind)
+    mismatch = fam is not None and _EXT_FAMILY.get(ext) != fam
+    digest = _sha256(path) if (compute_hash and not oversized) else ""
+    return SniffResult(kind=kind, size_bytes=int(size), triangles=triangles, sha256=digest,
+                       extension=ext, extension_mismatch=bool(mismatch))
+
+
+def check_limits(s: SniffResult, max_input_mb: float, max_triangles: int) -> Optional[str]:
+    """Error text when the input breaks a cap, else None."""
+    cap = float(max_input_mb) * 2 ** 20
+    if s.size_bytes > cap:
+        return (f"input is {s.size_bytes / 2 ** 20:.1f} MB, above the "
+                f"{float(max_input_mb):g} MB limit (max_input_mb)")
+    if s.triangles is not None and s.triangles > int(max_triangles):
+        return (f"input has {s.triangles} triangles, above the "
+                f"{int(max_triangles)} limit (max_triangles)")
+    return None
