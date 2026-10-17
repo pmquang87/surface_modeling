@@ -463,12 +463,17 @@ on the same load: `load_step` 61.0 -> 20.5 s, one view with hidden lines
 
 ## Measured numbers
 
-QA corpus run 2 (30 real-world files: NIST CTC/FTC, KiCad, trimesh and OCCT
-samples, scans; sandboxed, default limits, shared machine): median wall time
-9.3 s over the 28 drawn files (4.5–27.6 s apart from the RC buggy), the two
-failing inputs (empty and truncated STL) end in 0.2–0.3 s; peak RSS 294–542 MB
-on parts, 882 MB on the 300k-triangle topology-optimised bracket, 1193 MB on
-the 95-component wheel (limit 2048 MB).
+QA corpus run 3 (30 real-world files: NIST CTC/FTC PMI test parts, Pro/E, NX,
+Inventor, SolidWorks, FreeCAD, KiCad, CadQuery and OCCT exports, trimesh models,
+scans and a topology-optimised bracket; sandboxed, default limits, quiet
+machine): 28 drawings, 2 rejected inputs (empty and truncated STL, exit 1 in
+0.3 s), exit codes 12 × 0 / 16 × 2 / 2 × 1; median wall time 8.3 s over the 28
+drawn files, 101 s for the 15 MB / 211-solid Inventor assembly (hidden lines,
+section and cross-part dimensions omitted and flagged), 33 s for the
+554k-triangle wheel; peak RSS median 326 MB, 713 MB on the assembly, 1193 MB on
+the wheel (limit 2048 MB). Every DXF re-read with 0 audit errors and 0 fixes,
+every PDF opened by PyMuPDF without repair, every SVG parsed. Rendered examples:
+`docs/examples/`.
 
 HLR (front view, this machine):
 
