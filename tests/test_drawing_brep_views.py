@@ -1031,3 +1031,77 @@ def test_auto_section_skip_hint_for_a_model_without_solid():
     _, _, _, unknown = choose_section_plane_brep_info(
         types.SimpleNamespace(shape=None, census=box), [], "auto")
     assert unknown["skip_hint"] is None                 # no census count: no hint
+
+
+# ------------------------------------------------------------------ F7-perf
+
+def test_f7_mesh_cache_meshes_a_shape_once(monkeypatch):
+    """Item F: with a mesh cache the poly route meshes one shape once for all views,
+    even when ``_needs_mesh`` keeps saying True (a face that cannot be meshed);
+    a finer deflection or another shape (the section body) is meshed again."""
+    import src.drawing.brep_views as bv
+    calls = []
+    real = bv.prepare_faceted_shell
+
+    def counting(shape, deflection):
+        calls.append(deflection)
+        return real(shape, deflection)
+    monkeypatch.setattr(bv, "prepare_faceted_shell", counting)
+    monkeypatch.setattr(bv, "_needs_mesh", lambda shape, d: True)   # the unmeshable-face case
+    shape = _box_hole()
+    # negative control: without a cache every view meshes again
+    bv.project_brep(shape, VIEWS["front"], exact=False, deflection=0.05)
+    bv.project_brep(shape, VIEWS["top"], exact=False, deflection=0.05)
+    assert calls == [0.05, 0.05]
+    calls.clear()
+    cache = {}
+    a = bv.project_brep(shape, VIEWS["front"], exact=False, deflection=0.05, mesh_cache=cache)
+    b = bv.project_brep(shape, VIEWS["top"], exact=False, deflection=0.05, mesh_cache=cache)
+    c = bv.project_brep(shape, VIEWS["right"], exact=False, deflection=0.1, mesh_cache=cache)
+    assert calls == [0.05]
+    assert a.stats["meshed"] is True and b.stats.get("mesh_reused") and c.stats.get("mesh_reused")
+    assert b.visible and c.visible
+    bv.project_brep(shape, VIEWS["front"], exact=False, deflection=0.01, mesh_cache=cache)
+    assert calls == [0.05, 0.01]                         # finer request: meshed again
+    bv.project_brep(_box_hole(), VIEWS["front"], exact=False, deflection=0.05, mesh_cache=cache)
+    assert calls == [0.05, 0.01, 0.05]                   # a new shape has its own mesh
+
+
+def test_f7_native_overrun_below_raise_limit_keeps_visible_lines():
+    """Item D: a native HLR step over ``time_budget_s`` but under
+    ``hlr_raise_after_s`` keeps the view without hidden lines instead of raising."""
+    from src.drawing.brep_views import project_brep
+    ref = project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02)
+    assert ref.hidden                                    # precondition
+    with pytest.raises(TimeoutError):                    # the old contract is unchanged
+        project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02, time_budget_s=1e-9)
+    pv = project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02,
+                      time_budget_s=1e-9, hlr_raise_after_s=60.0)
+    assert pv.hidden == [] and pv.stats["hidden_dropped"] is True
+    assert pv.stats["hidden_dropped_reason"] == "time_budget"
+    assert len(pv.visible) >= 1 and pv.stats["raw_hidden_edges"] > 0
+
+
+def test_f7_max_hidden_edges_skips_the_hidden_conversion(monkeypatch):
+    """``max_hidden_edges`` drops the hidden lines before ``edges_to_primitives``
+    ever sees a hidden compound."""
+    import src.drawing.brep_views as bv
+    from src.drawing.model import LineStyle
+    styles = []
+    real = bv.edges_to_primitives
+
+    def spy(compound, deflection, style, **k):
+        styles.append(style)
+        return real(compound, deflection, style, **k)
+    monkeypatch.setattr(bv, "edges_to_primitives", spy)
+    ref = bv.project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02)
+    assert ref.hidden and LineStyle.HIDDEN in styles     # precondition
+    n = ref.stats["raw_hidden_edges"]
+    styles.clear()
+    capped = bv.project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02,
+                             max_hidden_edges=n - 1)
+    assert capped.hidden == [] and capped.stats["hidden_dropped_reason"] == "max_hidden_edges"
+    assert LineStyle.HIDDEN not in styles
+    same = bv.project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02,
+                           max_hidden_edges=n)
+    assert len(same.hidden) == len(ref.hidden)

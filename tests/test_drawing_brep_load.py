@@ -1276,3 +1276,77 @@ def test_hole_filled_by_a_fastener_of_another_solid_is_marked(monkeypatch):
     assert sorted(f.kind for f in brep_features.cylinder_features(thin)) == ["boss", "hole"]
     monkeypatch.setattr(brep_features, "_detect_filled", False)
     assert sorted(f.kind for f in brep_features.cylinder_features(asm)) == ["boss", "hole"]
+
+
+# ---------------------------------------------------------------------------
+# F7-perf: census of large assemblies
+# ---------------------------------------------------------------------------
+
+def _located_copies(n=30, dx=10.0, dy=20.0, dz=30.0):
+    """A compound of ``n`` located copies (shared TShape) of one box, in a row."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.gp import gp_Trsf, gp_Vec
+    box = _box(dx, dy, dz)
+    copies = []
+    for i in range(n):
+        t = gp_Trsf()
+        t.SetTranslation(gp_Vec(15.0 * i, 0.0, 0.0))
+        copies.append(BRepBuilderAPI_Transform(box, t, False).Shape())
+    return _compound(copies)
+
+
+@needs_ocp
+def test_fast_census_groups_located_copies_by_tshape(monkeypatch):
+    """Above ``fast_above_faces`` the census runs BRepCheck and the volume once
+    per unique solid (volume x instances) and the bounded exact bbox; at or
+    below it (and with the default None) the exact whole-shape path runs."""
+    from OCP.TopAbs import TopAbs_SOLID
+    import src.io.step_audit as step_audit
+    from src.drawing import brep_load
+    asm = _located_copies()
+    # precondition: 30 instances (180 faces) of ONE TShape
+    assert _count(asm, TopAbs_SOLID) == 30
+    calls = []
+    real = step_audit.brep_volume
+
+    def spy(shape):
+        calls.append(shape.ShapeType())
+        return real(shape)
+    monkeypatch.setattr(step_audit, "brep_volume", spy)
+
+    fast = brep_load.analyze_shape(asm, fast_above_faces=100).census
+    assert fast["census_mode"] == "fast"
+    assert fast["solids_unique"] == 1 and fast["solid_instances"] == 30
+    assert fast["volume_method"] == "per_unique_solid"
+    assert fast["volume_mm3"] == pytest.approx(30 * 6000.0, rel=1e-9)
+    assert calls == [TopAbs_SOLID]                     # one integration, of the unique solid
+    assert fast["bbox_source"] == "exact_bounded"
+    assert np.allclose(fast["bbox_min"], [0, 0, 0], atol=1e-9)
+    assert np.allclose(fast["bbox_max"], [15.0 * 29 + 10.0, 20.0, 30.0], atol=1e-9)
+    assert fast["brepcheck_valid"] is True
+
+    for gate in (None, 180, 1000):                     # 180 faces: not ABOVE the gate
+        calls.clear()
+        exact = brep_load.analyze_shape(asm, fast_above_faces=gate).census
+        assert exact["census_mode"] == "exact", gate
+        assert "solid_instances" not in exact and exact["bbox_source"] == "exact"
+        assert calls and calls[0] != TopAbs_SOLID       # the whole compound was integrated
+        assert exact["volume_mm3"] == pytest.approx(fast["volume_mm3"], rel=1e-9)
+        assert exact["bbox_min"] == fast["bbox_min"] and exact["bbox_max"] == fast["bbox_max"]
+        assert exact["brepcheck_valid"] is fast["brepcheck_valid"]
+
+
+@needs_ocp
+def test_bounded_exact_bbox_equals_add_optimal_on_curved_parts():
+    """``exact_bbox_bounded`` gives the AddOptimal box bit for bit on a part with
+    a NURBS cylinder (where the loose box is 10 mm too large) and on the plate."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_NurbsConvert
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+    from src.drawing.brep_load import exact_bbox, exact_bbox_bounded, loose_bbox
+    nurbs = BRepBuilderAPI_NurbsConvert(BRepPrimAPI_MakeCylinder(10.0, 20.0).Shape(), True).Shape()
+    for shape in (nurbs, _plate(), _compound([_plate(), nurbs])):
+        ref = exact_bbox(shape)
+        got = exact_bbox_bounded(shape)
+        assert ref is not None and np.array_equal(got, ref)
+    # precondition of the point of it: the loose box of the NURBS cylinder is NOT exact
+    assert float(np.max(np.abs(loose_bbox(nurbs) - exact_bbox(nurbs)))) > 1.0

@@ -413,10 +413,40 @@ def _paper_scale(deflection: float, paper_scale: Optional[float]) -> float:
 
 # ----------------------------------------------------------------- API
 
+def _mesh_once(shape, deflection: float, mesh_cache: Optional[dict], stats: dict) -> None:
+    """Mesh ``shape`` for the poly HLR unless it is already meshed fine enough.
+
+    ``mesh_cache`` (a dict owned by the caller, e.g. one pipeline run) maps
+    ``id(shape)`` to ``(shape, deflection)``; a shape meshed at a deflection
+    <= the requested one is not meshed again. ``_needs_mesh`` alone cannot
+    see that: ``BRepTools.Triangulation_s`` stays False when ANY face could
+    not be meshed, so every view re-ran ``BRepMesh_IncrementalMesh`` (2.3 s
+    per view on the 10665-face RC buggy assembly). The cache keeps a
+    reference to the shape, so the id cannot be reused by another object.
+    """
+    if mesh_cache is not None:
+        hit = mesh_cache.get(id(shape))
+        if hit is not None and hit[0] is shape and float(hit[1]) <= deflection:
+            stats["mesh_reused"] = True
+            return
+    if _needs_mesh(shape, deflection):
+        prepare_faceted_shell(shape, deflection)
+        stats["meshed"] = True
+    if mesh_cache is not None:
+        mesh_cache[id(shape)] = (shape, float(deflection))
+
+
+def _hidden_edge_count(edge_counts: dict) -> int:
+    return int(sum(int(edge_counts.get(k) or 0) for k in _HIDDEN_COMPOUNDS))
+
+
 def project_brep(shape, spec, *, exact: bool, deflection: float, hidden: bool = True,
                  time_budget_s: Optional[float] = None, paper_scale: Optional[float] = None,
                  cover_tol: Optional[float] = None, max_hidden_primitives: Optional[int] = None,
-                 min_fragment_mm: Optional[float] = None) -> ProjectedView:
+                 min_fragment_mm: Optional[float] = None,
+                 max_hidden_edges: Optional[int] = None,
+                 hlr_raise_after_s: Optional[float] = None,
+                 mesh_cache: Optional[dict] = None) -> ProjectedView:
     """Hidden-line projection of ``shape`` for ``spec`` (a ``ViewSpec``).
 
     Returns a ``ProjectedView`` with ``visible`` (style VISIBLE) and
@@ -434,7 +464,17 @@ def project_brep(shape, spec, *, exact: bool, deflection: float, hidden: bool = 
     the view is returned WITHOUT hidden lines and ``stats["hidden_dropped"]``
     is True instead of raising. ``max_hidden_primitives`` (None = no cap)
     drops the hidden lines of a view whose raw hidden primitive count is
-    larger, before the clean-up.
+    larger, before the clean-up. ``max_hidden_edges`` (None = no cap) drops
+    them BEFORE the hidden edges are converted, when the hidden HLR
+    compounds hold more edges than that (``stats["raw_hidden_edges"]``;
+    reason "max_hidden_edges"; 99k-152k per view on the RC buggy assembly).
+
+    ``hlr_raise_after_s`` (default: ``time_budget_s``) is the native-HLR time
+    above which ``TimeoutError`` is raised. When it is larger than the budget
+    and the native step lands between the two, the view is kept: its hidden
+    lines are dropped (reason "time_budget") and the visible ones are
+    extracted (the pipeline's run deadline, F7-perf item D).
+    ``mesh_cache``: see ``_mesh_once`` (poly route; ``stats["mesh_reused"]``).
 
     ``paper_scale`` (paper mm per model mm; default ``0.05 / deflection``,
     the pipeline's deflection rule, which is WRONG where the pipeline clamps
@@ -469,16 +509,16 @@ def project_brep(shape, spec, *, exact: bool, deflection: float, hidden: bool = 
         if exact:
             algo, to_shape = _compounds_exact(shape, spec)
         else:
-            if _needs_mesh(shape, deflection):
-                prepare_faceted_shell(shape, deflection)
-                stats["meshed"] = True
+            _mesh_once(shape, deflection, mesh_cache, stats)
             algo, to_shape = _compounds_poly(shape, spec)
     except Exception as exc:
         raise RuntimeError(f"{algorithm} failed for view {spec.name!r}: {exc}") from exc
     t_hlr = time.perf_counter() - t0
-    if time_budget_s is not None and t_hlr > float(time_budget_s):
+    raise_after = time_budget_s if hlr_raise_after_s is None else hlr_raise_after_s
+    if raise_after is not None and t_hlr > float(raise_after):
         raise TimeoutError(f"{algorithm} for view {spec.name!r} took {t_hlr:.3f} s "
-                           f"> budget {float(time_budget_s):.3f} s")
+                           f"> budget {float(raise_after):.3f} s")
+    hlr_over_budget = time_budget_s is not None and t_hlr > float(time_budget_s)
 
     t1 = time.perf_counter()
     try:
@@ -500,6 +540,15 @@ def project_brep(shape, spec, *, exact: bool, deflection: float, hidden: bool = 
         stats["hidden_dropped"] = True
         stats["hidden_dropped_reason"] = reason
         log.debug("view %s: hidden lines dropped (%s)", spec.name, reason)
+
+    stats["raw_hidden_edges"] = _hidden_edge_count(stats["edge_counts"])
+    if hidden and hlr_over_budget:
+        hidden = False
+        drop_hidden("time_budget")
+    elif hidden and max_hidden_edges is not None and \
+            stats["raw_hidden_edges"] > int(max_hidden_edges):
+        hidden = False
+        drop_hidden("max_hidden_edges")
 
     visible: list = []
     for name in _VISIBLE_COMPOUNDS:

@@ -74,7 +74,7 @@ def _all_non_default():
         classifier_threshold=0.2, max_input_mb=50.0, max_triangles=1000,
         timeout_s=60.0, memory_limit_mb=1024, output_cap_mb=50,
         title="Bracket Ø20", owner="ACME", quiet=True,
-        stl_unit="in", max_hidden_primitives=5000)
+        stl_unit="in", max_hidden_primitives=5000, hidden_lines_force=True)
 
 
 def test_json_round_trip_every_field():

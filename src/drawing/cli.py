@@ -57,6 +57,8 @@ from .options import (FORMATS, ORIENTS, PROJECTIONS, SECTIONS, SHEET_CHOICES, ST
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+#: logger of the pipeline's stage lines (``pipeline.stage_logger``), INFO even under --quiet
+STAGE_LOGGER = "src.drawing.stage"
 
 
 class _Parser(argparse.ArgumentParser):
@@ -126,6 +128,10 @@ def build_parser() -> _Parser:
                    help="drop the hidden lines of a B-rep view with more than N raw hidden "
                         "primitives (flag hidden_lines_dropped; default 20000; 'none' = no cap)")
     p.add_argument("--no-hidden", dest="no_hidden", action="store_true", help="no hidden lines")
+    p.add_argument("--hidden-lines-force", dest="hidden_lines_force", action="store_true",
+                   help="keep hidden lines on large assemblies (more than 20 solids or 50000 "
+                        "raw hidden edges per view; default: omitted, flag "
+                        "hidden_lines_omitted_assembly)")
     p.add_argument("--no-hole-positions", dest="no_hole_positions", action="store_true",
                    help="no hole position dimensions")
     p.add_argument("--title", default=None, help="drawing title (default: file stem)")
@@ -161,6 +167,8 @@ def options_from_args(args, parser: _Parser) -> DrawingOptions:
         kw["hidden_lines"] = False
     if args.no_hole_positions:
         kw["hole_positions"] = False
+    if args.hidden_lines_force:
+        kw["hidden_lines_force"] = True
     if args.quiet:
         kw["quiet"] = True
     try:
@@ -179,6 +187,9 @@ def _setup_logging(quiet: bool) -> None:
         h.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
         root.addHandler(h)
     root.setLevel(logging.ERROR if quiet else logging.INFO)
+    # one line per pipeline stage boundary even under --quiet: the sandbox keeps
+    # the child's stderr tail, which then shows where a killed run died (F7-perf)
+    logging.getLogger(STAGE_LOGGER).setLevel(logging.INFO)
 
 
 @contextlib.contextmanager

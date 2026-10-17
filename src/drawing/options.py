@@ -45,7 +45,7 @@ _FLOAT_FIELDS = ("text_height", "facet_smooth_angle_deg", "feature_angle_deg",
                  "hlr_time_budget_s", "classifier_threshold", "max_input_mb", "timeout_s")
 _INT_FIELDS = ("max_hole_callouts", "faceted_max_triangles", "raster_px", "exact_hlr_max_faces",
                "max_triangles", "memory_limit_mb", "output_cap_mb", "max_hidden_primitives")
-_BOOL_FIELDS = ("hidden_lines", "hole_positions", "quiet")
+_BOOL_FIELDS = ("hidden_lines", "hole_positions", "quiet", "hidden_lines_force")
 
 
 @dataclass
@@ -86,6 +86,11 @@ class DrawingOptions:
     # (NIST CTC/FTC, exact HLR), 185k-193k on the 10665-face RC buggy (poly
     # HLR), whose hidden clean-up alone cost about 14 s per view
     max_hidden_primitives: Optional[int] = 20_000
+    # F7-perf: large assemblies are drawn without hidden lines (more than 20
+    # solid instances, or a view with more than 50000 raw hidden HLR edges;
+    # flag ``hidden_lines_omitted_assembly``). True keeps them (the
+    # ``max_hidden_primitives`` cap and the time budget still apply).
+    hidden_lines_force: bool = False
 
     def __post_init__(self):
         # lists (from JSON or callers) become tuples so options stay hashable-ish

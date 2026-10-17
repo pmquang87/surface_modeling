@@ -101,6 +101,9 @@ FLAGS: Dict[str, str] = {
     "section_fallback": "info",
     "interior_silhouettes_omitted": "info",
     "layout_text_collision": "info",       # layout.py: labels/dimension texts overlap
+    # ---- F7-perf: large assemblies and the run deadline ----
+    "hidden_lines_omitted_assembly": "info",   # large assembly: no hidden lines by design
+    "section_skipped_budget": "warning",   # run deadline near: the section was not drawn
     # sandbox breaches (the run failed; exit 1 regardless of the severity)
     "sandbox_timeout": "warning",
     "sandbox_memory_exceeded": "warning",
@@ -279,6 +282,8 @@ class Report:
             "sheet": {"size": None, "orientation": None, "scale": None, "projection": None,
                       "iso5457": None},
             "outputs": {"pdf": None, "svg": None, "dxf": None, "step": None, "report": None},
+            # dxf_audited: the DXF was re-read and audited (False when skipped; F7-perf)
+            "writers": {"dxf_audited": None},
             "quality": {"level": None, "flags": [], "last_stage": None},
             "warnings": [],
             "timing": {"total_s": None, "load_s": None, "views_s": None, "section_s": None,
@@ -427,7 +432,8 @@ class Report:
         has_dims = any(x.get("kind") == "linear" for x in (d.get("dimensions") or []))
         if not has_section and not d.get("dimensions"):
             return "minimal"
-        hidden = bool(getattr(self.options, "hidden_lines", True))
+        hidden = bool(getattr(self.options, "hidden_lines", True)) and not any(
+            self.has_flag(c) for c in ("hidden_lines_dropped", "hidden_lines_omitted_assembly"))
         poly = any(v.get("algorithm") == "hlr_poly" for v in views)
         if (d["route"].get("pipeline") == "brep" and hidden and has_section and has_dims
                 and not poly and views):

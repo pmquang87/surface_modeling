@@ -43,12 +43,13 @@ exactly one line `RESULT {json}` (the report).
 | `--up` | `z` | `y` rotates a Y-up file to Z-up first |
 | `--stl-to-step` | `auto` | `auto` (faceted when prismatic and ≤ 30k triangles), `faceted`, `nurbs` (smooth reverse engineering, slow), `off` |
 | `--no-hidden` | | omit hidden lines |
+| `--hidden-lines-force` | | keep hidden lines on large assemblies (default: omitted above 20 solids or 50 000 raw hidden edges per view, flag `hidden_lines_omitted_assembly`) |
 | `--no-hole-positions` | | diameter callouts only |
 | `--title`, `--owner` | file stem, empty | title block fields |
 | `--timeout` | 180 s | wall clock of the child (floor 15 s: imports alone cost 4–5 s) |
 | `--memory-limit-mb` | 2048 | committed-memory cap of the child |
 | `--no-sandbox` | | run in-process |
-| `--quiet` | | no progress on stderr |
+| `--quiet` | | no progress on stderr, except one `INFO src.drawing.stage: stage ...` line per stage boundary (elapsed, time left, RSS) |
 
 Programmatic use: `from src.drawing.pipeline import run; code, report = run(path, out_dir, DrawingOptions(...))`.
 
@@ -148,7 +149,12 @@ section 3.8. The parts a consumer should read first:
   `unit_not_mm`, `sheet_not_iso5457`, `approval_blank`. `info` flags:
   `holes_not_detected_mesh_route`, `organic_classified`, `too_many_triangles`,
   `extension_mismatch`, `facet_edges_suppressed`, `hlr_poly_used`,
-  `section_nudged`, `degenerate_faces_removed`.
+  `section_nudged`, `degenerate_faces_removed`, `hidden_lines_omitted_assembly`.
+  `section_skipped_budget` (warning): the run deadline was too close for
+  the section.
+- `writers.dxf_audited`: the DXF was re-read and audited by ezdxf (False
+  above 100 000 sheet items or with less than 10 s left before the run
+  deadline; `writers.dxf_audit_skipped_reason` says which).
 - `route`: pipeline, source, classifier values, the STL→STEP attempt with its
   audit, every fallback with its reason, the orientation permutation.
 - `geometry`: census (B-rep or mesh), exact bbox, volume, area, features.
@@ -185,6 +191,41 @@ with `OPENBLAS_NUM_THREADS=1` (≈ 630 MB without it, which dies under any cap
 below ~650 MB); library imports ≈ 4–5 s per job; `TerminateJobObject` ≈ 3 ms;
 a failed STEP read followed by a transfer exits with 0xC0000005, which the
 parent reports as "input unreadable by OpenCASCADE".
+
+## Large assemblies and the run deadline
+
+- **Census above the face gate** (`exact_hlr_max_faces`, 4000 face
+  instances): BRepCheck and the adaptive volume run once per unique solid
+  (instances grouped by `TShape`, volume x `ScaleFactor^3` per instance,
+  sign flipped for a REVERSED instance) and the bbox is
+  `brep_load.exact_bbox_bounded`: the per-face loose `Add_s` boxes bound a
+  branch and bound, only the faces near the six extremes get `AddOptimal`.
+  The box is bit-identical to `AddOptimal_s` of the whole shape (a loose box
+  would print 0.43 mm too much into the overall dimensions of the RC buggy).
+  `geometry.census_mode` / `bbox_source` / `solid_instances` say which path
+  ran. The section's per-body boxes use the same bounded box.
+- **Hidden lines**: more than 20 solid instances, or a view with more than
+  50 000 raw hidden HLR edges, is drawn without hidden lines
+  (`hidden_lines_omitted_assembly`, info; `--hidden-lines-force` keeps them).
+  The STEP root count is not used: Inventor and `STEPControl_Writer`
+  assemblies arrive as one root.
+- **Run deadline**: 0.8 x `timeout_s` from the start of `pipeline.run`. Each
+  view gets its share of the time left (minus a 25 % section/sheet reserve,
+  at least 2 s, at most `hlr_time_budget_s`); a native HLR step between the
+  share and `hlr_time_budget_s` keeps the visible lines and drops the hidden
+  ones (`hidden_lines_dropped`). With less than 10 % of the budget left the
+  section is skipped (`section_skipped_budget`); the DXF audit needs 10 s.
+- **Mesh once**: the poly HLR meshes the drawn shape once per run (a
+  `mesh_cache` in the pipeline context); `BRepTools.Triangulation_s` stays
+  False when one face cannot be meshed, which made every view re-mesh.
+
+RC buggy front suspension (15 MB Inventor STEP, 211 instances of 91 solids,
+10 665 faces, shared machine, other jobs running): before 112 s in-process
+(load 43.7, views 30.4, section 26.7, write 4.1), after 97 s sandboxed with
+the default 180 s timeout (load 23.1, views 30.4, section 27.1, write 6.9;
+peak RSS 695 MB). In-process A/B on the same load: `load_step` 61.0 -> 20.5 s,
+one view with hidden lines 12.4 s -> without 5.7 s -> with the reused mesh
+5.4 s (HLR 1.97 -> 0.88 s), section 39.7 -> 29.4 s.
 
 ## Measured numbers
 

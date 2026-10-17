@@ -229,7 +229,143 @@ def exact_bbox(shape: Any) -> Optional[np.ndarray]:
         return None
 
 
-def _census(shape: Any, full_check: bool = True) -> Dict[str, Any]:
+def loose_bbox(shape: Any) -> Optional[np.ndarray]:
+    """``(2, 3)`` box by ``BRepBndLib.Add_s`` without triangulation: never smaller
+    than the shape (control hull + tolerance), cheap, but not exact (0.43 mm
+    too large on the RC buggy assembly). None when void or on failure."""
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    try:
+        box = Bnd_Box()
+        BRepBndLib.Add_s(shape, box, False)
+        if box.IsVoid():
+            return None
+        x0, y0, z0, x1, y1, z1 = box.Get()
+        return np.array([[x0, y0, z0], [x1, y1, z1]], dtype=float)
+    except Exception as exc:
+        logger.warning("loose bounding box failed: %s", exc)
+        return None
+
+
+def exact_bbox_bounded(shape: Any) -> Optional[np.ndarray]:
+    """The ``exact_bbox`` box, computed by branch and bound over the faces.
+
+    ``AddOptimal_s`` on a compound is the union of the optimal boxes of its
+    faces (plus edges outside faces and vertices outside edges). The loose
+    ``Add_s`` box of a face is never smaller than its optimal box, so for each
+    of the six box sides the faces are visited in the order of their loose
+    bound and the walk stops as soon as the next loose bound cannot beat the
+    best optimal value found: only the few faces near the extremes are
+    integrated. Measured on the 10665-face RC buggy assembly: 19 faces
+    integrated, 0.31 s instead of 33 s, the box bit-identical to
+    ``exact_bbox``. Shapes with edges outside faces or vertices outside edges
+    (wireframes) use ``exact_bbox``. None when void; raises nothing (falls
+    back to ``exact_bbox`` on any OCCT failure).
+    """
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX
+    from OCP.TopExp import TopExp, TopExp_Explorer
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+    try:
+        if shape is None or shape.IsNull():
+            return None
+        if TopExp_Explorer(shape, TopAbs_EDGE, TopAbs_FACE).More() or \
+                TopExp_Explorer(shape, TopAbs_VERTEX, TopAbs_EDGE).More():
+            return exact_bbox(shape)
+        m = TopTools_IndexedMapOfShape()
+        TopExp.MapShapes_s(shape, TopAbs_FACE, m)
+        faces = [m.FindKey(i) for i in range(1, m.Extent() + 1)]
+        if not faces:
+            return exact_bbox(shape)
+        loose = np.empty((len(faces), 6))
+        for i, f in enumerate(faces):
+            b = Bnd_Box()
+            BRepBndLib.Add_s(f, b, False)
+            loose[i] = (b.Get() if not b.IsVoid()
+                        else (np.inf, np.inf, np.inf, -np.inf, -np.inf, -np.inf))
+        optimal: Dict[int, Optional[np.ndarray]] = {}
+
+        def opt(i: int) -> Optional[np.ndarray]:
+            if i not in optimal:
+                b = Bnd_Box()
+                BRepBndLib.AddOptimal_s(faces[i], b, False, False)
+                optimal[i] = None if b.IsVoid() else np.asarray(b.Get(), float)
+            return optimal[i]
+
+        res = np.empty(6)
+        for k in range(6):
+            sign = -1.0 if k < 3 else 1.0          # the minima as maxima of -x
+            key = sign * loose[:, k]
+            best = -np.inf
+            for i in np.argsort(-key, kind="stable"):
+                if not key[i] > best:
+                    break
+                o = opt(int(i))
+                if o is not None:
+                    best = max(best, sign * float(o[k]))
+            if not math.isfinite(best):
+                return exact_bbox(shape)
+            res[k] = sign * best
+        logger.debug("bounded exact bbox: %d of %d faces integrated", len(optimal), len(faces))
+        return res.reshape(2, 3)
+    except Exception as exc:
+        logger.warning("bounded exact bbox failed (%s); full AddOptimal", exc)
+        return exact_bbox(shape)
+
+
+def _unique_solids(shape: Any) -> Optional[List[tuple]]:
+    """``[(solid at the identity location, FORWARD), [factor per instance]], ...]``
+    grouped by ``TShape``, or None when the shape holds faces outside solids.
+
+    ``factor`` turns the volume of the unique solid into the signed volume of
+    the instance: ``ScaleFactor ** 3`` of its location (negative for a mirror)
+    times -1 for a REVERSED instance. Verified on the RC buggy assembly: the
+    sum over the 211 instances of the per-instance adaptive volume equals
+    the sum over the 91 unique solids times their factors to 1e-12.
+    """
+    from OCP.TopAbs import TopAbs_FACE, TopAbs_FORWARD, TopAbs_REVERSED, TopAbs_SOLID
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+    if TopExp_Explorer(shape, TopAbs_FACE, TopAbs_SOLID).More():
+        return None
+    m = TopTools_IndexedMapOfShape()
+    factors: Dict[int, List[float]] = {}
+    ident = TopLoc_Location()
+    ex = TopExp_Explorer(shape, TopAbs_SOLID)
+    while ex.More():
+        s = ex.Current()
+        ex.Next()
+        idx = m.Add(s.Located(ident).Oriented(TopAbs_FORWARD))
+        f = float(s.Location().Transformation().ScaleFactor()) ** 3
+        if s.Orientation() == TopAbs_REVERSED:
+            f = -f
+        factors.setdefault(idx, []).append(f)
+    if m.Extent() == 0:
+        return None
+    return [(m.FindKey(i), factors.get(i, [])) for i in range(1, m.Extent() + 1)]
+
+
+def _census(shape: Any, full_check: bool = True,
+            fast_above_faces: Optional[int] = None) -> Dict[str, Any]:
+    """The census dict (see ``BrepModel``).
+
+    ``fast_above_faces`` (None = always the exact path): above that many
+    face instances, ``BRepCheck_Analyzer`` and the volume run once per
+    UNIQUE solid (``_unique_solids``: instances grouped by ``TShape``, the
+    volume multiplied by each instance's factor) and the bbox comes from
+    ``exact_bbox_bounded`` (same box as ``AddOptimal_s``, a few faces
+    integrated). Extra keys: ``census_mode`` ("exact" | "fast"),
+    ``bbox_source`` ("exact" | "exact_bounded"), and on the fast path with
+    solids ``solid_instances`` and ``volume_method`` "per_unique_solid".
+    Measured on the RC buggy assembly (211 instances of 91 solids, 10665
+    faces): BRepCheck 4.4 -> 3.4 s, volume 7.9 -> 4.1 s, bbox 21.7 -> 0.3 s.
+    The per-unique volume (291371.87 mm3) agrees with the fixed Gauss volume
+    of the compound (291326.62) to 0.016 %; the adaptive integration of the
+    whole compound gives 292280.79 (+0.31 %), the sum of its own per-instance
+    integrations is again 291371.87.
+    """
     c = _empty_census()
     if shape is None or shape.IsNull():
         return c
@@ -307,9 +443,34 @@ def _census(shape: Any, full_check: bool = True) -> Dict[str, Any]:
                            + _count_unique(fb.GetOpenWires(), TopAbs_EDGE))
     except Exception as exc:
         logger.warning("free-boundary analysis failed: %s", exc)
+
+    fast = fast_above_faces is not None and c["faces"] > int(fast_above_faces)
+    c["census_mode"] = "fast" if fast else "exact"
+    unique = None
+    if fast and c["solids"] > 0 and vol_target is shape:
+        try:
+            unique = _unique_solids(shape)
+        except Exception as exc:
+            logger.warning("unique solid grouping failed (%s); exact census", exc)
+            unique = None
+    if unique is not None:
+        c["solid_instances"] = int(sum(len(f) for _s, f in unique))
+        c["volume_method"] = "per_unique_solid"
+
+    def volume_of(target) -> float:
+        if full_check:
+            return brep_volume(target)       # adaptive Gauss, Precision.Confusion
+        props = GProp_GProps()               # fixed Gauss: exact on planar facets
+        BRepGProp.VolumeProperties_s(target, props)
+        return float(props.Mass())
+
     if full_check:
         try:
-            c["brepcheck_valid"] = bool(BRepCheck_Analyzer(shape).IsValid())
+            if unique is not None:
+                c["brepcheck_valid"] = all(bool(BRepCheck_Analyzer(s).IsValid())
+                                           for s, _f in unique)
+            else:
+                c["brepcheck_valid"] = bool(BRepCheck_Analyzer(shape).IsValid())
         except Exception as exc:
             logger.warning("BRepCheck failed: %s", exc)
             c["brepcheck_valid"] = False
@@ -318,12 +479,10 @@ def _census(shape: Any, full_check: bool = True) -> Dict[str, Any]:
 
     if c["faces"]:
         try:
-            if full_check:
-                vol = brep_volume(vol_target)   # adaptive Gauss, Precision.Confusion
+            if unique is not None:
+                vol = sum(volume_of(s) * sum(f) for s, f in unique if f)
             else:
-                props = GProp_GProps()       # fixed Gauss: exact on planar facets
-                BRepGProp.VolumeProperties_s(vol_target, props)
-                vol = float(props.Mass())
+                vol = volume_of(vol_target)
             c["volume_mm3"] = float(vol) if math.isfinite(vol) else None
         except Exception as exc:
             logger.warning("volume integration failed: %s", exc)
@@ -344,7 +503,8 @@ def _census(shape: Any, full_check: bool = True) -> Dict[str, Any]:
         c["volume_signed_open"] = vol
         c["volume_mm3"] = None
 
-    bb = exact_bbox(shape)
+    bb = exact_bbox_bounded(shape) if fast else exact_bbox(shape)
+    c["bbox_source"] = "exact_bounded" if fast else "exact"
     if bb is not None:
         c["bbox_min"] = [float(v) for v in bb[0]]
         c["bbox_max"] = [float(v) for v in bb[1]]
@@ -390,7 +550,8 @@ def _census_warnings(c: Dict[str, Any], source_unit: str, roots: int) -> List[st
 
 
 def analyze_shape(shape, source_unit: str = "mm", roots: int = 1, *,
-                  full_check: bool = True) -> BrepModel:
+                  full_check: bool = True,
+                  fast_above_faces: Optional[int] = None) -> BrepModel:
     """Census + warnings of an in-memory shape. Never raises on a null shape
     (the census is all zeros, ``bbox_min`` None, ``brepcheck_valid`` False).
 
@@ -405,8 +566,10 @@ def analyze_shape(shape, source_unit: str = "mm", roots: int = 1, *,
     of 3.1 s) but can be off by up to ~2 % on curved B-rep faces, so use it for
     faceted bodies from ``faceted_shape_from_mesh`` (the STL route, whose mesh
     census already has the validity numbers) and keep the default for STEP.
+    ``fast_above_faces``: see ``_census`` (per-unique-solid BRepCheck and
+    volume, bounded exact bbox above that many face instances; None = never).
     """
-    census = _census(shape, full_check=bool(full_check))
+    census = _census(shape, full_check=bool(full_check), fast_above_faces=fast_above_faces)
     return BrepModel(shape=shape, source_unit=source_unit, roots=int(roots),
                      census=census, warnings=_census_warnings(census, source_unit, roots),
                      source_unit_factor=UNIT_FACTORS.get(source_unit))
@@ -821,7 +984,7 @@ def _file_units(reader: Any) -> List[str]:
         return []
 
 
-def load_step(path: str) -> BrepModel:
+def load_step(path: str, fast_census_above_faces: Optional[int] = None) -> BrepModel:
     """Read a STEP file safely and return its ``BrepModel``.
 
     Raises ``ValueError`` when the file is missing, cannot be parsed or
@@ -844,6 +1007,9 @@ def load_step(path: str) -> BrepModel:
     Raises ``TessellatedOnlyError`` (a ``ValueError``) when every drawn face
     is a triangulation without a surface; its ``mesh`` holds the triangles
     for the mesh route.
+
+    ``fast_census_above_faces`` is passed to the census as
+    ``fast_above_faces`` (the pipeline passes ``exact_hlr_max_faces``).
     """
     import os
     if not os.path.isfile(path):
@@ -892,7 +1058,8 @@ def load_step(path: str) -> BrepModel:
             mesh, faces=used, triangles=n_tri, source_unit=source_unit,
             source_unit_factor=factor, roots=roots, bodies=bodies)
 
-    model = analyze_shape(drawn, source_unit=source_unit, roots=roots)
+    model = analyze_shape(drawn, source_unit=source_unit, roots=roots,
+                          fast_above_faces=fast_census_above_faces)
     model.source_unit_factor = factor
     model.bodies = bodies
     model.original_shape = shape

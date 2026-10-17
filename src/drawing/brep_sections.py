@@ -101,17 +101,17 @@ _THIN_RATIO = 0.1          # auto: depth < this x min(width, height) -> thin par
 # ----------------------------------------------------------------- plane choice
 
 def _exact_bbox(shape) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """The ``AddOptimal_s`` box, by ``brep_load.exact_bbox_bounded`` (the same box,
+    integrating only the faces near the extremes): AddOptimal on the bodies near
+    the plane cost 18.6 of the 39.7 s of the RC buggy section (F7-perf)."""
     try:
-        from OCP.Bnd import Bnd_Box
-        from OCP.BRepBndLib import BRepBndLib
+        from .brep_load import exact_bbox_bounded
         if shape is None or shape.IsNull():
             return None
-        box = Bnd_Box()
-        BRepBndLib.AddOptimal_s(shape, box, False, False)
-        if box.IsVoid():
+        bb = exact_bbox_bounded(shape)
+        if bb is None:
             return None
-        x0, y0, z0, x1, y1, z1 = box.Get()
-        return np.array([x0, y0, z0], float), np.array([x1, y1, z1], float)
+        return np.array(bb[0], float), np.array(bb[1], float)
     except Exception as exc:
         log.debug("exact bbox failed: %s", exc)
         return None
@@ -835,7 +835,8 @@ def _body_centroids(shape, parts=None) -> List[np.ndarray]:
 # ----------------------------------------------------------------- API
 
 def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
-                 depth_extent: float, hidden: bool = True) -> SectionView:
+                 depth_extent: float, hidden: bool = True,
+                 time_budget_s: Optional[float] = None) -> SectionView:
     """Cut ``shape`` with the plane (``point``, ``normal``) and view it with ``spec``.
 
     ``normal`` must equal ``spec.n`` (ValueError otherwise). A plane that
@@ -858,6 +859,11 @@ def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
     wires, bodies_sectioned, kept_whole, dropped_whole, cut, common_retries,
     half_space_excess_mm, half_space_excess_tol_mm, excess_bodies, seconds,
     seconds_body.
+
+    ``time_budget_s`` (None = none) is handed to the body's ``project_brep``
+    as its budget with ``hlr_raise_after_s = inf``: an overrun never raises,
+    it only cuts the Python clean-up of the body (hidden lines dropped,
+    visible segments left unmerged; the pipeline's run deadline).
     """
     from .brep_views import project_brep
 
@@ -938,7 +944,14 @@ def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
             kept = _half_space_cut(shape, p, n, stats=hs, bodies=bodies)
         except Exception as exc:
             raise RuntimeError(f"section body cut failed: {exc}") from exc
-        body = project_brep(kept, spec, exact=exact, deflection=deflection, hidden=bool(hidden))
+        if time_budget_s is None:
+            body = project_brep(kept, spec, exact=exact, deflection=deflection,
+                                hidden=bool(hidden))
+        else:
+            budget = max(float(time_budget_s) - (time.perf_counter() - t0), 1e-3)
+            body = project_brep(kept, spec, exact=exact, deflection=deflection,
+                                hidden=bool(hidden), time_budget_s=budget,
+                                hlr_raise_after_s=math.inf)
         t_body = time.perf_counter() - t1
 
     stats = dict(lstats)

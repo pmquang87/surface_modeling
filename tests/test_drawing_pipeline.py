@@ -1422,3 +1422,170 @@ def test_issue3_oriented_bbox_maps_the_file_box_without_a_second_exact_bbox(plat
     c, s = np.cos(0.3), np.sin(0.3)
     assert _permuted_box(np.array([[c, -s, 0], [s, c, 0], [0, 0, 1.0]]), [0, 0, 0],
                          [1, 1, 1]) is None
+
+
+# ------------------------------------------- F7-perf: large assemblies, deadline --
+
+def _plate_row_step(path, n):
+    """STEP of ``n`` located copies of the plate in a row along X (one root)."""
+    from OCP.BRep import BRep_Builder
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.TopoDS import TopoDS_Compound
+    from OCP.gp import gp_Trsf, gp_Vec
+    from src.io.exporters import export_step
+    plate = _plate()
+    b = BRep_Builder()
+    comp = TopoDS_Compound()
+    b.MakeCompound(comp)
+    for i in range(n):
+        t = gp_Trsf()
+        t.SetTranslation(gp_Vec(120.0 * i, 0.0, 0.0))
+        b.Add(comp, BRepBuilderAPI_Transform(plate, t, False).Shape())
+    export_step(comp, str(path))
+    return str(path)
+
+
+@pytest.fixture(scope="module")
+def plate_row_25(tmp_path_factory):
+    if not HAS_OCP:
+        pytest.skip("cadquery-ocp not installed")
+    return _plate_row_step(tmp_path_factory.mktemp("row25") / "row25.step", 25)
+
+
+@needs_ocp
+def test_f7_assembly_drawn_without_hidden_lines_unless_forced(plate_row_25, tmp_path):
+    """Item C: 25 solids (> 20) -> no hidden lines, flag hidden_lines_omitted_assembly
+    (info), level reduced; --hidden-lines-force keeps them."""
+    from src.drawing.pipeline import run
+    o = dict(formats=("svg",), section="off", views=("top", "iso"))
+    code, rep = run(plate_row_25, str(tmp_path / "a"), _opts(**o))
+    assert rep["ok"] is True, rep["error"]
+    assert rep["geometry"]["solids"] == 25                       # precondition: the assembly
+    assert _codes(rep).get("hidden_lines_omitted_assembly") == "info"
+    top = {v["name"]: v for v in rep["views"]}["top"]
+    assert top["hidden"] == 0 and top["hidden_omitted"] == "assembly"
+    assert "hidden_lines_dropped" not in _codes(rep)
+    assert rep["quality"]["level"] != "full"
+    # control: forced, the same top view has the hidden hole walls and no flag
+    _, rep2 = run(plate_row_25, str(tmp_path / "b"), _opts(hidden_lines_force=True, **o))
+    assert rep2["ok"] is True, rep2["error"]
+    top2 = {v["name"]: v for v in rep2["views"]}["top"]
+    assert top2["hidden"] > 0 and "hidden_omitted" not in top2
+    assert "hidden_lines_omitted_assembly" not in _codes(rep2)
+
+
+@needs_ocp
+def test_f7_raw_hidden_edge_cap_omits_hidden_lines(plate_files, tmp_path, monkeypatch):
+    """Item C, second trigger: a view with more raw hidden HLR edges than
+    ``_MAX_HIDDEN_EDGES`` is drawn without them (info flag, not the warning)."""
+    import src.drawing.pipeline as pl
+    o = dict(formats=("svg",), section="off", views=("top",))
+    _, ref = pl.run(plate_files["step"], str(tmp_path / "a"), _opts(**o))
+    assert ref["views"][0]["hidden"] > 0                          # precondition
+    assert "hidden_lines_omitted_assembly" not in _codes(ref)
+    monkeypatch.setattr(pl, "_MAX_HIDDEN_EDGES", 1)
+    _, rep = pl.run(plate_files["step"], str(tmp_path / "b"), _opts(**o))
+    assert rep["views"][0]["hidden"] == 0
+    assert rep["views"][0]["hidden_dropped"] == "max_hidden_edges"
+    assert _codes(rep).get("hidden_lines_omitted_assembly") == "info"
+    assert "hidden_lines_dropped" not in _codes(rep)
+    _, forced = pl.run(plate_files["step"], str(tmp_path / "c"),
+                       _opts(hidden_lines_force=True, **o))
+    assert forced["views"][0]["hidden"] == ref["views"][0]["hidden"]
+
+
+@needs_ocp
+def test_f7_run_deadline_keeps_the_drawing(plate_files, tmp_path, monkeypatch):
+    """Item D: with the run deadline already passed, every view is still drawn
+    (visible lines; hidden dropped -> hidden_lines_dropped), the section is
+    skipped (section_skipped_budget) and the DXF is written without its audit."""
+    import src.drawing.pipeline as pl
+    o = dict(formats=("svg", "dxf"), views=("top", "right"))
+    code0, ref = pl.run(plate_files["step"], str(tmp_path / "a"), _opts(**o))
+    # precondition: with the normal deadline nothing is dropped or skipped
+    assert ref["ok"] is True and ref["section"] is not None and ref["section"]["loops"] > 0
+    assert all(v["hidden"] > 0 for v in ref["views"])
+    assert not {"hidden_lines_dropped", "section_skipped_budget"} & set(_codes(ref))
+    assert ref["writers"]["dxf_audited"] is True
+    monkeypatch.setattr(pl, "_DEADLINE_FRACTION", 1e-9)     # deadline = run start
+    monkeypatch.setattr(pl, "_MIN_VIEW_BUDGET_S", 1e-9)      # tiny time_budget_s per view
+    code, rep = pl.run(plate_files["step"], str(tmp_path / "b"), _opts(**o))
+    assert rep["ok"] is True, rep["error"]
+    assert (tmp_path / "b" / "plate.svg").is_file() and (tmp_path / "b" / "plate.dxf").is_file()
+    views = {v["name"]: v for v in rep["views"]}
+    assert set(views) == {"top", "right"}
+    for name, v in views.items():
+        # the visible lines are all there (past the deadline they may stay unmerged)
+        assert v["visible"] >= {w["name"]: w for w in ref["views"]}[name]["visible"] > 0, name
+        assert v["hidden"] == 0 and v["hidden_dropped"] == "time_budget", name
+    assert _codes(rep).get("hidden_lines_dropped") == "warning"
+    assert _codes(rep).get("section_skipped_budget") == "warning"
+    assert rep["section"] is None
+    assert rep["writers"]["dxf_audited"] is False
+    assert "deadline" in rep["writers"]["dxf_audit_skipped_reason"]
+    assert code == 2
+
+
+@needs_ocp
+def test_f7_dxf_audit_gated_by_sheet_size(plate_files, tmp_path, monkeypatch):
+    """Item E: the DXF re-read audit runs for a normal sheet and is skipped above
+    ``_DXF_AUDIT_MAX_ITEMS`` sheet items (report writers.dxf_audited)."""
+    import src.drawing.pipeline as pl
+    import src.drawing.writers as wr
+    o = dict(formats=("dxf",), section="off", views=("front",))
+    calls = []
+    real = wr.write_dxf
+
+    def spy(sheet, path, *a, **k):
+        calls.append(k.get("audit"))
+        return real(sheet, path, *a, **k)
+    monkeypatch.setattr(wr, "write_dxf", spy)
+    _, rep = pl.run(plate_files["step"], str(tmp_path / "a"), _opts(**o))
+    assert rep["ok"] is True, rep["error"]
+    assert calls == [True] and rep["writers"]["dxf_audited"] is True
+    n_items = rep["writers"]["dxf_items"]
+    assert n_items > 0
+    monkeypatch.setattr(pl, "_DXF_AUDIT_MAX_ITEMS", n_items - 1)
+    _, rep2 = pl.run(plate_files["step"], str(tmp_path / "b"), _opts(**o))
+    assert calls[-1] is False and rep2["writers"]["dxf_audited"] is False
+    assert "sheet items" in rep2["writers"]["dxf_audit_skipped_reason"]
+    assert (tmp_path / "b" / "plate.dxf").stat().st_size > 0
+
+
+@needs_ocp
+def test_f7_write_dxf_audit_switch(tmp_path, monkeypatch):
+    """``write_dxf(audit=False)`` does not re-read the file; the default does."""
+    import ezdxf
+    from src.drawing.model import LineStyle, Segment, Sheet
+    from src.drawing.writers.dxf import write_dxf
+    sheet = Sheet("A3", 420.0, 297.0, items=[Segment((10, 10), (100, 50), LineStyle.VISIBLE)])
+    reads = []
+    real = ezdxf.readfile
+
+    def spy(*a, **k):
+        reads.append(1)
+        return real(*a, **k)
+    monkeypatch.setattr(ezdxf, "readfile", spy)
+    on = write_dxf(sheet, str(tmp_path / "on.dxf"))
+    assert reads == [1] and on["audited"] is True and on["audit_errors"] == 0
+    off = write_dxf(sheet, str(tmp_path / "off.dxf"), audit=False)
+    assert reads == [1] and off["audited"] is False and off["audit_errors"] is None
+    assert off["entities"] == on["entities"] and off["bytes"] > 0
+
+
+@needs_ocp
+def test_f7_stage_lines_on_stderr_under_quiet(plate_files, tmp_path):
+    """Item G: --quiet keeps one 'stage' line per stage boundary on stderr; stdout
+    is still exactly the RESULT line."""
+    proc = _cli([plate_files["step"], str(tmp_path / "o"), "--no-sandbox", "--quiet",
+                 "--formats", "svg"])
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 1 and lines[0].startswith("RESULT "), proc.stdout
+    stage = [ln for ln in proc.stderr.splitlines() if "src.drawing.stage" in ln]
+    text = "\n".join(stage)
+    for s in ("stage sniff", "stage load", "stage views view front", "stage section",
+              "stage write", "stage done"):
+        assert s in text, (s, proc.stderr[-2000:])
+    assert all("elapsed" in ln and "rss" in ln for ln in stage)
+    # nothing else of the progress chatter under --quiet
+    assert "[drawing]" not in proc.stderr

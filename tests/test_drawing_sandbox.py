@@ -613,7 +613,11 @@ def test_cli_sandboxed_quiet_run_has_empty_stderr_tail(tmp_path):
     assert res["sandbox"]["enabled"] is True                   # precondition: it WAS sandboxed
     assert res["ok"] is True, res.get("error")
     assert res["sandbox"]["font_cache"] == "seeded"
-    assert res["sandbox"]["stderr_tail"] == ""
+    # F7-perf item G: --quiet keeps ONLY the pipeline's stage lines (where a killed
+    # child died); no other output (the font-cache noise of issue 20) may remain
+    tail = [ln for ln in res["sandbox"]["stderr_tail"].splitlines() if ln.strip()]
+    assert tail and all(ln.startswith("INFO src.drawing.stage: stage ") for ln in tail), tail
+    assert "stage done" in tail[-1]
     # the persistent cache was built in the temp dir (the override took effect)
     assert any(cache_dir.iterdir()), "font cache not built under the override dir"
 

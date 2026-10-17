@@ -86,16 +86,35 @@ def _faces_with_inversion(shape: Any, cylinders_only: bool = True) -> List[Any]:
     ``inverted`` is True when the face belongs to a solid whose signed volume
     is negative (an inverted solid: every face orientation is flipped, so a
     hole would read as convex). Faces outside any solid are never inverted.
-    The volume is only integrated for solids that have a selected face.
+    The volume is only integrated for solids that have a selected face, and
+    only once per unique solid (``TShape``; F7-perf item H): the instance's
+    sign is the unique solid's sign times that of ``ScaleFactor ** 3`` of
+    its location, flipped for a REVERSED instance (203 integrations, 4.35 s
+    -> one per unique solid on the RC buggy assembly).
     ``body`` is the index of the solid the face belongs to (in explorer
     order), -1 for faces outside any solid.
     """
     from OCP.BRepAdaptor import BRepAdaptor_Surface
     from OCP.GeomAbs import GeomAbs_Cylinder
-    from OCP.TopAbs import TopAbs_FACE, TopAbs_SOLID
+    from OCP.TopAbs import TopAbs_FACE, TopAbs_FORWARD, TopAbs_REVERSED, TopAbs_SOLID
     from OCP.TopExp import TopExp_Explorer
+    from OCP.TopLoc import TopLoc_Location
     from OCP.TopoDS import TopoDS
-    from OCP.TopTools import TopTools_MapOfShape
+    from OCP.TopTools import TopTools_IndexedMapOfShape, TopTools_MapOfShape
+
+    unique = TopTools_IndexedMapOfShape()
+    unique_volume: dict = {}
+    ident = TopLoc_Location()
+
+    def inverted_solid(solid) -> bool:
+        base = solid.Located(ident).Oriented(TopAbs_FORWARD)
+        idx = unique.Add(base)
+        if idx not in unique_volume:
+            unique_volume[idx] = _signed_volume(base)
+        f = float(solid.Location().Transformation().ScaleFactor()) ** 3
+        if solid.Orientation() == TopAbs_REVERSED:
+            f = -f
+        return unique_volume[idx] * f < 0.0
 
     seen = TopTools_MapOfShape()
 
@@ -123,7 +142,7 @@ def _faces_with_inversion(shape: Any, cylinders_only: bool = True) -> List[Any]:
         inverted = False
         if faces and _heal_inverted:
             try:
-                inverted = _signed_volume(solid) < 0.0
+                inverted = inverted_solid(solid)
             except Exception as exc:
                 logger.debug("solid volume failed: %s", exc)
             if inverted:

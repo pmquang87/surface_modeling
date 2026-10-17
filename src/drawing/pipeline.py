@@ -89,6 +89,15 @@ by ``report.PROGRESS_ENV`` (no-op when
 the variable is unset); the CLI parent merges the last snapshot into the
 failure report when the child is killed (QA issue 17).
 
+Large assemblies and the run deadline (F7-perf): the STEP census goes per
+unique solid above ``exact_hlr_max_faces``; more than 20 solids or 50000
+raw hidden edges in a view draw that model / view without hidden lines
+(``hidden_lines_omitted_assembly``, unless ``hidden_lines_force``); the run
+plans to finish by 0.8 x ``timeout_s`` (view budgets, section skip
+``section_skipped_budget``, DXF audit gate ``writers.dxf_audited``); the poly
+HLR meshes the shape once per run (``_Ctx.mesh_cache``). Every stage boundary
+logs one ``src.drawing.stage`` INFO line (kept by the CLI under --quiet).
+
 No output to stdout (the CLI owns it): progress goes to ``logging`` or the
 ``log`` callable; the NURBS converter (which prints) runs under
 ``redirect_stdout(sys.stderr)``.
@@ -125,7 +134,29 @@ _DEPTH_MESH_MARGIN = 1.2          # mesh route: mesh_load.choose_depth_sign_mesh
 # flags the B-rep stage of an STL input produces; forgotten on the mesh fallback
 _BREP_STAGE_FLAGS = ("hlr_poly_used", "section_nudged", "section_open_wires", "section_empty",
                      "holes_not_detected_mesh_route", "facet_edges_suppressed",
-                     "hidden_lines_dropped", "section_fallback")
+                     "hidden_lines_dropped", "section_fallback", "hidden_lines_omitted_assembly",
+                     "section_skipped_budget")
+
+# F7-perf: large assemblies and the cooperative run deadline
+_ASSEMBLY_MIN_SOLIDS = 20         # more solid instances: no hidden lines unless hidden_lines_force
+_MAX_HIDDEN_EDGES = 50_000        # raw hidden HLR edges of one view above which it has none
+_DEADLINE_FRACTION = 0.8          # run deadline = 0.8 x timeout_s after run() started
+_RESERVE_FRACTION = 0.25          # of the run budget kept for section + sheet while drawing views
+_WRITE_RESERVE_FRACTION = 0.1     # of the run budget kept for the sheet and writers
+_MIN_RESERVE_S = 5.0
+_MIN_VIEW_BUDGET_S = 2.0          # a view never gets less (its visible lines are still drawn)
+_DXF_AUDIT_MAX_ITEMS = 100_000    # sheet items above which the DXF is not re-read for the audit
+_DXF_AUDIT_MIN_REMAINING_S = 10.0  # ... and when less time than this is left before the deadline
+
+stage_logger = logging.getLogger("src.drawing.stage")
+
+
+def _rss_mb() -> Optional[float]:
+    try:
+        import psutil
+        return float(psutil.Process().memory_info().rss) / 2 ** 20
+    except Exception:
+        return None
 
 
 class _Failure(Exception):
@@ -159,9 +190,42 @@ class _Ctx:
         self.skip_section: Optional[str] = None      # reason, e.g. "not_a_solid"
         self.skip_overall_dims: Optional[str] = None
         self.progress_path = progress_path_from_env()
+        # cooperative run deadline (F7-perf item D): the sandbox kills the child at
+        # timeout_s; the run plans to finish by 0.8 x timeout_s after this point
+        self.t_start = time.perf_counter()
+        try:                                         # validate() runs later, inside _run
+            self.budget_s = _DEADLINE_FRACTION * float(options.timeout_s)
+            if not (math.isfinite(self.budget_s) and self.budget_s > 0.0):
+                raise ValueError(self.budget_s)
+        except Exception:
+            self.budget_s = _DEADLINE_FRACTION * 180.0
+        self.deadline = self.t_start + self.budget_s
+        # shapes meshed for the poly HLR in this run (brep_views._mesh_once, item F)
+        self.mesh_cache: Dict[int, Any] = {}
+
+    def remaining(self) -> float:
+        """Seconds left before the run deadline (negative when passed)."""
+        return self.deadline - time.perf_counter()
+
+    def reserve(self, fraction: float) -> float:
+        return max(_MIN_RESERVE_S, fraction * self.budget_s)
+
+    def stage_line(self, stage: str, view: Optional[str] = None) -> None:
+        """One INFO line per stage boundary on ``src.drawing.stage`` (kept by the
+        CLI under --quiet, so a killed child's stderr tail shows where it was)."""
+        try:
+            rss = _rss_mb()
+            stage_logger.info("stage %s%s elapsed %.1f s remaining %.1f s rss %s", stage,
+                              f" view {view}" if view else "",
+                              time.perf_counter() - self.t_start, self.remaining(),
+                              "n/a" if rss is None else f"{rss:.0f} MB")
+        except Exception:                            # never fail a run over a log line
+            pass
 
     def progress(self, stage: str, view: Optional[str] = None) -> bool:
-        """Write the progress snapshot (no-op without ``report.PROGRESS_ENV``)."""
+        """Log the stage line and write the progress snapshot (the snapshot is a
+        no-op without ``report.PROGRESS_ENV``)."""
+        self.stage_line(stage, view)
         if not self.progress_path:
             return False
         try:
@@ -330,13 +394,24 @@ def _view_entry(name: str, pv, seconds: float) -> dict:
          "hidden": len(pv.hidden), "seconds": round(float(seconds), 4)}
     if st.get("hidden_dropped"):
         e["hidden_dropped"] = st.get("hidden_dropped_reason") or True
+    if st.get("hidden_omitted"):
+        e["hidden_omitted"] = st.get("hidden_omitted")
+    if st.get("time_budget_s") is not None:
+        e["time_budget_s"] = st.get("time_budget_s")
+    if st.get("mesh_reused"):
+        e["mesh_reused"] = True
     return e
 
 
 def _view_flags(ctx: _Ctx, name: str, pv) -> None:
     """Report flags a projected view asks for (QA issues 3 and 13)."""
     st = pv.stats or {}
-    if st.get("hidden_dropped"):
+    if st.get("hidden_dropped") and st.get("hidden_dropped_reason") == "max_hidden_edges":
+        ctx.rep.flag("hidden_lines_omitted_assembly", "info",
+                     f"view {name}: {st.get('raw_hidden_edges')} raw hidden edges > "
+                     f"{_MAX_HIDDEN_EDGES}: drawn without hidden lines (--hidden-lines-force "
+                     f"keeps them)")
+    elif st.get("hidden_dropped"):
         ctx.rep.flag("hidden_lines_dropped", "warning",
                      f"view {name}: hidden lines omitted ({st.get('hidden_dropped_reason')})")
     if st.get("interior_silhouettes_omitted"):
@@ -391,13 +466,23 @@ def _section_report(ctx: _Ctx, sec, info: Optional[dict] = None) -> None:
 # ------------------------------------------------------------ B-rep stage --
 
 def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
-                strict: bool, solids: Optional[int] = None) -> None:
+                strict: bool, solids: Optional[int] = None,
+                roots: Optional[int] = None) -> None:
     """Features, views and section of an oriented OCCT shape.
 
     ``strict`` (STL inputs): any failure raises ``_BrepStageError`` so the
     caller falls back to the mesh route. Otherwise a failed view is skipped
     and flagged and a failed section is flagged. ``solids``: the census
     solid count (an auto section is skipped for a model without solid).
+
+    F7-perf: more than ``_ASSEMBLY_MIN_SOLIDS`` solids, or a view with more
+    than ``_MAX_HIDDEN_EDGES`` raw hidden HLR edges, is drawn without hidden
+    lines (flag ``hidden_lines_omitted_assembly``, info) unless
+    ``hidden_lines_force``; ``roots`` is only reported. Each view gets a
+    share of the time left before the run deadline (``ctx.remaining()``
+    minus a section/sheet reserve) as its ``time_budget_s``; the section is
+    skipped (``section_skipped_budget``) when less than the sheet reserve is
+    left, and its body projection gets the time left before that reserve.
     """
     import numpy as np
     from . import brep_views
@@ -446,19 +531,46 @@ def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
         ctx.features = []
         ctx.rep.data["geometry"]["features"] = {"holes": None, "bosses": None, "fillets": None}
 
+    # large assembly (F7-perf item C): no hidden lines unless forced. The STEP root
+    # count is not used: Inventor and STEPControl assemblies arrive as ONE root
+    # (the 211-solid RC buggy suspension has roots == 1)
+    hidden_on = bool(opts.hidden_lines)
+    if hidden_on and not opts.hidden_lines_force and solids is not None \
+            and int(solids) > _ASSEMBLY_MIN_SOLIDS:
+        hidden_on = False
+        ctx.rep.flag("hidden_lines_omitted_assembly", "info",
+                     f"{int(solids)} solids > {_ASSEMBLY_MIN_SOLIDS}"
+                     + (f" ({roots} root(s))" if roots is not None else "")
+                     + ": large assembly drawn without hidden lines (--hidden-lines-force "
+                       "keeps them)")
+    max_hidden_edges = None if opts.hidden_lines_force else _MAX_HIDDEN_EDGES
+
     t0 = time.perf_counter()
     views_base = ctx.timing["views_s"]
-    for name in opts.views:
+    for i, name in enumerate(opts.views):
         spec = VIEWS[name]
         ctx.timing["views_s"] = views_base + (time.perf_counter() - t0)   # live for progress
         ctx.progress("views", view=name)
         tv = time.perf_counter()
+        # run deadline (item D): this view's share of the time left before the
+        # section / sheet reserve; never above hlr_time_budget_s, and a native HLR
+        # step between the share and hlr_time_budget_s keeps the visible lines
+        n_left = len(opts.views) - i
+        share = (ctx.remaining() - ctx.reserve(_RESERVE_FRACTION)) / n_left
+        budget = float(min(opts.hlr_time_budget_s, max(share, _MIN_VIEW_BUDGET_S)))
         try:
             pv = brep_views.project_brep(shape, spec, exact=exact, deflection=defl,
-                                         hidden=bool(opts.hidden_lines and name != "iso"),
-                                         time_budget_s=opts.hlr_time_budget_s,
+                                         hidden=bool(hidden_on and name != "iso"),
+                                         time_budget_s=budget,
                                          paper_scale=scale,
-                                         max_hidden_primitives=opts.max_hidden_primitives)
+                                         max_hidden_primitives=opts.max_hidden_primitives,
+                                         max_hidden_edges=max_hidden_edges,
+                                         hlr_raise_after_s=opts.hlr_time_budget_s,
+                                         mesh_cache=ctx.mesh_cache)
+            if pv.stats is not None:
+                pv.stats["time_budget_s"] = round(budget, 3)
+                if opts.hidden_lines and not hidden_on and name != "iso":
+                    pv.stats["hidden_omitted"] = "assembly"
         except TimeoutError as exc:
             if strict:
                 raise _BrepStageError(f"view {name}: {exc}") from exc
@@ -485,6 +597,16 @@ def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
         return
     ctx.progress("section")
     t1 = time.perf_counter()
+    write_reserve = ctx.reserve(_WRITE_RESERVE_FRACTION)
+    if ctx.remaining() < write_reserve:
+        # run deadline (item D): the drawing without the section beats a killed run
+        ctx.rep.flag("section_skipped_budget", "warning",
+                     f"{max(ctx.remaining(), 0.0):.1f} s left before the run deadline "
+                     f"(0.8 x timeout {opts.timeout_s:g} s) < {write_reserve:.1f} s kept for the "
+                     f"sheet: no section view drawn")
+        ctx.rep.data["section"] = None
+        ctx.section = None
+        return
     try:
         census = {"bbox_min": lo.tolist(), "bbox_max": hi.tolist()}
         if solids is not None:
@@ -501,7 +623,9 @@ def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
             spec = _section_spec(normal)
             depth = float(abs(np.dot(hi - lo, np.asarray(normal, float))))
             sec = section_brep(shape, point, normal, spec, exact=exact, deflection=defl,
-                               depth_extent=depth, hidden=False)
+                               depth_extent=depth, hidden=False,
+                               time_budget_s=max(ctx.remaining() - write_reserve,
+                                                 _MIN_VIEW_BUDGET_S))
             sec.marker_view = marker
             _section_report(ctx, sec, info)
             if info.get("reason") == "bbox_centre_fallback":
@@ -623,7 +747,10 @@ def _run_step(ctx: _Ctx) -> None:
         logger.debug("unit sniff failed: %s", exc)
     ctx.progress("load")
     try:
-        model = load_step(ctx.input_path)
+        # above the exact-HLR face gate: per-unique-solid BRepCheck / volume and the
+        # bounded exact bbox (brep_load._census, F7-perf item B)
+        model = load_step(ctx.input_path,
+                          fast_census_above_faces=ctx.options.exact_hlr_max_faces)
     except TessellatedOnlyError as exc:
         ctx.timing["load_s"] += time.perf_counter() - t0
         _run_step_tessellated(ctx, exc)
@@ -640,6 +767,10 @@ def _run_step(ctx: _Ctx) -> None:
                 "edges", "face_types", "brepcheck_valid", "free_edges", "closed",
                 "loose_faces", "volume_scope"):
         g[key] = c.get(key)
+    for key in ("census_mode", "bbox_source", "solids_unique", "solid_instances",
+                "volume_method"):
+        if c.get(key) is not None:
+            g[key] = c.get(key)
     bodies = dict(model.bodies or {})
     if bodies:
         g["bodies"] = bodies
@@ -701,7 +832,7 @@ def _run_step(ctx: _Ctx) -> None:
             + (", depth turned 180 deg" if depth.get("depth_flipped") else ""))
     ctx.progress("loaded")
     _brep_stage(ctx, shape, lo, hi, exact_ok=True, features_on=True, strict=False,
-                solids=c.get("solids"))
+                solids=c.get("solids"), roots=model.roots)
 
 
 def _run_step_tessellated(ctx: _Ctx, exc) -> None:
@@ -1158,8 +1289,24 @@ def _sheet_and_write(ctx: _Ctx) -> None:
     os.makedirs(ctx.out_dir, exist_ok=True)
     for fmt in opts.formats:
         path = _out_path(ctx, fmt)
+        kw = {}
+        if fmt == "dxf":
+            # item E: the re-read audit is skipped for huge sheets or near the deadline
+            n_items = len(getattr(lay.sheet, "items", None) or [])
+            left = ctx.remaining()
+            audit = n_items <= _DXF_AUDIT_MAX_ITEMS and left >= _DXF_AUDIT_MIN_REMAINING_S
+            kw["audit"] = audit
+            w = rep.data.setdefault("writers", {})
+            w["dxf_audited"] = False
+            w["dxf_items"] = n_items
+            if not audit:
+                w["dxf_audit_skipped_reason"] = (
+                    f"{n_items} sheet items > {_DXF_AUDIT_MAX_ITEMS}"
+                    if n_items > _DXF_AUDIT_MAX_ITEMS else
+                    f"{max(left, 0.0):.1f} s left before the run deadline < "
+                    f"{_DXF_AUDIT_MIN_REMAINING_S:g} s")
         try:
-            info = fns[fmt](lay.sheet, path)
+            info = fns[fmt](lay.sheet, path, **kw)
         except Exception as exc:
             rep.flag("writer_failed", "warning", f"{fmt}: {type(exc).__name__}: {exc}")
             continue
@@ -1168,6 +1315,8 @@ def _sheet_and_write(ctx: _Ctx) -> None:
             continue
         rep.data["outputs"][fmt] = path
         written += 1
+        if fmt == "dxf" and isinstance(info, dict):
+            rep.data.setdefault("writers", {})["dxf_audited"] = bool(info.get("audited"))
         if fmt == "dxf" and (info.get("audit_errors") or info.get("audit_fixes")):
             rep.warn(f"dxf audit after re-read: {info.get('audit_errors')} error(s), "
                      f"{info.get('audit_fixes')} fix(es)")

@@ -511,7 +511,7 @@ def stabilise_dxf(path: str, date: datetime.date, version: str = "") -> str:
 
 
 def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE, *,
-              date=None) -> dict:
+              date=None, audit: bool = True) -> dict:
     """Write ``sheet`` as an R2010 DXF in model space (sheet mm).
 
     Returns ``{"bytes", "entities", "layers": {name: count}, "dimensions",
@@ -526,6 +526,11 @@ def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE, 
     stamped into the header dates, and the GUIDs are derived from the
     content (``stabilise_dxf``), so the same sheet and date give the same
     bytes.
+
+    ``audit=False`` skips the re-read audit (``ezdxf.readfile`` +
+    ``audit``, the largest part of the writer's time on big sheets): the
+    result then has ``audited`` False and ``audit_errors`` /
+    ``audit_fixes`` None. ``audited`` is True when the re-read ran.
     """
     logging.getLogger("fontTools").setLevel(logging.CRITICAL)
     import ezdxf
@@ -606,18 +611,21 @@ def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE, 
         entities += 1
         layers[e.dxf.layer] = layers.get(e.dxf.layer, 0) + 1
     audit_errors = audit_fixes = None
-    try:
-        aud = ezdxf.readfile(path).audit()
-        audit_errors, audit_fixes = len(aud.errors), len(aud.fixes)
-        if audit_errors or audit_fixes:
-            log.warning("dxf: audit after re-read: %d errors, %d fixes: %s", audit_errors,
-                        audit_fixes, [f.message for f in aud.fixes][:5])
-    except Exception as exc:
-        log.warning("dxf: re-read for audit failed: %s", exc)
+    audited = False
+    if audit:
+        try:
+            aud = ezdxf.readfile(path).audit()
+            audit_errors, audit_fixes = len(aud.errors), len(aud.fixes)
+            audited = True
+            if audit_errors or audit_fixes:
+                log.warning("dxf: audit after re-read: %d errors, %d fixes: %s", audit_errors,
+                            audit_fixes, [f.message for f in aud.fixes][:5])
+        except Exception as exc:
+            log.warning("dxf: re-read for audit failed: %s", exc)
     return {"bytes": os.path.getsize(path), "entities": entities, "layers": layers,
             "dimensions": n_dims, "dimensions_skipped": dims_skipped,
             "dimension_items_replaced": replaced,
             "dimension_match": "exact" if exact is not None else "geometric",
             "skipped": skipped + dims_skipped,
-            "audit_errors": audit_errors, "audit_fixes": audit_fixes,
+            "audit_errors": audit_errors, "audit_fixes": audit_fixes, "audited": audited,
             "fingerprint_guid": fingerprint}

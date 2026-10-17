@@ -69,6 +69,13 @@
 - **Thicken**: Convert surfaces to solids with uniform wall thickness
 - Uses signed distance fields + marching cubes — inspired by "never-fail" offset techniques
 
+### 📐 2D Engineering Drawings (STEP/STL → PDF/SVG/DXF)
+- `python -m src.drawing part.step out/` writes a basic engineering drawing plus a JSON quality report, with no manual step
+- Orthographic views with hidden lines, isometric view, overall and hole dimensions (`4 x Ø6.5`), one hatched section A-A
+- ISO 5457 sheet (A3 / A4), ISO 7200 title block, first- or third-angle projection, ISO 128 line widths and dash patterns
+- STEP through OpenCASCADE hidden-line removal; STL classified and either converted to a faceted STEP solid or drawn from the mesh with a depth buffer
+- Every job runs in a sandboxed child process (timeout, memory cap, output caps, whole-tree kill); tested on 30 real-world files
+
 ### 🖥️ Professional GUI
 - Dark-themed PySide6 desktop application
 - PyVista-powered 3D viewport with interactive rendering
@@ -118,13 +125,15 @@ python src/main.py
 | `pyvistaqt` | Qt integration for PyVista |
 | `PySide6` | Desktop GUI framework (Qt6) |
 | `networkx` | Graph operations for mesh topology |
+| `scikit-image` | Marching cubes for Shell/Thicken; mask contours for mesh-route drawing outlines |
+| `ezdxf` | DXF writer of the drawing module (layers, DIMENSION and HATCH entities) |
 
 ### Optional Dependencies
 
 | Package | Purpose |
 |---------|---------|
-| `cadquery` / `OCP` | STEP file import/export and NURBS operations via OpenCascade |
-| `scikit-image` | Marching cubes for Shell/Thicken operations |
+| `cadquery` / `OCP` | STEP file import/export, NURBS operations and the B-rep drawing route via OpenCascade |
+| `psutil` | Sandbox resource reporting (peak RSS) and the process-tree kill fallback of the drawing module |
 
 > **Note**: The application works fully without `cadquery`/`OCP`. STEP import/export will be unavailable, but all other features (STL/OBJ, Sub-D, reverse engineering) work out of the box.
 
@@ -285,6 +294,28 @@ Every run re-reads the written file and audits it independently: shell closure (
 
 Machine-readable contract: progress goes to stderr; **stdout carries exactly one line, `RESULT {json}`**, with every audit number. Exit codes: `0` clean, `2` a STEP was written but the audit found something (see `audit_reasons`), `1` failed, nothing usable written. `--volume-tol PCT` turns the volume comparison into a gate (a smooth fit differs from its chord mesh by about 0.1 % on good parts; the faceted mode holds 1e-4 %, i.e. 1e-6 relative, measured on a 63,676-triangle real part).
 
+### Command-line drawing (STEP / STL → PDF, SVG, DXF)
+
+```bash
+python -m src.drawing part.step out/                          # A3, first angle, front/top/right/iso + section A-A, pdf+svg+dxf
+python -m src.drawing part.stl  out/                          # STL: classifier -> faceted STEP -> B-rep drawing, or mesh fallback
+python -m src.drawing part.stl  out/ --stl-unit in            # STL carries no unit; declare it instead of the mm assumption
+python -m src.drawing part.step out/ --sheet A4 --projection third --formats pdf
+python -m src.drawing part.step out/ --views front,top,right,left,iso --section top
+python -m src.drawing part.step out/ --timeout 300 --memory-limit-mb 3072
+python -m src.drawing part.step out/ --no-sandbox --quiet     # in-process (what the sandboxed parent runs as its child)
+```
+
+Outputs in `out/`: `<stem>.pdf`, `<stem>.svg`, `<stem>.dxf`, `<stem>.report.json`, and `<stem>.step` when an STL was converted. The drawing has orthographic views with hidden lines, an isometric view, overall dimensions, hole callouts (`4 x Ø6.5`, counterbores as one feature) with positions, one hatched section A-A with its cutting-plane marker, an ISO 5457 frame and an ISO 7200 title block.
+
+| Input | Route | What you get |
+|-------|-------|--------------|
+| STEP | OpenCASCADE hidden-line removal on the solids (sketch curves, construction wires and PMI shells are filtered out and reported) | exact circles and lines, tangent edges suppressed, hole detection from cylindrical faces, section by boolean cut |
+| STL, prismatic (classifier) | exact faceted STEP solid (written next to the drawing) + polyhedral HLR | the STEP deliverable plus the drawing; no hole callouts (reported) |
+| STL, organic / oversized / damaged | trimesh + numpy depth buffer | silhouettes and feature edges, mask-contour outline, plane section; `quality.level: reduced` |
+
+The quality report (`surface_modeling.drawing.report/1`) records the route and why, classifier values, fallbacks, geometry census (units, validity, closed shells, inverted meshes, components), per-view algorithm and counts, every dimension placed and dropped, section statistics, sheet and scale, sandbox resource usage, and coded flags with severities. Same stdout contract as the converter: one `RESULT {json}` line; exit `0` clean, `2` drawing written with warning flags, `1` failed. Each job runs as a sandboxed child (wall-clock timeout, memory cap, CPU backstop, output caps, whole-tree kill). Details, measured numbers and known gaps: [docs/drawing_module.md](docs/drawing_module.md); service architecture and proposal material: [docs/drawing_service_architecture.md](docs/drawing_service_architecture.md).
+
 ---
 
 ## Project Structure
@@ -320,6 +351,13 @@ python-power-surfacing/
     │   ├── step_census.py               # OpenCascade-free STEP Part 21 census (from stl2step)
     │   ├── step_canonical.py            # canonical STEP text for determinism tests
     │   └── occt_utils.py                # OCCT process state: STEP statics, console printer
+    ├── drawing/                         # STEP/STL -> 2D engineering drawing (python -m src.drawing)
+    │   ├── cli.py, pipeline.py          # CLI + RESULT contract; router STEP -> B-rep, STL -> faceted STEP or mesh
+    │   ├── brep_load.py, brep_features.py, brep_views.py, brep_sections.py   # OCCT census, holes, HLR, sections
+    │   ├── mesh_load.py, mesh_views.py, mesh_sections.py                     # trimesh census, classifier, depth buffer
+    │   ├── dimensions.py, layout.py, style.py, model.py, projection.py       # ISO sheet, dimensions, 2D model
+    │   ├── writers/ (svg.py, dxf.py, pdf.py)                                 # three writers for one Sheet
+    │   └── sandbox.py, report.py, sniff.py, options.py                       # sandboxed worker, quality report
     ├── subd/
     │   ├── __init__.py
     │   ├── catmull_clark.py             # Catmull-Clark subdivision
