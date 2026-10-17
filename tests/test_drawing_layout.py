@@ -225,19 +225,19 @@ def test_plan_hole_positions_on_and_off():
     pos_off = [d for d in _linear(off) if round(d.value, 6) not in overall]
     assert len(pos_on) == 4                       # precondition for the "off" assertion
     assert pos_off == []
-    # QA issue 23: one datum per view and axis. Holes (8, 52) and (50, 30): along X both are
-    # nearer the left edge (8, 50); along Y one is nearer the top and one ties, no majority for
-    # the top edge, so both are measured from the bottom (52, 30)
-    assert sorted(round(d.value, 6) for d in pos_on) == [8.0, 30.0, 50.0, 52.0]
+    # QA round 2 issue 15: the position reference of a group is the hole nearest the datum
+    # corner (bottom-left), so the 4 x Ø6.5 group is measured at (8, 8) and the Ø20 hole at
+    # (50, 30); extension lines stay short instead of crossing the view
+    assert sorted(round(d.value, 6) for d in pos_on) == [8.0, 8.0, 30.0, 50.0]
     assert all(d.view == "top" for d in pos_on)
     horizontal = sorted(round(d.value, 6) for d in pos_on if d.angle_deg == 0.0)
     assert horizontal == [8.0, 50.0]
     bands = {(round(d.value, 6), d.angle_deg): b for d, b in zip(on.dims, on.bands)
              if d.view == "top" and d.kind == "linear"}
     # shorter dims nearer the outline, the overall depth outermost on the left of the top view
-    assert bands[(30.0, 90.0)] == ("left", 0) and bands[(52.0, 90.0)] == ("left", 1)
+    assert bands[(8.0, 90.0)] == ("left", 0) and bands[(30.0, 90.0)] == ("left", 1)
     assert bands[(60.0, 90.0)] == ("left", 2)
-    assert bands[(50.0, 0.0)] == ("bottom", 0) and bands[(8.0, 0.0)] == ("top", 0)
+    assert bands[(8.0, 0.0)] == ("bottom", 0) and bands[(50.0, 0.0)] == ("bottom", 1)
 
 
 def test_plan_cap_moves_groups_to_undimensioned():
@@ -496,10 +496,12 @@ def _strip_texts(sheet):
 
 def test_compose_strip_scale_on_a_reduced_sheet():
     res, _, _ = _compose("first", sheet="A4")
-    assert res.scale == pytest.approx(1 / 5) and res.scale_text == "1:5"     # precondition: reduced
+    # QA round 2 issue 6: the section leaves the side cell for the front column, so the plate on
+    # A4 is drawn at 1:2 (it was 1:5 with the section beside the front view)
+    assert res.scale == pytest.approx(1 / 2) and res.scale_text == "1:2"     # precondition: reduced
     texts = _strip_texts(res.sheet)
-    assert "SCALE 1:5" in texts and "SCALE 1:1" not in texts
-    assert res.sheet.meta["scale_text"] == "1:5"
+    assert "SCALE 1:2" in texts and "SCALE 1:1" not in texts
+    assert res.sheet.meta["scale_text"] == "1:2"
 
 
 def test_compose_first_angle_placement():
@@ -739,9 +741,9 @@ def test_compose_band_offsets_10_plus_7k():
             assert d.base[1] == pytest.approx(g.ymax + off), (d.text, b)
         seen[(d.view, d.text, d.angle_deg)] = (side, k)
     # precondition: several bands on the left, so a layout ignoring k fails
-    assert seen[("top", "30", 90.0)] == ("left", 0) and seen[("top", "52", 90.0)] == ("left", 1)
+    assert seen[("top", "8", 90.0)] == ("left", 0) and seen[("top", "30", 90.0)] == ("left", 1)
     assert seen[("top", "60", 90.0)] == ("left", 2)
-    assert seen[("top", "50", 0.0)] == ("bottom", 0) and seen[("top", "8", 0.0)] == ("top", 0)
+    assert seen[("top", "8", 0.0)] == ("bottom", 0) and seen[("top", "50", 0.0)] == ("bottom", 1)
     lefts = sorted(d.base[0] for d in sh.dimensions if d.view == "top" and d.kind == "linear"
                    and d.angle_deg == 90.0 and d.base[0] < tb.xmin)
     assert np.diff(lefts) == pytest.approx([ST.dim_pitch, ST.dim_pitch])   # distinct lines, 7 mm apart
@@ -846,8 +848,8 @@ def test_compose_iso_view_is_labelled_with_its_own_scale():
     labels = [t for t in sh.items if isinstance(t, Text) and t.text.startswith("ISO (")]
     assert [t.text for t in labels] == [f"ISO ({scale_text(iso_s)})"] == ["ISO (1:1)"]
     a4, _, _ = _compose("first", sheet="A4")
-    assert a4.sheet.meta["iso_scale"] == pytest.approx(0.2)
-    assert [t.text for t in a4.sheet.items if isinstance(t, Text) and t.text.startswith("ISO (")] == ["ISO (1:5)"]
+    assert a4.sheet.meta["iso_scale"] == pytest.approx(0.5)          # round 2 issue 6: A4 at 1:2
+    assert [t.text for t in a4.sheet.items if isinstance(t, Text) and t.text.startswith("ISO (")] == ["ISO (1:2)"]
     (ox, oy), _ = res.placements["iso"]
     bb = views["iso"].bbox
     top = oy + iso_s * bb.ymax
@@ -863,7 +865,7 @@ def test_compose_iso_view_is_labelled_with_its_own_scale():
 
 
 def test_compose_section_marker_clears_the_dimension_bands():
-    from src.drawing.layout import MARKER_ARROW_AT, MARKER_BAND_CLEAR, band_extent
+    from src.drawing.layout import MARKER_ARROW_AT, MARKER_BAND_CLEAR, MARKER_GAP, band_extent
     res, views, plan = _compose("first")
     sh = res.sheet
     assert sh.meta["marker_view"] == "top"
@@ -875,14 +877,22 @@ def test_compose_section_marker_clears_the_dimension_bands():
     shafts = sorted((i for i in sh.items if isinstance(i, Segment) and i.style == LineStyle.CUTTING
                      and abs(i.a[0] - i.b[0]) < TOL), key=lambda i: i.a[0])
     assert len(shafts) == 2
-    assert shafts[0].a[0] == pytest.approx(tb.xmin - (band_extent(ST, k_left) + MARKER_BAND_CLEAR))
+    # QA round 2 issue 14: the plane y = 30 runs through the Ø20 hole centre, whose Y position dim
+    # has its extension line on the cutting line on the banded left side: that whole end moves
+    # past the outermost band (line, overshoot and a far-side text) instead of lying on the
+    # extension line; no narrow chain is drawn any more
+    outer_line = ST.dim_first_offset + (k_left - 1) * ST.dim_pitch
+    start = outer_line + max(ST.ext_overshoot, ST.dim_text_gap + ST.text_height) + MARKER_GAP
+    assert start > band_extent(ST, k_left) - ST.dim_pitch + ST.ext_overshoot
+    assert shafts[0].a[0] == pytest.approx(tb.xmin - (start + MARKER_ARROW_AT - MARKER_GAP))
     assert shafts[1].a[0] == pytest.approx(tb.xmax + MARKER_ARROW_AT)
-    # a narrow chain joins the wide dash to the far arrow, on the banded side only
-    chain = [i for i in sh.items if isinstance(i, Segment) and i.style == LineStyle.CENTER]
-    assert len(chain) == 1
-    xs = sorted([chain[0].a[0], chain[0].b[0]])
-    assert chain[0].a[1] == pytest.approx(y_cut) and chain[0].b[1] == pytest.approx(y_cut)
-    assert xs == pytest.approx([shafts[0].a[0], tb.xmin - (ST.section_dash_len - 3.0)])
+    assert [i for i in sh.items if isinstance(i, Segment) and i.style == LineStyle.CENTER] == []
+    wide = sorted((i for i in sh.items if isinstance(i, Segment) and i.style == LineStyle.CUTTING
+                   and abs(i.a[1] - i.b[1]) < TOL), key=lambda i: min(i.a[0], i.b[0]))
+    assert len(wide) == 2 and all(w.a[1] == pytest.approx(y_cut) for w in wide)
+    assert max(wide[0].a[0], wide[0].b[0]) == pytest.approx(tb.xmin - start)
+    assert min(wide[1].a[0], wide[1].b[0]) == pytest.approx(tb.xmax + MARKER_GAP)
+    assert MARKER_BAND_CLEAR > 0
     # arrows and letters keep clear of every dimension item
     letters = [t for t in sh.items if isinstance(t, Text) and t.text == "A"]
     dim_boxes = [BBox2D.of_primitives([sh.items[i]]) for g in sh.meta["dimension_items"] for i in g]
@@ -1362,7 +1372,8 @@ def test_compose_without_the_collision_pass_would_overlap(monkeypatch):
     bands = [b for d, b in zip(plan.dims, plan.bands) if d.kind == "linear"] + [None, None]
     res, _, _ = _compose(plan=DimensionPlan(dims=dims, undimensioned=[], bands=bands))
     assert _overlapping_texts(res.sheet)
-    assert ("layout_text_collision", "info") in [f[:2] for f in res.flags]
+    # QA round 2 issue 10: leftover overlaps are a warning (was info)
+    assert ("layout_text_collision", "warning") in [f[:2] for f in res.flags]
 
 
 # ---- issue 4: the cutting-line connector does not run through a dimension text --
@@ -1376,14 +1387,17 @@ def test_compose_cutting_line_avoids_the_depth_dimension_text():
     depth = [d for d in res.sheet.dimensions if d.view == "top" and d.angle_deg == 90.0]
     assert len(depth) == 1 and depth[0].text == "20"
     # precondition: the plane is at mid-depth = the depth dimension's midpoint, so the centred
-    # text (text_offset 0) sits on the cutting line
+    # text (text_offset 0) sits on the cutting line's extension
     y_cut = res.placements["top"][0][1] + res.scale * 10.0
     assert 0.5 * (depth[0].p1[1] + depth[0].p2[1]) == pytest.approx(y_cut)
     marker = [i for i in res.sheet.items if isinstance(i, Segment) and i.style in (LineStyle.CUTTING, LineStyle.CENTER)]
     centred = next(i for i in render_dimension(Dimension(**{**depth[0].__dict__, "text_offset": 0.0}), ST)
                    if isinstance(i, Text))
-    assert any(_seg_hits_box(m, BBox2D.of_primitives([centred])) for m in marker)
-    assert depth[0].text_offset != 0.0
+    # QA round 2 issue 14: with bands on that side the wide dash ends before the first dimension
+    # line and no connector runs past the bands (round 1 crossed this text and shifted it), so the
+    # centred text is clear and stays centred
+    assert not any(_seg_hits_box(m, BBox2D.of_primitives([centred])) for m in marker)
+    assert depth[0].text_offset == 0.0
     for name, box in _text_boxes(res.sheet):
         for m in marker:
             assert not _seg_hits_box(m, box), (name, m)
@@ -1445,7 +1459,7 @@ def test_callout_room_is_the_exact_rendered_reach():
                 reach[i] = max(reach[i], v)
         assert max(reach) > 0.0                                   # precondition: callouts reach out
         assert room["top"] == pytest.approx(tuple(reach), abs=1e-6)
-    assert res.scale == pytest.approx(1 / 5)
+    assert res.scale == pytest.approx(1 / 2)                      # A4 (round 2 issue 6: was 1:5)
 
 
 # ---- issue 26: bosses / fillets recorded, concentric bore without positions --
@@ -1488,6 +1502,9 @@ def test_section_hatch_small_region_gets_lines_or_fill():
     assert spacing == 3.0
     assert len(hatch_lines([small], spacing, 45.0)) <= 1          # precondition: the old single spacing
     sec = SectionView(VIEWS["front"], np.zeros(3), np.array([0.0, -1.0, 0.0]), [big, small, tiny], None)
+    # QA round 2 issue 3: the fill is decided per body, so the tiny piece is a body of its own here
+    # (in one body with the big region it is hatched, see test_section_fill_is_decided_per_body)
+    sec.loop_body = [0, 0, 1]
     items, stats = _section_items(sec, (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 121.5, 40))
     hatches = [i for i in items if isinstance(i, HatchLines)]
     assert len(hatches) == 2
@@ -1514,7 +1531,598 @@ def test_section_thin_strip_is_filled_at_any_angle():
     assert _min_width(big) == pytest.approx(40.0)
     for strip in (diag, flat):
         sec = SectionView(VIEWS["front"], np.zeros(3), np.array([0.0, -1.0, 0.0]), [big, strip], None)
+        sec.loop_body = [0, 1]                    # round 2 issue 3: the strip is a body of its own
         items, stats = _section_items(sec, (0.0, 0.0), 1.0, ST, BBox2D.from_points(np.vstack([big, strip])))
         fills = [i for i in items if isinstance(i, Polygon)]
         assert len(fills) == 1 and np.allclose(fills[0].points, strip) and stats["filled_regions"] == 1
         assert len([i for i in items if isinstance(i, HatchLines)]) == 1          # only the big region
+
+
+# =========================================================================
+# QA round 2 (task R4-layout): issues 3, 6, 7, 10, 13, 14, 17 (room), 28, 30
+# =========================================================================
+
+def _sec_of(loops, bodies=None, spec="front"):
+    sec = SectionView(VIEWS[spec], np.zeros(3), -VIEWS[spec].n, [np.asarray(lp, float) for lp in loops], None)
+    if bodies is not None:
+        sec.loop_body = list(bodies)
+    return sec
+
+
+def _ring(r_out, r_in, n=256, c=(0.0, 0.0)):
+    a = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False)
+    u = np.column_stack([np.cos(a), np.sin(a)])
+    return [np.asarray(c, float) + r_out * u, np.asarray(c, float) + r_in * u[::-1]]
+
+
+def _hatch_angles(h):
+    d = h.segments[:, 1, :] - h.segments[:, 0, :]
+    return set(np.round(np.degrees(np.arctan2(d[:, 1], d[:, 0])) % 180.0, 6))
+
+
+# ---- issue 3: section fill per body from the mean thickness 2A/P --------------------
+
+STRIP = [[0, 0], [20, 0], [20, 1.5], [0, 1.5]]
+U_WALL = [[30, 0], [50, 0], [50, 20], [48.5, 20], [48.5, 1.5], [31.5, 1.5], [31.5, 20], [30, 20]]
+
+
+def test_section_fill_is_decided_per_body_from_the_mean_thickness():
+    from src.drawing.layout import _min_width, _section_items
+    # precondition: the round 1 per-region rule (bbox / hull caliper < 2 mm) fills the straight
+    # piece and hatches the U piece of the same 1.5 mm wall (mixed, the 08 / 14 defect)
+    assert _min_width(np.array(STRIP, float)) < 2.0 < _min_width(np.array(U_WALL, float))
+    items, stats = _section_items(_sec_of([STRIP, U_WALL]), (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 50, 20))
+    fills = [i for i in items if isinstance(i, Polygon)]
+    hatched = [i for i in items if isinstance(i, HatchLines) and len(i.segments)]
+    assert len(fills) == 2 and not hatched
+    assert stats["fill"] == "solid" and stats["filled_regions"] == 2
+    assert stats["filled_area_fraction"] == pytest.approx(1.0)
+    assert stats["body_thickness"][0] == pytest.approx(2 * (30 + 85.5) / (43 + 117), rel=1e-6)
+
+
+def test_section_thin_region_in_a_thick_body_is_hatched_not_filled():
+    from src.drawing.layout import _section_items
+    big = [[0, 0], [80, 0], [80, 40], [0, 40]]
+    strip = [[0, 50], [60, 50], [60, 51.5], [0, 51.5]]
+    one = _sec_of([big, strip])                                  # no loop_body: one body
+    items, stats = _section_items(one, (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 80, 51.5))
+    assert not [i for i in items if isinstance(i, Polygon)]      # one part, one treatment
+    hatches = [i for i in items if isinstance(i, HatchLines)]
+    assert len(hatches) == 2 and all(len(h.segments) >= 2 for h in hatches)
+    assert stats["fill"] == "hatch" and stats["hatch_spacings"] == [3.0, pytest.approx(0.7)]
+    two = _sec_of([big, strip], bodies=[0, 1])                   # control: the strip as its own body
+    items2, stats2 = _section_items(two, (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 80, 51.5))
+    assert len([i for i in items2 if isinstance(i, Polygon)]) == 1 and stats2["fill"] == "mixed"
+
+
+def test_section_thin_ring_is_filled_or_finely_hatched():
+    from src.drawing.layout import _section_items
+    thin = _sec_of(_ring(40.0, 39.2))
+    items, stats = _section_items(thin, (0.0, 0.0), 1.0, ST, BBox2D(-40, -40, 40, 40))
+    fills = [i for i in items if isinstance(i, Polygon)]
+    hatches = [i for i in items if isinstance(i, HatchLines) and len(i.segments)]
+    assert fills or (hatches and max(stats["hatch_spacings"]) <= 0.7 + 1e-9)
+    assert stats["body_thickness"][0] == pytest.approx(0.8, rel=0.01)
+    # a 4 mm ring is hatched at about t / 3, not at the section spacing (3 mm, round 1: a hull of 80 mm)
+    ring4 = _sec_of(_ring(40.0, 36.0))
+    items4, stats4 = _section_items(ring4, (0.0, 0.0), 1.0, ST, BBox2D(-40, -40, 40, 40))
+    assert hatch_spacing(ST, 80.0) == 3.0
+    assert not [i for i in items4 if isinstance(i, Polygon)]
+    assert stats4["hatch_spacings"] == [pytest.approx(4.0 / 3.0, rel=0.01)]
+
+
+# ---- issue 28: one hatch angle / phase per body ---------------------------------------
+
+def test_section_hatch_alternates_per_body():
+    from src.drawing.layout import _section_items
+    a = [[0, 0], [30, 0], [30, 30], [0, 30]]
+    b = [[30, 0], [60, 0], [60, 30], [30, 30]]
+    c = [[60, 0], [90, 0], [90, 30], [60, 30]]
+    one, _ = _section_items(_sec_of([a, b, c]), (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 90, 30))
+    h1 = [i for i in one if isinstance(i, HatchLines)]
+    assert len(h1) == 3 and all(_hatch_angles(h) == {45.0} for h in h1)     # control: one body
+    three, stats = _section_items(_sec_of([a, b, c], bodies=[7, 3, 9]), (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 90, 30))
+    h3 = {round(float(h.loops[0][:, 0].min())): h for h in three if isinstance(h, HatchLines)}
+    # bodies ranked by id: 3 -> 45, 7 -> 135, 9 -> 45 with a half-spacing phase shift
+    assert _hatch_angles(h3[30]) == {45.0} and _hatch_angles(h3[0]) == {135.0} and _hatch_angles(h3[60]) == {45.0}
+    nrm = np.array([-math.sin(math.pi / 4), math.cos(math.pi / 4)])
+    sp = stats["hatch_spacing"]
+    ph_b = (h3[30].segments[0, 0] @ nrm) % sp
+    ph_c = (h3[60].segments[0, 0] @ nrm) % sp
+    assert abs(((ph_c - ph_b) % sp) - 0.5 * sp) < 1e-6
+    assert stats["bodies"] == 3
+
+
+# ---- issue 6: alternative section placements before a smaller scale -----------------
+
+def _to220_views():
+    return _box_views(28.525, 4.455, 10.25)
+
+
+def _to220_section():
+    loops = [np.array([[0, 0], [28.525, 0], [28.525, 4.455], [0, 4.455]], float)]
+    return SectionView(VIEWS["top"], np.array([14.0, 2.2, 5.1]), np.array([0.0, 0.0, 1.0]), loops, None,
+                       label="A", marker_view="front")
+
+
+def _to220_plan(views):
+    hole = _hole(24.4, 2.2, 1.87, z=5.125, length=4.455, axis=(0.0, 1.0, 0.0))
+    return plan_dimensions(views, [hole], DrawingOptions(), ST, np.array([28.525, 4.455, 10.25]))
+
+
+def test_choose_scale_tries_other_section_cells(monkeypatch):
+    import src.drawing.layout as layout_mod
+    # measured: the triage's 12.7 mm deep variant already fits 1:2 with the side cell; at 50.8 mm
+    # the side cell costs 1:5 and the front column keeps 1:2
+    boxes = {"front": BBox2D(0, 0, 304.8, 203.2), "top": BBox2D(0, 0, 304.8, 50.8),
+             "right": BBox2D(0, 0, 50.8, 203.2), "section": BBox2D(0, 0, 304.8, 50.8)}
+    bands = {"front": (1, 1, 0, 0), "top": (1, 0, 0, 0)}
+    monkeypatch.setattr(layout_mod, "_SECTION_ALTERNATIVES", False)
+    s_old, _ = choose_scale(boxes, bands, SHEETS["A3"], ST, "first", True, True)
+    monkeypatch.setattr(layout_mod, "_SECTION_ALTERNATIVES", True)
+    s, info = choose_scale(boxes, bands, SHEETS["A3"], ST, "first", True, True)
+    assert s_old is not None and s_old < 0.5                   # precondition: the side cell costs a step
+    assert s >= 0.5
+    assert info["section_mode"] in ("cell", "free")
+    assert info["scale_candidates"][-1][:2] == (s, True)
+    assert all(not ok for sc, ok, _ in info["scale_candidates"][:-1])
+
+
+def test_compose_to220_keeps_5_to_1_with_a_section(monkeypatch):
+    import src.drawing.layout as layout_mod
+    views = _to220_views()
+    plan = _to220_plan(views)
+    monkeypatch.setattr(layout_mod, "_SECTION_ALTERNATIVES", False)
+    old, _, _ = _compose(views=views, section=_to220_section(), plan=plan)
+    monkeypatch.setattr(layout_mod, "_SECTION_ALTERNATIVES", True)
+    res, _, _ = _compose(views=views, section=_to220_section(), plan=plan)
+    assert old.scale < 5.0                                      # precondition: the side cell drops a step
+    assert res.scale == 5.0 and not res.overflow
+    rects = {n: r for n, (_, r) in res.placements.items()}
+    names = sorted(rects)
+    for i, a in enumerate(names):                               # no two view rectangles overlap
+        for b in names[i + 1:]:
+            assert not _boxes_overlap(rects[a], rects[b]), (a, b)
+    assert res.sheet.meta["scale_candidates"][-1][:2] == (5.0, True)
+
+
+# ---- issue 7: cap position bands at 3 per side when that wins a scale --------------
+
+def _deep_plan(W=2400.0, H=680.0, D=300.0, n_pos=12):
+    # measured (probe over W): at W = 2400 the 13 left bands (10 + 7 x 13 = 101 mm) cost 1:10 -> 1:20
+    # on A3; capped at 3 position bands (38 mm) the drawing keeps 1:10
+    views = _box_views(W, D, H, iso=False)
+    fb, tb = views["front"].bbox, views["top"].bbox
+    dims = [Dimension("linear", format_value(W), W, p1=(0.0, 0.0), p2=(W, 0.0), base=(W / 2, 0.0),
+                      angle_deg=0.0, view="front"),
+            Dimension("linear", format_value(H), H, p1=(0.0, 0.0), p2=(0.0, H), base=(0.0, H / 2),
+                      angle_deg=90.0, view="front"),
+            Dimension("linear", format_value(D), D, p1=(0.0, 0.0), p2=(0.0, D), base=(0.0, D / 2),
+                      angle_deg=90.0, view="top")]
+    bands = [("bottom", 0), ("left", n_pos), ("left", 0)]
+    for i in range(n_pos):
+        y = (i + 1) * H / (n_pos + 2)
+        dims.append(Dimension("linear", format_value(y), y, p1=(0.0, 0.0), p2=(W / 2, y), base=(0.0, y / 2),
+                              angle_deg=90.0, view="front"))
+        bands.append(("left", i))
+    assert fb.width == W and tb.height == D
+    return views, DimensionPlan(dims=dims, undimensioned=[], bands=bands)
+
+
+def test_compose_caps_deep_position_bands_to_keep_the_scale(monkeypatch):
+    import src.drawing.layout as layout_mod
+    views, plan = _deep_plan()
+    monkeypatch.setattr(layout_mod, "POSITION_BAND_CAP", None)        # no cap: the old behaviour
+    old, _, _ = _compose(views=views, section=None, plan=plan)
+    monkeypatch.setattr(layout_mod, "POSITION_BAND_CAP", 3)
+    res, _, _ = _compose(views=views, section=None, plan=plan)
+    assert old.scale == pytest.approx(1 / 20) and len(old.sheet.dimensions) == 15     # precondition
+    assert res.scale == pytest.approx(1 / 10)
+    pos = [d for d in res.sheet.dimensions if d.view == "front" and d.angle_deg == 90.0 and d.value < 680.0]
+    assert len(pos) == 3 and sorted(d.value for d in pos) == pytest.approx([680 / 14 * k for k in (1, 2, 3)])
+    overall = {d.text for d in res.sheet.dimensions if d.value in (2400.0, 680.0, 300.0)}
+    assert overall == {"2400", "680", "300"}                         # never drop overall dims
+    dropped = [u for u in res.plan.undimensioned if u.get("reason") == "layout_space"]
+    assert len(dropped) == 9 and all(u["view"] == "front" for u in dropped)
+    assert plan.undimensioned == [] and len(plan.dims) == 15         # the caller's plan is untouched
+    assert ("layout_dims_dropped", "info") in [f[:2] for f in res.flags]
+    # the outermost left band now holds the overall height
+    k = band_counts(res.plan)["front"]
+    assert k[0] == 4
+
+
+def test_compose_does_not_cap_when_the_scale_does_not_improve():
+    views, plan = _deep_plan(W=86.0, H=68.0, D=30.0)
+    res, _, _ = _compose(views=views, section=None, plan=plan)
+    assert len(res.sheet.dimensions) == 15 and not [u for u in res.plan.undimensioned
+                                                     if u.get("reason") == "layout_space"]
+
+
+# ---- issue 10: leftover text collisions are a warning ----------------------------
+
+def test_compose_leftover_collision_is_a_warning_and_moves_are_info(monkeypatch):
+    import src.drawing.layout as layout_mod
+    views = _plate_views()
+    plan = _plan(views=views, hole_positions=False)
+    dims = [d for d in plan.dims if d.kind == "linear"] + [
+        Dimension("diameter", "4 x Ø6.5", 6.5, center=(92.0, 52.0), radius=3.25, base=(92.0, 52.0),
+                  leader_angle_deg=45.0, view="top", count=4),
+        Dimension("diameter", "4 x Ø12.7", 12.7, center=(92.0, 52.0), radius=3.25, base=(92.0, 52.0),
+                  leader_angle_deg=45.0, view="top", count=4)]
+    bands = [b for d, b in zip(plan.dims, plan.bands) if d.kind == "linear"] + [None, None]
+    crowded = DimensionPlan(dims=dims, undimensioned=[], bands=bands)
+    res, _, _ = _compose(plan=crowded)
+    codes = {f[0]: f[1] for f in res.flags}
+    assert codes.get("layout_text_moved") == "info" and "layout_text_collision" not in codes
+    monkeypatch.setattr(layout_mod, "_resolve_text_collisions", lambda *a, **k: {})
+    bad, _, _ = _compose(plan=crowded)
+    assert _overlapping_texts(bad.sheet)                                 # precondition
+    assert ("layout_text_collision", "warning") in [f[:2] for f in bad.flags]
+    assert "layout_text_moved" not in [f[0] for f in bad.flags]
+
+
+def test_callout_leader_never_runs_over_the_marker():
+    from src.drawing.layout import _segments_intersect
+    assert _segments_intersect((0, 0), (10, 0), (5, -1), (5, 1))
+    assert not _segments_intersect((0, 0), (10, 0), (11, -1), (11, 1))
+    assert not _segments_intersect((0, 0), (10, 0), (0, 1), (10, 1))
+    assert _segments_intersect((0, 0), (10, 0), (5, 0), (12, 0))            # collinear overlap
+    views = _box_views(100.0, 60.0, 15.0, iso=False)
+    top = views["top"]
+    views["top"] = ProjectedView(top.spec, list(top.visible) + [Circle((47.0, 58.0), 1.0)], [], top.bbox,
+                                 "hlr_exact")
+    call = Dimension("diameter", "Ø2", 2.0, center=(47.0, 58.0), radius=1.0, base=(47.0, 58.0),
+                     leader_angle_deg=45.0, view="top")
+    plan = DimensionPlan(dims=[call], undimensioned=[], bands=[None])
+    sec = SectionView(VIEWS["right"], np.array([50.0, 30.0, 7.5]), np.array([1.0, 0.0, 0.0]),
+                      [np.array([[0, 0], [60, 0], [60, 15], [0, 15]], float)], None, marker_view="top")
+    res, _, _ = _compose(views=views, section=sec, plan=plan)
+    sh = res.sheet
+    marker = [i for i in sh.items if isinstance(i, Segment) and i.style == LineStyle.CUTTING]
+    (ox, oy), _ = res.placements["top"]
+    s = res.scale
+    planned = [i for i in render_dimension(_compose_sheet_callout(call, res, views), ST) if isinstance(i, Segment)]
+    assert any(_segments_intersect(p.a, p.b, m.a, m.b) for p in planned for m in marker)   # precondition
+    g = sh.meta["dimension_items"][0]
+    leader = [sh.items[i] for i in g if isinstance(sh.items[i], Segment)]
+    for p in leader:
+        for m in marker:
+            assert not _segments_intersect(p.a, p.b, m.a, m.b), (p, m)
+    assert sh.dimensions[0].leader_angle_deg != 45.0 and (ox, oy, s)
+
+
+def _compose_sheet_callout(d, res, views):
+    """The callout as compose would draw it unmoved (the planned 45 degree leader)."""
+    from src.drawing.layout import _dim_to_sheet
+    (ox, oy), _ = res.placements[d.view]
+    s = res.scale
+    bb = views[d.view].bbox
+    geom = BBox2D(ox + s * bb.xmin, oy + s * bb.ymin, ox + s * bb.xmax, oy + s * bb.ymax)
+    return _dim_to_sheet(d, None, (ox, oy), s, geom, ST)
+
+
+# ---- issue 13: the wide cutting-line ends start outside the outline ----------------
+
+def test_marker_wide_ends_start_outside_the_view():
+    from src.drawing.layout import _marker_geometry, _marker_items, _segment_hits_box
+    views = _box_views(10.0, 10.0, 2.0, iso=False)
+    sec = SectionView(VIEWS["top"], np.array([5.0, 5.0, 1.0]), np.array([0.0, 0.0, 1.0]),
+                      [np.array([[0, 0], [10, 0], [10, 10], [0, 10]], float)], None, marker_view="top")
+    boxes = {k: v.bbox for k, v in views.items()}
+    geo = _marker_geometry(sec, views, boxes)
+    assert geo is not None and geo[0] == "front"                # the top view sees the plane face-on
+    s = 5.0
+    geom = BBox2D(0.0, 0.0, s * 10.0, s * 2.0)
+    items = _marker_items(geo, (0.0, 0.0), s, ST, "A")
+    cutting = [i for i in items if isinstance(i, Segment) and i.style == LineStyle.CUTTING]
+    assert len(cutting) == 4
+    g = geom.expanded(0.5)
+    for c in cutting:
+        assert not g.contains(c.a) and not g.contains(c.b), c
+        assert not _segment_hits_box(c.a, c.b, g), c
+    wide = [c for c in cutting if abs(c.a[1] - c.b[1]) < 1e-9]
+    assert sorted(round(min(abs(c.a[0] - x), abs(c.b[0] - x)), 6) for c, x in zip(
+        sorted(wide, key=lambda c: c.a[0]), (0.0, 50.0))) == [1.5, 1.5]
+
+
+# ---- issue 14: the marker keeps off dimension and extension lines ------------------
+
+def _segs_collinear_overlap(p, q, tol=0.1):
+    a, b = np.asarray(p.a, float), np.asarray(p.b, float)
+    c, d = np.asarray(q.a, float), np.asarray(q.b, float)
+    u = b - a
+    L = np.linalg.norm(u)
+    if L < 1e-9:
+        return False
+    u /= L
+    n = np.array([-u[1], u[0]])
+    if abs((c - a) @ n) > tol or abs((d - a) @ n) > tol:
+        return False
+    lo, hi = sorted([(c - a) @ u, (d - a) @ u])
+    return min(hi, L) - max(lo, 0.0) > 1e-6
+
+
+def _plate_hole_case():
+    views = _box_views(100.0, 50.0, 10.0, iso=False)
+    top = views["top"]
+    views["top"] = ProjectedView(top.spec, list(top.visible) + [Circle((30.0, 25.0), 5.0)], [], top.bbox,
+                                 "hlr_exact")
+    hole = _hole(30.0, 25.0, 5.0, z=5.0, length=10.0)
+    plan = plan_dimensions(views, [hole], DrawingOptions(), ST, np.array([100.0, 50.0, 10.0]))
+    sec = SectionView(VIEWS["right"], np.array([30.0, 25.0, 5.0]), np.array([1.0, 0.0, 0.0]),
+                      [np.array([[0, 0], [50, 0], [50, 10], [0, 10]], float)], None, label="A", marker_view="top")
+    return views, plan, sec
+
+
+def test_marker_does_not_lie_on_extension_lines_or_cross_dimension_lines():
+    from src.drawing.layout import _segments_intersect
+    views, plan, sec = _plate_hole_case()
+    pos30 = [d for d in plan.dims if d.view == "top" and d.angle_deg == 0.0 and d.text == "30"]
+    assert len(pos30) == 1                                       # precondition: the hole position dim
+    res, _, _ = _compose(views=views, section=sec, plan=plan)
+    sh = res.sheet
+    assert sh.meta["marker_view"] == "top"
+    dim_idx = {i for g in sh.meta["dimension_items"] for i in g}
+    dim_segs = [sh.items[i] for i in dim_idx if isinstance(sh.items[i], Segment)]
+    cutting = [i for i in sh.items if isinstance(i, Segment) and i.style == LineStyle.CUTTING]
+    center = [i for i in sh.items if isinstance(i, Segment) and i.style == LineStyle.CENTER]
+    x_cut = res.placements["top"][0][0] + res.scale * 30.0
+    ext30 = [s for s in dim_segs if abs(s.a[0] - x_cut) < 1e-6 and abs(s.b[0] - x_cut) < 1e-6]
+    assert ext30                                                 # precondition: an extension line on the trace
+    for c in cutting:
+        for s in dim_segs:
+            assert not _segs_collinear_overlap(c, s), (c, s)
+    for c in center:
+        for s in dim_segs:
+            assert not _segments_intersect(c.a, c.b, s.a, s.b), (c, s)
+    # both wide ends are still drawn, on the trace, outside the view
+    wide = [c for c in cutting if abs(c.a[0] - c.b[0]) < 1e-9 and abs(c.a[0] - x_cut) < 1e-6]
+    assert len(wide) == 2
+    # and everything the marker draws stays in the reserved rect of the top view
+    rect = res.placements["top"][1]
+    for it in cutting + center:
+        _assert_inside(BBox2D.of_primitives([it]), rect, ("marker", it))
+
+
+def test_marker_with_bands_on_its_side_has_no_connector_across_them():
+    sec = _section()
+    sec.plane_point = np.array([50.0, 22.0, 7.5])                 # off every hole centre and quadrant
+    res, views, plan = _compose("first", section=sec)
+    sh = res.sheet
+    k_left = band_counts(plan)["top"][0]
+    assert sh.meta["marker_view"] == "top" and k_left == 3       # precondition: bands on the cut side
+    center = [i for i in sh.items if isinstance(i, Segment) and i.style == LineStyle.CENTER]
+    assert center == []
+    tb = _geom_box(res, views, "top")
+    first_line = tb.xmin - ST.dim_first_offset
+    wide_left = [i for i in sh.items if isinstance(i, Segment) and i.style == LineStyle.CUTTING
+                 and abs(i.a[1] - i.b[1]) < 1e-9 and max(i.a[0], i.b[0]) < tb.xmin]
+    assert len(wide_left) == 1
+    assert min(wide_left[0].a[0], wide_left[0].b[0]) > first_line   # stops before the first dimension line
+    assert max(wide_left[0].a[0], wide_left[0].b[0]) == pytest.approx(tb.xmin - 1.5)
+    # the letter sits beyond the arrow head, not on the first dimension line, and no dimension
+    # line or text is touched by any marker item (extension lines run parallel to this cutting
+    # line; an arrow shaft crossing one at a right angle is accepted)
+    letters = [t for t in sh.items if isinstance(t, Text) and t.text == "A"]
+    dims = [sh.items[i] for g in sh.meta["dimension_items"] for i in g]
+    marker = [i for i in sh.items if getattr(i, "style", None) == LineStyle.CUTTING] + letters
+    for m in marker:
+        mb = BBox2D.of_primitives([m])
+        for d in dims:
+            if isinstance(d, Segment) and abs(d.a[1] - d.b[1]) > 1e-9:
+                assert not _seg_hits_box(d, mb.expanded(0.1)), (m, d)
+            elif isinstance(d, Text):
+                assert not _boxes_overlap(BBox2D.of_primitives([d]), mb), (m, d)
+
+
+# ---- issue 17 (room part): a text wider than its span goes outside, inside the rect --
+
+def test_compose_places_a_wide_text_outside_its_span_and_reserves_it():
+    views = _box_views(100.0, 40.0, 15.0, iso=False)
+    assert views["front"].bbox.width == 100.0
+    dims = [Dimension("linear", "100", 100.0, p1=(0.0, 0.0), p2=(100.0, 0.0), base=(50.0, 0.0),
+                      angle_deg=0.0, view="front"),
+            Dimension("linear", "2.25", 2.25, p1=(0.0, 0.0), p2=(2.25, 0.0), base=(1.125, 0.0),
+                      angle_deg=0.0, view="front")]
+    plan = DimensionPlan(dims=dims, undimensioned=[], bands=[("bottom", 1), ("bottom", 0)])
+    res, _, _ = _compose(views=views, section=None, plan=plan, sheet="A4")
+    sh = res.sheet
+    k = [i for i, d in enumerate(sh.dimensions) if d.text == "2.25"][0]
+    d = sh.dimensions[k]
+    g = sh.meta["dimension_items"][k]
+    t = next(sh.items[i] for i in g if isinstance(sh.items[i], Text))
+    tbox = BBox2D.of_primitives([t])
+    span = abs(d.p2[0] - d.p1[0])
+    assert tbox.width + 2 * ST.dim_text_gap > span               # precondition: the text does not fit
+    ext = [sh.items[i] for i in g if isinstance(sh.items[i], Segment)
+           and abs(sh.items[i].a[0] - sh.items[i].b[0]) < 1e-9]
+    assert len(ext) == 2
+    for e in ext:
+        assert not _seg_hits_box(e, tbox), e
+    # the text sits beyond the hole end (inside the view's extent), not past the datum edge; the
+    # layout sets the offset itself, so the room it reserved is what is drawn
+    assert tbox.xmin > max(d.p1[0], d.p2[0]) and d.text_offset > 0.0
+    _assert_inside(BBox2D.of_primitives([sh.items[i] for i in g]), res.placements["front"][1], "2.25")
+
+
+def test_outside_text_avoids_the_extension_lines_of_outer_bands():
+    views, plan = _deep_plan()
+    res, _, _ = _compose(views=views, section=None, plan=plan)
+    sh = res.sheet
+    k = [i for i, d in enumerate(sh.dimensions) if d.text == "48.57"][0]
+    d = sh.dimensions[k]
+    g = sh.meta["dimension_items"][k]
+    tbox = BBox2D.of_primitives([next(sh.items[i] for i in g if isinstance(sh.items[i], Text))])
+    assert tbox.height + 2 * ST.dim_text_gap > abs(d.p2[1] - d.p1[1])          # precondition: outside
+    # past the hole end the 145.71 extension line (an outer band) would cross it: it goes past the
+    # datum end instead, where no outer extension line runs
+    foreign = [sh.items[i] for kk, gg in enumerate(sh.meta["dimension_items"]) if kk != k for i in gg
+               if isinstance(sh.items[i], Segment)]
+    assert not [s for s in foreign if _seg_hits_box(s, tbox)]
+    assert tbox.ymax < min(d.p1[1], d.p2[1])
+    _assert_inside(tbox, res.placements["front"][1], "48.57")
+
+
+# ---- issue 30: the unit note goes on the sheet --------------------------------------
+
+def test_strip_prints_the_unit_note_when_given():
+    note = "Dimensions in mm (unit assumed, see report)"
+    views = _box_views(100.0, 40.0, 15.0, iso=False)
+    plan = plan_dimensions(views, [], DrawingOptions(), ST, np.array([100.0, 40.0, 15.0]))
+    res = compose(views, None, plan, DrawingOptions(), ST, {"unit_note": note})
+    texts = [t.text for t in res.sheet.items if isinstance(t, Text)]
+    # review R4: one line would need 1.9 mm text (below the 2.5 mm lettering minimum), so the
+    # note is set on two lines of the 9 mm strip, each at least 2.5 mm high
+    assert 0.6 * 2.5 * len(note) > 48.0                         # precondition: one line cannot keep 2.5 mm
+    assert note not in texts
+    lines = [t for t in res.sheet.items if isinstance(t, Text) and t.text in
+             ("Dimensions in mm (unit", "Dimensions in mm", "(unit assumed, see report)", "assumed, see report)")]
+    assert " ".join(t.text for t in sorted(lines, key=lambda t: -t.position[1])) == note
+    assert len(lines) == 2 and all(t.height >= 2.5 - 1e-9 for t in lines)
+    plain = compose(views, None, plan, DrawingOptions(), ST, {})
+    assert "Dimensions in mm" in [t.text for t in plain.sheet.items if isinstance(t, Text)]
+
+
+def test_strip_two_line_unit_note_stays_inside_its_cell():
+    from src.drawing.layout import STRIP_COLS, strip_items
+    note = "Dimensions in mm (unit assumed, see report)"
+    size = SHEETS["A3"]
+    items = strip_items(size, ST, "1:1", "first", "STEP", unit_note=note)
+    texts = [t for t in items if isinstance(t, Text) and t.text not in ("SCALE 1:1", "STEP")]
+    assert len(texts) == 2 and all(t.height >= 2.5 - 1e-9 for t in texts)
+    assert " ".join(t.text for t in sorted(texts, key=lambda t: -t.position[1])) == note
+    segs = [s for s in items if isinstance(s, Segment)]
+    y0 = min(min(s.a[1], s.b[1]) for s in segs)
+    y1 = max(max(s.a[1], s.b[1]) for s in segs)
+    for t in texts:                                             # inside the 9 mm strip, no overlap
+        assert y0 < t.position[1] - 0.5 * t.height and t.position[1] + 0.5 * t.height < y1
+        assert 0.6 * t.height * len(t.text) <= (STRIP_COLS[3] - STRIP_COLS[2]) - 2.0 + 1e-9
+    a, b = sorted(texts, key=lambda t: t.position[1])
+    assert a.position[1] + 0.5 * a.height <= b.position[1] - 0.5 * b.height
+    short = strip_items(size, ST, "1:1", "first", "STEP", unit_note="Dimensions in mm (assumed)")
+    assert "Dimensions in mm (assumed)" in [t.text for t in short if isinstance(t, Text)]
+
+
+# ---- review R4: auto sheet, overall-dim recognition, tiny / finned section regions ----
+
+def test_compose_auto_takes_a3_before_dropping_dims():
+    import src.drawing.layout as layout_mod
+    views, plan = _deep_plan(W=60.0, H=40.0, D=20.0, n_pos=8)
+    a4, _, _ = _compose(views=views, section=None, plan=plan, sheet="A4")
+    # precondition (the reviewed defect): on A4 the cap drops position dims to keep a scale
+    assert [u for u in a4.plan.undimensioned if u.get("reason") == "layout_space"]
+    a3, _, _ = _compose(views=views, section=None, plan=plan, sheet="A3")
+    assert not [u for u in a3.plan.undimensioned if u.get("reason") == "layout_space"]
+    res, _, _ = _compose(views=views, section=None, plan=plan, sheet="auto")
+    assert res.sheet_size.name == "A3"
+    assert not [u for u in res.plan.undimensioned if u.get("reason") == "layout_space"]
+    assert len(res.sheet.dimensions) == len(plan.dims) and res.scale >= a4.scale
+    assert res.scale == a3.scale
+    assert layout_mod.POSITION_BAND_CAP == 3
+
+
+def test_compose_auto_still_caps_on_the_final_sheet():
+    views, plan = _deep_plan()
+    res, _, _ = _compose(views=views, section=None, plan=plan, sheet="auto")
+    assert res.sheet_size.name == "A3" and res.scale == pytest.approx(1 / 10)
+    assert len([u for u in res.plan.undimensioned if u.get("reason") == "layout_space"]) == 9
+
+
+def test_compose_auto_keeps_a4_when_it_holds_everything_at_1_to_1():
+    views, plan = _deep_plan(W=40.0, H=40.0, D=20.0, n_pos=8)
+    a4, _, _ = _compose(views=views, section=None, plan=plan, sheet="A4")
+    assert a4.scale >= 1.0 and not a4.sheet.meta["dims_dropped"]          # precondition
+    res, _, _ = _compose(views=views, section=None, plan=plan, sheet="auto")
+    assert res.sheet_size.name == "A4" and res.scale == a4.scale and not res.sheet.meta["dims_dropped"]
+
+
+def test_compose_auto_does_not_cap_a4_when_a3_shows_every_dim_at_that_scale():
+    views, plan = _deep_plan(W=30.0, H=20.0, D=10.0, n_pos=8)
+    a4, _, _ = _compose(views=views, section=None, plan=plan, sheet="A4")
+    a3, _, _ = _compose(views=views, section=None, plan=plan, sheet="A3")
+    # precondition: on A4 the cap wins a step (1:1 -> 2:1) by dropping dims; A3 holds all of them
+    assert a4.sheet.meta["dims_dropped"] and a4.scale >= 2.0
+    assert not a3.sheet.meta["dims_dropped"] and a3.scale >= a4.scale
+    res, _, _ = _compose(views=views, section=None, plan=plan, sheet="auto")
+    assert res.sheet_size.name == "A3" and res.scale == a3.scale and not res.sheet.meta["dims_dropped"]
+
+
+def test_cap_bands_keeps_an_overall_dim_whose_view_bbox_is_slightly_larger():
+    from src.drawing.layout import _cap_bands
+    views, plan = _deep_plan(W=100.0, H=100.0, D=50.0, n_pos=8)
+    boxes = {k: v.bbox for k, v in views.items()}
+    fb = boxes["front"]
+    boxes["front"] = BBox2D(fb.xmin, fb.ymin - 0.1, fb.xmax, fb.ymax + 0.1)   # 0.2 mm larger
+    ext = boxes["front"].height
+    h = plan.dims[1]
+    assert h.value == 100.0
+    # precondition: the numeric (round 2) test misses it, so it would be dropped first
+    assert abs(abs(h.p2[1] - h.p1[1]) - ext) > max(0.01, 1e-3 * ext) and h.value < ext - max(0.01, 1e-3 * ext)
+    new, dropped = _cap_bands(plan, boxes, 3)
+    assert h in new.dims and len(dropped) == 5
+    assert all(u["value"] < 100.0 for u in dropped)
+
+
+def test_cap_bands_honours_a_role_marker_and_labels_dropped_kinds():
+    from src.drawing.layout import _cap_bands, _is_overall
+    views, plan = _deep_plan(W=100.0, H=100.0, D=50.0, n_pos=8)
+    boxes = {k: v.bbox for k, v in views.items()}
+    d0 = plan.dims[3]                                           # the innermost position dim (band 0)
+    assert not _is_overall(d0, boxes)                           # precondition
+    d0.role = "overall"
+    plan.dims[10].role = "step"
+    assert _is_overall(d0, boxes)
+    new, dropped = _cap_bands(plan, boxes, 3)
+    assert d0 in new.dims
+    kinds = {u["text"]: u["kind"] for u in dropped}
+    assert kinds[plan.dims[10].text] == "step"
+    assert set(kinds.values()) == {"step", "linear"}           # no role: generic, not "hole_position"
+
+
+def _sq(x, y, w, h):
+    return [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+
+
+def test_section_tiny_region_of_a_hatched_body_is_filled():
+    from src.drawing.geometry2d import hatch_lines as hl
+    from src.drawing.layout import _section_items
+    big = _sq(0, 0, 80, 40)
+    tiny8 = _sq(100, 10, 0.8, 0.8)
+    tiny6 = _sq(100, 20, 0.6, 0.6)
+    assert len(hl([np.array(tiny8, float)], 0.7, 45.0)) < 2     # precondition: one segment or none
+    items, stats = _section_items(_sec_of([big, tiny8, tiny6]), (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 101, 40))
+    fills = [i for i in items if isinstance(i, Polygon)]
+    assert len(fills) == 2 and stats["filled_regions"] == 2 and stats["fill"] == "mixed"
+    hatches = [i for i in items if isinstance(i, HatchLines)]
+    assert len(hatches) == 1 and len(hatches[0].segments) > 10   # the big region keeps its hatch
+    # control: a 1.5 mm strip in a thick body is still hatched (t = 2A/P = 1.46 >= 1.4)
+    strip = _sq(0, 50, 60, 1.5)
+    items2, stats2 = _section_items(_sec_of([big, strip]), (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 80, 51.5))
+    assert not [i for i in items2 if isinstance(i, Polygon)] and stats2["fill"] == "hatch"
+
+
+def _comb(base_h, n=30, fin_w=1.0, fin_h=30.0, width=100.0):
+    pts = [[0.0, 0.0], [width, 0.0]]
+    for k in range(n):
+        xr = width - k * (width / n)
+        xl = xr - fin_w
+        pts += [[xr, base_h], [xr, base_h + fin_h], [xl, base_h + fin_h], [xl, base_h]]
+    pts += [[0.0, base_h]]
+    a = np.array(pts, float)
+    return a[np.r_[True, np.any(np.diff(a, axis=0) != 0, axis=1)]]
+
+
+def test_section_finned_body_with_a_thick_base_is_hatched_not_filled():
+    from src.drawing.layout import _section_items
+    comb = _comb(10.0)
+    items, stats = _section_items(_sec_of([comb]), (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 100, 40))
+    assert stats["body_thickness"][0] < 2.1                     # precondition: 2A/P says "thin"
+    assert not [i for i in items if isinstance(i, Polygon)]
+    assert stats["fill"] == "hatch" and stats["thick_core_bodies"] == 1
+    hatches = [i for i in items if isinstance(i, HatchLines)]
+    assert hatches and len(hatches[0].segments) > 30
+    # control: the same comb on a 1.5 mm base is thin everywhere and stays filled
+    thin = _comb(1.5)
+    items2, stats2 = _section_items(_sec_of([thin]), (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 100, 31.5))
+    assert len([i for i in items2 if isinstance(i, Polygon)]) == 1 and stats2["fill"] == "solid"
+    assert stats2["thick_core_bodies"] == 0

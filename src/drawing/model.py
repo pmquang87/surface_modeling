@@ -340,6 +340,9 @@ class SectionView:
     label: str = "A"
     marker_view: str = "top"       # principal view that shows the cutting line
     stats: dict = field(default_factory=dict)   # open_wires_dropped, nudged, seconds
+    # body id per loop, aligned with ``loops`` (B-rep: solid / part index in
+    # explorer order; mesh: component index); None = one body (QA round 2 issue 3)
+    loop_body: Optional[List[int]] = None
 
 
 @dataclass
@@ -348,6 +351,13 @@ class CylFeature:
     axis: np.ndarray
     radius: float
     length: float
-    kind: str                      # "hole" | "boss" | "fillet"
+    kind: str                      # "hole" | "boss" | "fillet" | "filled_hole" | "round"
     full_circle: bool
     n_faces: int
+    # QA round 2 extras (optional): solid indices the feature's faces belong to
+    # (explorer order, -1 = outside any solid); for a "filled_hole" the solid
+    # indices of the filler (the fastener); for a "round" (toroidal edge
+    # round) the major radius of the torus (``radius`` is the round radius)
+    bodies: Tuple[int, ...] = ()
+    filler_bodies: Tuple[int, ...] = ()
+    major_radius: Optional[float] = None

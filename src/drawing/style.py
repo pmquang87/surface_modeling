@@ -24,7 +24,8 @@ Conventional (DIN 406 teaching practice, NOT ISO; the report must not cite
 ISO for these): extension gap 1 mm, overshoot 2 mm, dimension lines 10 mm
 then 7 mm pitch, text 1 mm above the line, 20 mm view gap, hatch spacing
 2 / 3 / 4 mm by the section's shorter extent (< 20, <= 80, above), minimum
-hatch spacing 1.0 mm (= max(0.7, 2 x wide)).
+hatch spacing 1.0 mm (= max(0.7, 2 x wide)); thin regions down to 0.7 mm and
+solid fill below a mean body thickness of 2.1 mm (``section_fill_below``).
 """
 from __future__ import annotations
 
@@ -124,14 +125,54 @@ def hatch_spacing(style: SheetStyle, shorter_extent_sheet_mm: float) -> float:
     return max(_HATCH_MIN, float(s))
 
 
-# Small section regions (QA round 1 issue 29; conventions, not ISO numbers):
-# a region whose smallest width on the sheet (caliper width of its outer loop, any
-# orientation, layout._min_width) is below HATCH_FILL_BELOW is filled
-# solid (ISO 128-50 allows blackening thin sections); a region narrower than two
-# section spacings across the hatch lines gets width / 3 (two or three lines),
-# never below HATCH_MIN_REGION.
+# Thin section regions (QA round 1 issue 29, round 2 issue 3; conventions, not ISO
+# numbers): the fill decision is made per BODY from its mean wall thickness on the
+# sheet, t = 2 A / P over all its loops (A = outer areas minus hole areas, P = all
+# loop perimeters; a long strip of width w gives t ~ w, an annulus gives its radial
+# width). A body with t below ``section_fill_below()`` (HATCH_FILL_BELOW, raised to
+# 3 x HATCH_MIN_REGION so a hatched region always gets spacing <= t / 3) is filled
+# solid (ISO 128-50 allows blackening thin sections); otherwise every region of the
+# body is hatched, a region thinner than two section spacings at t / 3, never below
+# HATCH_MIN_REGION (``thin_region_spacing``).
+# Review R4 (two guards):
+# * a region of a hatched body is still filled when its own t is below
+#   ``region_fill_below()`` (2 x HATCH_MIN_REGION = 1.4 mm) or its hatch has fewer than
+#   HATCH_MIN_SEGMENTS lines: a 0.8 mm island with one hatch line reads as an empty pocket;
+# * a body whose 2A/P is thin is NOT filled when more than THICK_CORE_FRACTION of its area
+#   lies deeper than ``section_fill_below()`` inside the material (local thickness above
+#   about 4 mm): the mean 2A/P of a finned heat sink is pulled below 2.1 mm by the fins,
+#   and filling it would blacken its 10 mm base.
 HATCH_FILL_BELOW = 2.0
 HATCH_MIN_REGION = 0.7
+HATCH_MIN_SEGMENTS = 2
+THICK_CORE_FRACTION = 0.10
+
+# Lettering minimum (ISO 3098 / ISO 7200 practice: 2.5 mm for notes on the sheet); the strip
+# sets a note on two lines rather than shrink it below this height (review R4).
+MIN_LETTERING_HEIGHT = 2.5
+
+
+def section_fill_below() -> float:
+    """Mean body thickness (sheet mm) below which a section body is filled solid: 2.1 mm."""
+    return max(HATCH_FILL_BELOW, 3.0 * HATCH_MIN_REGION)
+
+
+def region_fill_below() -> float:
+    """Region thickness (2A/P, sheet mm) below which a region of a hatched body is filled: 1.4 mm."""
+    return 2.0 * HATCH_MIN_REGION
+
+
+def thin_region_spacing(section_spacing: float, thickness_sheet_mm: float) -> float:
+    """Hatch spacing of one region of mean thickness ``t`` (2A/P, sheet mm) in a hatched body.
+
+    The section spacing when ``t >= 2 * spacing``, else ``t / 3`` floored at
+    ``HATCH_MIN_REGION`` (0.7 mm) and capped at the section spacing.
+    """
+    s = float(section_spacing)
+    t = float(thickness_sheet_mm)
+    if t >= 2.0 * s:
+        return s
+    return max(HATCH_MIN_REGION, min(s, t / 3.0))
 
 
 def region_hatch_spacing(section_spacing: float, across_sheet_mm: float) -> float:

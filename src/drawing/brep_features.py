@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -63,7 +63,19 @@ _FILL_MIN_OVERLAP = 0.5    # filler covers >= this share of the hole length
 _FILL_AXIS_TOL = 1e-4      # 1 - |cos| between hole and filler axes
 
 _FULL_CIRCLE_DEG = 360.0 - 1e-3
-_KIND_ORDER = {"hole": 0, "boss": 1, "fillet": 2, "filled_hole": 3}
+_KIND_ORDER = {"hole": 0, "boss": 1, "fillet": 2, "filled_hole": 3, "round": 4}
+
+# Report toroidal faces (edge rounds of circular edges) as kind "round"
+# features (QA round 2 issue 16). Module constant so the test can switch it off.
+_detect_rounds = True
+
+# A filler of a filled hole counts as a fastener (``CylFeature.filler_bodies``;
+# the section leaves it unsectioned, QA round 2 issue 28) when its solid is
+# slender: volume <= this x pi r^2 L of its filling cylinder (bolt with head
+# about 1.4 to 1.5, pin 1.0, a plate with a spigot >> 4) and it has no hole of
+# at least half its radius (a bushing or sleeve is sectioned).
+_FASTENER_VOL_RATIO = 4.0
+_FASTENER_BORE_RATIO = 0.5
 
 
 def _vec(p) -> np.ndarray:
@@ -79,9 +91,11 @@ def _signed_volume(solid: Any) -> float:
     return float(props.Mass())
 
 
-def _faces_with_inversion(shape: Any, cylinders_only: bool = True) -> List[Any]:
+def _faces_with_inversion(shape: Any, cylinders_only: bool = True,
+                          types: Any = None) -> List[Any]:
     """``(face, inverted, body)`` for every unique cylindrical face of
-    ``shape`` (every face with ``cylinders_only=False``).
+    ``shape`` (every face with ``cylinders_only=False``; the faces whose
+    ``BRepAdaptor_Surface.GetType()`` is in ``types`` when given).
 
     ``inverted`` is True when the face belongs to a solid whose signed volume
     is negative (an inverted solid: every face orientation is flipped, so a
@@ -92,7 +106,8 @@ def _faces_with_inversion(shape: Any, cylinders_only: bool = True) -> List[Any]:
     its location, flipped for a REVERSED instance (203 integrations, 4.35 s
     -> one per unique solid on the RC buggy assembly).
     ``body`` is the index of the solid the face belongs to (in explorer
-    order), -1 for faces outside any solid.
+    order, each solid instance once: ``_solid_list``), -1 for faces outside
+    any solid.
     """
     from OCP.BRepAdaptor import BRepAdaptor_Surface
     from OCP.GeomAbs import GeomAbs_Cylinder
@@ -126,7 +141,10 @@ def _faces_with_inversion(shape: Any, cylinders_only: bool = True) -> List[Any]:
             try:
                 if not seen.Add(face):        # a face shared by two parents: once
                     continue
-                if not cylinders_only or BRepAdaptor_Surface(face).GetType() == GeomAbs_Cylinder:
+                if types is not None:
+                    if BRepAdaptor_Surface(face).GetType() in types:
+                        found.append(face)
+                elif not cylinders_only or BRepAdaptor_Surface(face).GetType() == GeomAbs_Cylinder:
                     found.append(face)
             except Exception as exc:
                 logger.debug("face type failed: %s", exc)
@@ -134,10 +152,13 @@ def _faces_with_inversion(shape: Any, cylinders_only: bool = True) -> List[Any]:
 
     out: List[Any] = []
     sexp = TopExp_Explorer(shape, TopAbs_SOLID)
+    seen_solids = TopTools_MapOfShape()
     body = 0
     while sexp.More():
         solid = sexp.Current()
         sexp.Next()
+        if not seen_solids.Add(solid):       # the same instance twice: once (as _solid_list)
+            continue
         faces = sel_faces(TopExp_Explorer(solid, TopAbs_FACE))
         inverted = False
         if faces and _heal_inverted:
@@ -154,14 +175,31 @@ def _faces_with_inversion(shape: Any, cylinders_only: bool = True) -> List[Any]:
     return out
 
 
-def _cylinder_faces(shape: Any) -> List[Dict[str, Any]]:
+def _solid_list(shape: Any) -> List[Any]:
+    """The solids of ``shape`` in explorer order, each instance (TShape +
+    location) once: index i is the ``body`` of ``_faces_with_inversion`` and
+    the solid index of ``brep_sections._parts`` (solids come first there)."""
+    from OCP.TopAbs import TopAbs_SOLID
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopTools import TopTools_MapOfShape
+    seen = TopTools_MapOfShape()
+    out: List[Any] = []
+    ex = TopExp_Explorer(shape, TopAbs_SOLID)
+    while ex.More():
+        if seen.Add(ex.Current()):
+            out.append(ex.Current())
+        ex.Next()
+    return out
+
+
+def _cylinder_faces(shape: Any, faces: Any = None) -> List[Dict[str, Any]]:
     from OCP.BRepAdaptor import BRepAdaptor_Surface
     from OCP.BRepLProp import BRepLProp_SLProps
     from OCP.BRepTools import BRepTools
     from OCP.TopAbs import TopAbs_REVERSED
 
     out: List[Dict[str, Any]] = []
-    for face, inverted, body in _faces_with_inversion(shape):
+    for face, inverted, body in (_faces_with_inversion(shape) if faces is None else faces):
         try:
             ad = BRepAdaptor_Surface(face)
             cyl = ad.Cylinder()
@@ -274,9 +312,110 @@ def _mark_filled(groups: List[Dict[str, Any]], radius_tol: float, axis_tol: floa
             if min(h1, b1) - max(h0, b0) < need - radius_tol:
                 continue
             h["filled"] = True
+            h["filler"] = b
             n += 1
             break
     return n
+
+
+def _torus_faces(faces: Any) -> List[Dict[str, Any]]:
+    """Per toroidal face (``(face, inverted, body)`` items): axis, centre,
+    major / minor radius, U span (around the main axis, degrees) and
+    concavity (the normal points toward the tube's centre circle)."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepLProp import BRepLProp_SLProps
+    from OCP.BRepTools import BRepTools
+    from OCP.TopAbs import TopAbs_REVERSED
+
+    out: List[Dict[str, Any]] = []
+    for face, inverted, body in faces:
+        try:
+            ad = BRepAdaptor_Surface(face)
+            tor = ad.Torus()
+            ax = tor.Axis()
+            loc = _vec(ax.Location())
+            d = _vec(ax.Direction())
+            d /= np.linalg.norm(d)
+            umin, umax, vmin, vmax = BRepTools.UVBounds_s(face)
+            props = BRepLProp_SLProps(ad, 0.5 * (umin + umax), 0.5 * (vmin + vmax), 1, 1e-6)
+            if not props.IsNormalDefined():
+                continue
+            nrm = _vec(props.Normal())
+            if _flip_reversed and face.Orientation() == TopAbs_REVERSED:
+                nrm = -nrm
+            if inverted:
+                nrm = -nrm
+            p = _vec(props.Value())
+            rel = p - loc
+            radial = rel - np.dot(rel, d) * d
+            rn = float(np.linalg.norm(radial))
+            big = float(tor.MajorRadius())
+            tube = loc + (radial / rn * big if rn > 0 else np.zeros(3))
+            out.append({"loc": loc, "dir": d, "major": big, "radius": float(tor.MinorRadius()),
+                        "concave": bool(np.dot(nrm, p - tube) < 0),
+                        "u_span_deg": math.degrees(umax - umin), "body": int(body)})
+        except Exception as exc:
+            logger.debug("torus face skipped: %s", exc)
+    return out
+
+
+def _round_features(tfaces: List[Dict[str, Any]], radius_tol: float, axis_tol: float
+                    ) -> List[CylFeature]:
+    """Group toroidal faces of the same circular edge round (same axis,
+    centre, major and minor radius, concavity) into kind "round" features:
+    ``radius`` = the round (minor) radius, ``major_radius`` = the torus major
+    radius, ``center`` = the torus centre, ``length`` 0, ``full_circle`` when
+    the U spans add up to 360 degrees."""
+    groups: List[Dict[str, Any]] = []
+    for t in tfaces:
+        for g in groups:
+            if abs(abs(float(np.dot(t["dir"], g["dir"]))) - 1.0) > axis_tol:
+                continue
+            if abs(t["radius"] - g["radius"]) > radius_tol or t["concave"] != g["concave"]:
+                continue
+            if abs(t["major"] - g["major"]) > radius_tol:
+                continue
+            if float(np.linalg.norm(t["loc"] - g["loc"])) > radius_tol:
+                continue
+            g["u"] += t["u_span_deg"]
+            g["n"] += 1
+            g["bodies"].add(t["body"])
+            break
+        else:
+            groups.append({"loc": t["loc"], "dir": t["dir"], "radius": t["radius"],
+                           "major": t["major"], "concave": t["concave"], "u": t["u_span_deg"],
+                           "n": 1, "bodies": {t["body"]}})
+    return [CylFeature(center=g["loc"].copy(), axis=g["dir"].copy(), radius=float(g["radius"]),
+                       length=0.0, kind="round", full_circle=bool(g["u"] >= _FULL_CIRCLE_DEG),
+                       n_faces=int(g["n"]), bodies=tuple(sorted(g["bodies"])),
+                       major_radius=float(g["major"]))
+            for g in groups]
+
+
+def _fastener_bodies(h: Dict[str, Any], groups: List[Dict[str, Any]], solids: List[Any]
+                     ) -> tuple:
+    """The solids of the filler of the filled hole group ``h`` that look like
+    fasteners (``_FASTENER_VOL_RATIO``, ``_FASTENER_BORE_RATIO``)."""
+    b = h.get("filler")
+    if b is None:
+        return ()
+    out = []
+    cyl = math.pi * b["radius"] ** 2 * max(b["hi"] - b["lo"], 0.0)
+    for idx in sorted(x for x in b["bodies"] if x >= 0):
+        try:
+            if idx >= len(solids) or cyl <= 0.0:
+                continue
+            vol = abs(_signed_volume(solids[idx]))
+            if vol > _FASTENER_VOL_RATIO * cyl:
+                continue                     # a part with a spigot, not a bolt or pin
+            bored = any(g["concave"] and g.get("full") and idx in g["bodies"]
+                        and g["radius"] >= _FASTENER_BORE_RATIO * b["radius"] for g in groups)
+            if bored:
+                continue                     # a bushing or sleeve: sectioned
+            out.append(int(idx))
+        except Exception as exc:
+            logger.debug("fastener check failed: %s", exc)
+    return tuple(out)
 
 
 def _covers_full_circle(spans: List[Any], min_len: float) -> bool:
@@ -324,13 +463,39 @@ def cylinder_features(shape, radius_tol: float = 0.01, axis_tol: float = 1e-4
     cylinder of another solid fills (a bolt shank, a pin; see
     ``_mark_filled``) gets ``kind == "filled_hole"``: the dimensioning step
     gives callouts to ``"hole"`` only, so no callout points at a fastener.
+    Its ``filler_bodies`` lists the filler solids that look like fasteners
+    (``_fastener_bodies``: slender, no bore; QA round 2 issue 28), which
+    ``brep_sections.section_brep(features=...)`` leaves unsectioned.
+    ``bodies`` of every feature: the solid indices of its faces
+    (``_solid_list`` order, -1 = outside any solid).
+
+    Toroidal faces (edge rounds of circular edges, e.g. a rounded boss top
+    or the fillet at a boss foot) come out as kind ``"round"`` (QA round 2
+    issue 16, ``_round_features``): ``radius`` = the round radius (torus
+    minor radius), ``major_radius`` = the torus major radius, ``length`` 0;
+    sorted after the filled holes.
     """
     if shape is None:
         return []
+    tfaces: List[Dict[str, Any]] = []
     try:
         if shape.IsNull():
             return []
-        cfaces = _cylinder_faces(shape)
+        if _detect_rounds:
+            from OCP.BRepAdaptor import BRepAdaptor_Surface
+            from OCP.GeomAbs import GeomAbs_Cylinder, GeomAbs_Torus
+            both = _faces_with_inversion(shape, types=(GeomAbs_Cylinder, GeomAbs_Torus))
+            cyl_items, tor_items = [], []
+            for item in both:
+                try:
+                    is_torus = BRepAdaptor_Surface(item[0]).GetType() == GeomAbs_Torus
+                except Exception:
+                    continue
+                (tor_items if is_torus else cyl_items).append(item)
+            cfaces = _cylinder_faces(shape, cyl_items)
+            tfaces = _torus_faces(tor_items)
+        else:
+            cfaces = _cylinder_faces(shape)
     except Exception as exc:
         logger.warning("cylinder detection failed: %s", exc)
         return []
@@ -344,16 +509,29 @@ def cylinder_features(shape, radius_tol: float = 0.01, axis_tol: float = 1e-4
         if n_filled:
             logger.info("%d hole(s) filled by a cylinder of another solid: kind 'filled_hole'",
                         n_filled)
+    solids = None
     for g in groups:
         mid = 0.5 * (g["lo"] + g["hi"])
         full = g["full"]
+        fillers: tuple = ()
         if g["concave"]:
             kind = ("filled_hole" if g.get("filled") else "hole") if full else "fillet"
+            if kind == "filled_hole":
+                if solids is None:
+                    try:
+                        solids = _solid_list(shape)
+                    except Exception as exc:
+                        logger.debug("solid list failed: %s", exc)
+                        solids = []
+                fillers = _fastener_bodies(g, groups, solids)
         else:
             kind = "boss"
         feats.append(CylFeature(center=g["loc"] + mid * g["dir"], axis=g["dir"].copy(),
                                 radius=float(g["radius"]), length=float(g["hi"] - g["lo"]),
-                                kind=kind, full_circle=bool(full), n_faces=int(g["n_faces"])))
+                                kind=kind, full_circle=bool(full), n_faces=int(g["n_faces"]),
+                                bodies=tuple(sorted(g["bodies"])), filler_bodies=fillers))
+    if tfaces:
+        feats.extend(_round_features(tfaces, radius_tol, axis_tol))
     feats.sort(key=lambda f: (_KIND_ORDER.get(f.kind, 9), -round(f.radius, 6),
                               tuple(np.round(f.center, 6))))
     return feats
@@ -457,7 +635,41 @@ def _face_mean_normal(face: Any, ad: Any, uv: Any) -> Any:
     return np.array(s_all) / a_all if a_all > 0 else None
 
 
-def depth_sign_details(shape, n) -> Dict[str, Any]:
+def _extent_along(shape: Any, nv: np.ndarray, bbox: Any = None) -> Any:
+    """``(h_lo, h_hi, bbox_volume)``: the range of ``p . nv`` over the
+    axis-aligned bounding box of ``shape`` (or of ``bbox = (lo, hi)`` when
+    given, e.g. the census's exact bbox) and the box volume. The box comes
+    from ``brep_load.exact_bbox_bounded`` (the exact ``AddOptimal_s`` box by
+    branch and bound: 0.9 to 1.1 s for a full ``AddOptimal_s`` on NIST FTC
+    10, a few faces integrated here; the plain ``Add_s`` box is enlarged by
+    every tolerance and by the control points of curved faces). ``None``
+    when no box can be had."""
+    lo = hi = None
+    if bbox is not None:
+        try:
+            lo = np.asarray(bbox[0], dtype=float).reshape(3)
+            hi = np.asarray(bbox[1], dtype=float).reshape(3)
+        except Exception:
+            lo = hi = None
+    if lo is None:
+        try:
+            from .brep_load import exact_bbox_bounded
+            box = exact_bbox_bounded(shape)
+            if box is None:
+                return None
+            lo, hi = np.asarray(box[0], float), np.asarray(box[1], float)
+        except Exception as exc:
+            logger.debug("depth sign: bbox failed: %s", exc)
+            return None
+    if not (np.all(np.isfinite(lo)) and np.all(np.isfinite(hi))):
+        return None
+    corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
+                        for z in (lo[2], hi[2])])
+    h = corners @ nv
+    return float(h.min()), float(h.max()), float(np.prod(np.maximum(hi - lo, 0.0)))
+
+
+def depth_sign_details(shape, n, bbox: Any = None, cavity: bool = True) -> Dict[str, Any]:
     """Per side of the view normal ``n``: how much of the part faces a viewer
     standing there.
 
@@ -478,7 +690,28 @@ def depth_sign_details(shape, n) -> Dict[str, Any]:
     side walls are not integrated), ``score_plus`` /
     ``score_minus`` (count + facing area / area_total, so the area only
     breaks ties of the count) and ``faces`` (faces read). A null or empty
-    shape gives zeros. Cost (measured): 0.22 to 0.42 s on a 663-face NIST
+    shape gives zeros.
+
+    Cavity term (QA round 2 issue 4): ``cavity_plus`` = sum over the faces
+    facing ``+n`` of ``area x |cos| x (h_hi - centroid . n)``, the projected
+    area times how deep the face lies below the bounding plane on the
+    ``+n`` side; ``cavity_minus`` likewise against ``h_lo``. It approximates
+    the open volume a viewer on that side looks into: a pocket floor
+    (large area, deep) dominates, shallow counterbores, notches and logos
+    with many small faces do not (the face count turned NIST FTC 10 to its
+    back: 105.5 vs 24.5). ``bbox_volume`` is the volume of the axis-aligned
+    box (``bbox = (lo, hi)`` passes a box already known, e.g. the census's
+    exact bbox; otherwise ``BRepBndLib.AddOptimal_s``), ``h_lo`` / ``h_hi``
+    its range along ``n``. ``choose_depth_sign_brep`` decides with them.
+    ``proj_area_plus`` / ``proj_area_minus`` are the projected facing areas
+    (area x |cos|) and ``mean_recess_plus`` / ``mean_recess_minus`` the
+    area-weighted mean recess as a fraction of the bbox depth along ``n``
+    (cavity / (projected area x depth); 0 without a box): about 0.2 to 0.3
+    for a pocketed part, 0.5 and more for an open housing or tray (review
+    of issue 4). ``cavity=False`` skips the box and the cavity terms (they
+    stay 0): ``score_depth_sign`` needs neither (0.25 s on NIST FTC 10).
+
+    Cost (measured): 0.22 to 0.42 s on a 663-face NIST
     part (most of it the face list with the signed volume per solid and
     the areas); 7.5 s on the 10665-face RC buggy assembly against 6.6 s
     with the centre normal, the mean normals themselves 1.8 s there
@@ -498,7 +731,10 @@ def depth_sign_details(shape, n) -> Dict[str, Any]:
         raise ValueError(f"depth_sign_details: bad view normal {n!r}")
     nv = nv / nn
     out = {"faces_plus": 0, "faces_minus": 0, "area_plus": 0.0, "area_minus": 0.0,
-           "area_total": 0.0, "score_plus": 0.0, "score_minus": 0.0, "faces": 0}
+           "area_total": 0.0, "score_plus": 0.0, "score_minus": 0.0, "faces": 0,
+           "cavity_plus": 0.0, "cavity_minus": 0.0, "bbox_volume": 0.0,
+           "h_lo": None, "h_hi": None, "proj_area_plus": 0.0, "proj_area_minus": 0.0,
+           "mean_recess_plus": 0.0, "mean_recess_minus": 0.0}
     if shape is None:
         return out
     try:
@@ -508,6 +744,9 @@ def depth_sign_details(shape, n) -> Dict[str, Any]:
     except Exception as exc:
         logger.warning("depth sign scoring failed: %s", exc)
         return out
+    ext = _extent_along(shape, nv, bbox) if (faces and cavity) else None
+    if ext is not None:
+        out["h_lo"], out["h_hi"], out["bbox_volume"] = ext
     for face, inverted, _ in faces:
         try:
             ad = BRepAdaptor_Surface(face)
@@ -525,11 +764,17 @@ def depth_sign_details(shape, n) -> Dict[str, Any]:
             if inverted:
                 nrm = -nrm
             c = float(np.dot(nrm, nv))
-            area = 0.0
+            area, h = 0.0, None
             if abs(c) > _FACING_COS:          # side walls need no area
                 gp = GProp_GProps()
                 BRepGProp.SurfaceProperties_s(face, gp)
                 area = abs(float(gp.Mass()))
+                try:
+                    h = float(np.dot(_vec(gp.CentreOfMass()), nv))
+                    if not math.isfinite(h):
+                        h = None
+                except Exception:
+                    h = None
         except Exception as exc:
             logger.debug("depth sign: face skipped: %s", exc)
             continue
@@ -537,9 +782,20 @@ def depth_sign_details(shape, n) -> Dict[str, Any]:
         if c > _FACING_COS:
             out["faces_plus"] += 1
             out["area_plus"] += area
+            out["proj_area_plus"] += area * abs(c)
+            if h is not None and ext is not None:
+                out["cavity_plus"] += area * abs(c) * max(ext[1] - h, 0.0)
         elif c < -_FACING_COS:
             out["faces_minus"] += 1
             out["area_minus"] += area
+            out["proj_area_minus"] += area * abs(c)
+            if h is not None and ext is not None:
+                out["cavity_minus"] += area * abs(c) * max(h - ext[0], 0.0)
+    if ext is not None and ext[1] - ext[0] > 0.0:
+        depth = ext[1] - ext[0]
+        for s in ("plus", "minus"):
+            pa = out["proj_area_" + s]
+            out["mean_recess_" + s] = out["cavity_" + s] / (pa * depth) if pa > 0.0 else 0.0
     out["area_total"] = out["area_plus"] + out["area_minus"]
     tot = out["area_total"]
     out["score_plus"] = out["faces_plus"] + (out["area_plus"] / tot if tot > 0 else 0.0)
@@ -553,6 +809,82 @@ def score_depth_sign(shape, n) -> Any:
     ``depth_sign_details``). The pipeline looks along ``-n`` from the ``+n``
     side (``VIEWS[name].n`` points to the viewer); when ``score_minus`` is
     clearly larger, a 180-degree turn about the vertical axis shows the
-    featured side. Never raises on a null shape ((0.0, 0.0))."""
-    d = depth_sign_details(shape, n)
+    featured side. Never raises on a null shape ((0.0, 0.0)). The cavity
+    terms are not computed (``cavity=False``: no bbox)."""
+    d = depth_sign_details(shape, n, cavity=False)
     return float(d["score_plus"]), float(d["score_minus"])
+
+
+DEPTH_CAVITY_SHARE = 0.02    # cavity decides when a side's cavity >= 2 % of the bbox volume
+# Review of issue 4: the cavity rule leaves housings and trays to the face
+# rule. Area-weighted mean recess / bbox depth of the deeper side, measured
+# in the run2 pre-flip orientation: NIST CTC 02 housing 0.499 (the reference
+# view shows the exterior), FTC 06 0.572 and FTC 07 0.743 (the face rule
+# turns them as well), FTC 10 pocket 0.313 (cavity rule needed: the face rule
+# turns it to its back), TO-220 0.256, the 150 x 30 x 75 pocket block 0.222.
+DEPTH_CAVITY_MAX_MEAN_RECESS = 0.4
+DEPTH_FLIP_RATIO = 1.25      # turn only when the far side scores > 1.25 x the kept side
+DEPTH_FLIP_MIN_DIFF = 2.0    # face rule: and at least 2 (about two faces) more
+
+
+def choose_depth_sign_brep(shape, n, bbox: Any = None, ratio: float = DEPTH_FLIP_RATIO,
+                           min_diff: float = DEPTH_FLIP_MIN_DIFF,
+                           cavity_share: float = DEPTH_CAVITY_SHARE,
+                           max_mean_recess: Optional[float] = DEPTH_CAVITY_MAX_MEAN_RECESS
+                           ) -> Dict[str, Any]:
+    """Keep or turn the part for a viewer on the ``+n`` side (QA round 2 issue 4).
+
+    ``n`` points from the part toward the current viewer (file coordinates,
+    as for ``score_depth_sign``). With ``depth_sign_details``:
+
+    * cavity rule (``method == "brep_cavity"``): when the larger of
+      ``cavity_plus`` / ``cavity_minus`` is at least ``cavity_share`` of
+      ``bbox_volume``, turn when ``cavity_minus > ratio x cavity_plus``,
+      keep when ``cavity_plus > ratio x cavity_minus``; not when the larger
+      cavity's ``mean_recess`` (area-weighted mean recess / bbox depth) is
+      above ``max_mean_recess`` (None: no limit): that is the interior of an
+      open housing or tray, drawn from its exterior as the NIST CTC 02
+      reference does; ``"housing"`` in ``reason``;
+    * otherwise (no open cavity worth the name, a housing, or the two
+      cavities within the margin) the face rule (``method == "brep_faces"``): turn when
+      ``score_minus > ratio x score_plus`` and ``score_minus - score_plus
+      >= min_diff`` (the round-1 rule of ``pipeline._depth_sign_brep``).
+
+    Returns ``{"flip", "method", "score_kept", "score_flipped" (the scores of
+    the deciding rule), "cavity_kept", "cavity_flipped", "faces_kept",
+    "faces_flipped" (the face-rule scores), "bbox_volume", "mean_recess_kept",
+    "mean_recess_flipped", "housing" (True when the recess limit sent a
+    decisive cavity to the face rule), "reason"}``.
+    Never raises on a null shape (no flip); a bad ``n`` raises ValueError
+    like ``depth_sign_details``.
+    """
+    d = depth_sign_details(shape, n, bbox=bbox)
+    cp, cm = float(d["cavity_plus"]), float(d["cavity_minus"])
+    sp, sm = float(d["score_plus"]), float(d["score_minus"])
+    vol = float(d["bbox_volume"] or 0.0)
+    out = {"flip": False, "method": "brep_faces", "score_kept": sp, "score_flipped": sm,
+           "cavity_kept": cp, "cavity_flipped": cm, "faces_kept": sp, "faces_flipped": sm,
+           "bbox_volume": vol, "mean_recess_kept": float(d["mean_recess_plus"]),
+           "mean_recess_flipped": float(d["mean_recess_minus"]), "housing": False,
+           "reason": ""}
+    share = max(cp, cm) / vol if vol > 0 else 0.0
+    cav = (f"open cavity {cp:.4g} mm3 on the kept side, {cm:.4g} mm3 on the far side "
+           f"({100.0 * share:.3g} % of the bbox volume)")
+    decisive = vol > 0 and share >= float(cavity_share) and (cm > ratio * cp or cp > ratio * cm)
+    if decisive and max_mean_recess is not None:
+        rec = float(d["mean_recess_minus"] if cm > cp else d["mean_recess_plus"])
+        if rec > float(max_mean_recess):
+            decisive = False
+            out["housing"] = True
+            cav += (f"; mean recess {rec:.3g} of the depth > {float(max_mean_recess):.3g}: "
+                    f"an open housing, drawn from its exterior by the face rule")
+    if decisive:
+        out.update(method="brep_cavity", score_kept=cp, score_flipped=cm,
+                   flip=bool(cm > ratio * cp))
+        out["reason"] = cav + ("; turned 180 deg about Z" if out["flip"] else "")
+        return out
+    flip = bool(sm > ratio * sp and sm - sp >= float(min_diff))
+    out["flip"] = flip
+    out["reason"] = (f"faces facing the front viewer: {sp:.4g} on the kept side, {sm:.4g} on "
+                     f"the far side ({cav})" + ("; turned 180 deg about Z" if flip else ""))
+    return out

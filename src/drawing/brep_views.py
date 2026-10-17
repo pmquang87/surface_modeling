@@ -42,6 +42,15 @@ Measured facts this module relies on (HLR probe, OCP 7.9.3, REPORT-hlr.md):
   ``dedupe_primitives``, ``drop_covered_curves`` (hidden circles/arcs on
   visible ones), ``subtract_covered`` (hidden segments under visible
   segments), ``merge_collinear`` (chains such as 0..5 and 5..55).
+  QA round 2 issue 18: hidden Polylines / Arcs / Circles are also cut
+  where they lie on visible edges (``subtract_covered_curves``, loose mode,
+  0.05 mm on paper; the far intersection curve of a cross-drilled hole,
+  far bore rings seen obliquely), and on the exact route hidden Segments
+  use the same loose 0.05 mm cover (``_EXACT_SEGMENTS_LOOSE``). Measured on
+  NIST CTC 02 at 1:20: hidden length within 0.05 mm on paper of a visible
+  line 21.8 / 2.2 / 31.7 % (front / top / right) -> 4.2 / 1.5 / 2.3 %;
+  splinecage at 5:1 81.6 / 85.9 % -> 8.9 / 7.7 %. ``stats``
+  ``hidden_curves_dropped`` / ``hidden_curves_trimmed`` count the curves.
 * Exact HLR must not be used on regularity-encoded faceted shells (it loses
   a third of the silhouette into ``Rg1``: ico2 16 of 24 edges); PolyAlgo
   with the DEFAULT ``TolAngular`` (0.001) gives exactly the 24 mesh
@@ -62,6 +71,7 @@ from typing import List, Optional
 import numpy as np
 
 from .geometry2d import (chain_to_primitives, dedupe_primitives, drop_covered_curves,
+                         primitives_to_segments, subtract_covered_curves,
                          drop_isolated_fragments, is_straight, merge_collinear, subtract_covered)
 from .model import Arc, BBox2D, Circle, LineStyle, Polyline, Primitive2D, ProjectedView, Segment
 
@@ -78,6 +88,9 @@ _DEFLECTION_PER_SCALE = 0.05   # pipeline rule deflection = 0.05 / scale, invert
 _COVER_PAPER_MM = 0.3          # poly route: hidden-on-visible subtraction tolerance (QA issue 27)
 _DASH_PERIOD_PAPER_MM = 3.0    # one hidden dash: chains with >= 2 shorter chords become Polylines (QA issue 6)
 _MIN_FRAGMENT_PAPER_MM = 0.3   # isolated open fragments shorter than this are dropped (QA issue 35)
+_CURVE_COVER_PAPER_MM = 0.05   # hidden curves on visible edges: loose cover tolerance (QA2 issue 18)
+_SUBTRACT_HIDDEN_CURVES = True  # hidden Polylines/Arcs/Circles lying on visible edges are cut (QA2 #18)
+_EXACT_SEGMENTS_LOOSE = True   # exact route: hidden Segments use the same loose 0.05 mm cover (QA2 #18)
 
 _VISIBLE_COMPOUNDS = ("VCompound", "OutLineVCompound")
 _HIDDEN_COMPOUNDS = ("HCompound", "OutLineHCompound")
@@ -331,9 +344,28 @@ def _polyline_edges(prims) -> np.ndarray:
     return np.concatenate(chunks)
 
 
+def _curve_cover(vis_arr: np.ndarray, vis_other: list, deflection: float) -> np.ndarray:
+    """Visible segments + visible Polylines/Arcs/Circles flattened at ``deflection``."""
+    chunks = [np.asarray(vis_arr, float).reshape(-1, 2, 2)]
+    if vis_other:
+        try:
+            chunks.append(primitives_to_segments(vis_other, deflection))
+        except (TypeError, ValueError):
+            chunks.append(_polyline_edges(vis_other))
+    return np.concatenate(chunks) if any(len(c) for c in chunks) else np.zeros((0, 2, 2))
+
+
 def _clean_hidden(hid_segs, hid_other, vis_arr, vis_other, tol: float, cover_tol: float,
-                  loose: bool, deadline: Optional[float]):
-    """Hidden half of ``_clean``: drop/subtract what lies on visible edges, merge collinear."""
+                  loose: bool, deadline: Optional[float], curve_tol: Optional[float] = None,
+                  deflection: Optional[float] = None, info: Optional[dict] = None):
+    """Hidden half of ``_clean``: drop/subtract what lies on visible edges, merge collinear.
+
+    ``curve_tol`` (default ``cover_tol``): loose tolerance with which hidden
+    Polylines / Arcs / Circles are cut where they lie on visible edges
+    (``subtract_covered_curves``, QA round 2 issue 18); ``deflection``
+    (default ``100 * tol``, the ``_geo_tol`` rule inverted) flattens the
+    curves. ``info`` gets ``hidden_curves_dropped`` / ``hidden_curves_trimmed``.
+    """
     hid_arr = _seg_array(hid_segs)
     if _SUBTRACT_COVERED:
         hid_other = drop_covered_curves(hid_other, vis_other, tol)
@@ -344,6 +376,15 @@ def _clean_hidden(hid_segs, hid_other, vis_arr, vis_other, tol: float, cover_tol
             # anywhere in the view (F1 review: 97.6 % of the hidden segments on 03)
             hid_arr = subtract_covered(hid_arr, cover, cover_tol, loose=loose, deadline=deadline,
                                        min_len=tol)
+        if _SUBTRACT_HIDDEN_CURVES and hid_other:
+            ctol = max(float(cover_tol if curve_tol is None else curve_tol), tol)
+            defl = 100.0 * tol if deflection is None else float(deflection)
+            cover_all = _curve_cover(vis_arr, vis_other, defl)
+            hid_other, st = subtract_covered_curves(hid_other, cover_all, ctol, deflection=defl,
+                                                    min_len=tol, deadline=deadline)
+            if info is not None:
+                info["hidden_curves_dropped"] = st["dropped"]
+                info["hidden_curves_trimmed"] = st["trimmed"]
     if len(hid_arr):
         hid_arr = merge_collinear(hid_arr, tol, deadline=deadline)
     return hid_arr, hid_other
@@ -358,7 +399,8 @@ def _emit(arr: np.ndarray, style: LineStyle, tol: float, chain_short: Optional[f
 
 def _clean(visible: list, hidden: list, tol: float, *, cover_tol: Optional[float] = None,
            loose: bool = False, chain_short: Optional[float] = None,
-           deadline: Optional[float] = None, info: Optional[dict] = None):
+           deadline: Optional[float] = None, info: Optional[dict] = None,
+           curve_tol: Optional[float] = None, deflection: Optional[float] = None):
     """Dedupe, drop/subtract hidden edges on visible ones, merge collinear segments.
 
     ``cover_tol`` (default ``tol``) is the tolerance of the hidden-on-visible
@@ -368,7 +410,9 @@ def _clean(visible: list, hidden: list, tol: float, *, cover_tol: Optional[float
     ``deadline``: when passed during the visible clean-up the visible
     segments are kept merged-or-not as far as they got; when passed during
     the hidden clean-up the hidden lines are dropped and ``info`` gets
-    ``hidden_dropped = True`` (QA issue 3). Returns (visible, hidden).
+    ``hidden_dropped = True`` (QA issue 3). ``curve_tol`` / ``deflection``:
+    see ``_clean_hidden`` (hidden curves on visible edges, QA round 2 issue
+    18). Returns (visible, hidden).
     """
     info = {} if info is None else info
     cover_tol = tol if cover_tol is None else max(float(cover_tol), tol)
@@ -391,7 +435,8 @@ def _clean(visible: list, hidden: list, tol: float, *, cover_tol: Optional[float
             hid_segs, hid_other = _split(hidden)
             hid_style = hid_segs[0].style if hid_segs else LineStyle.HIDDEN
             hid_arr, hid_other = _clean_hidden(hid_segs, hid_other, vis_arr, vis_other, tol,
-                                               cover_tol, loose, deadline)
+                                               cover_tol, loose, deadline, curve_tol=curve_tol,
+                                               deflection=deflection, info=info)
             hid_prims = _emit(hid_arr, hid_style, tol, chain_short, deadline) + hid_other
         except TimeoutError:
             info["hidden_dropped"] = True
@@ -571,14 +616,21 @@ def project_brep(shape, spec, *, exact: bool, deflection: float, hidden: bool = 
     t2 = time.perf_counter()
     scale = _paper_scale(deflection, paper_scale)
     tol = _geo_tol(deflection)
+    curve_tol = max(tol, _CURVE_COVER_PAPER_MM / scale)
     if exact:
         ctol, loose, chain_short = tol, False, None
+        if _EXACT_SEGMENTS_LOOSE:
+            ctol, loose = curve_tol, True
     else:
         ctol = max(tol, _COVER_PAPER_MM / scale) if cover_tol is None else max(float(cover_tol), tol)
         loose, chain_short = True, _DASH_PERIOD_PAPER_MM / scale
+    curve_tol = max(curve_tol, ctol)
     info: dict = {}
     visible, hidden_prims = _clean(visible, hidden_prims, tol, cover_tol=ctol, loose=loose,
-                                   chain_short=chain_short, deadline=deadline, info=info)
+                                   chain_short=chain_short, deadline=deadline, info=info,
+                                   curve_tol=curve_tol, deflection=deflection)
+    for k in ("hidden_curves_dropped", "hidden_curves_trimmed"):
+        stats[k] = int(info.get(k, 0))
     if info.get("hidden_dropped"):
         drop_hidden(info.get("hidden_dropped_reason", "time_budget"))
     if info.get("visible_unmerged"):

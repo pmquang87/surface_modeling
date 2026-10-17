@@ -985,7 +985,8 @@ def test_issue14_depth_sign_on_the_mesh_route(tmp_path):
     assert rep["ok"] is True, rep["error"]
     o = rep["route"]["orientation"]
     assert o["permutation"] == [0, 1, 2]               # precondition: identity permutation
-    assert o["depth_method"] == "mesh_feature_edges"
+    # R5: the report names the deciding rule of choose_depth_sign_mesh (QA round 2 issue 4)
+    assert o["depth_method"] in ("mesh_cavity", "mesh_feature_edges")
     assert o["depth_flipped"] is True and o["flips"] == [-1, -1, 1]
     # mirror control: bosses already on the viewer's side -> no turn (an
     # always-flip scorer fails here)
@@ -995,7 +996,7 @@ def test_issue14_depth_sign_on_the_mesh_route(tmp_path):
                                                   views=("front",), stl_to_step="off"))
     assert rep2["ok"] is True, rep2["error"]
     o2 = rep2["route"]["orientation"]
-    assert o2["permutation"] == [0, 1, 2] and o2["depth_method"] == "mesh_feature_edges"
+    assert o2["permutation"] == [0, 1, 2] and o2["depth_method"] == o["depth_method"]
     assert o2["depth_flipped"] is False and o2["flips"] == [1, 1, 1]
     assert o2["depth_scores"]["kept"] > o2["depth_scores"]["flipped"]
 
@@ -1589,3 +1590,447 @@ def test_f7_stage_lines_on_stderr_under_quiet(plate_files, tmp_path):
     assert all("elapsed" in ln and "rss" in ln for ln in stage)
     # nothing else of the progress chatter under --quiet
     assert "[drawing]" not in proc.stderr
+
+
+# ================================================= QA round 2 (R5 integration) ==
+
+def _plate_row_compound(n, pitch=120.0):
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.gp import gp_Trsf, gp_Vec
+    plate = _plate()
+    parts = []
+    for i in range(n):
+        t = gp_Trsf()
+        t.SetTranslation(gp_Vec(pitch * i, 0.0, 0.0))
+        parts.append(BRepBuilderAPI_Transform(plate, t, False).Shape())
+    return _compound(parts)
+
+
+@pytest.fixture(scope="module")
+def plate_row_3(tmp_path_factory):
+    if not HAS_OCP:
+        pytest.skip("cadquery-ocp not installed")
+    return _write_step(_plate_row_compound(3), tmp_path_factory.mktemp("row3") / "row3.step")
+
+
+@needs_ocp
+def test_r2_issue5_11_assembly_has_no_hole_dims_and_no_auto_section(plate_row_3, tmp_path,
+                                                                     monkeypatch):
+    """Issue 5: an assembly above _ASSEMBLY_MIN_SOLIDS gets no hole callouts and no
+    position dims (undimensioned reason 'assembly', info flag); issue 11: no auto
+    section (info flag) unless --section names a plane; issue 16: n_bodies reaches
+    the planner (body_extent / body_position entries)."""
+    import src.drawing.pipeline as pl
+    o = dict(formats=("svg",), views=("front", "top"))
+    _, ref = pl.run(plate_row_3, str(tmp_path / "ref"), _opts(**o))
+    assert ref["ok"] is True, ref["error"]
+    # precondition: 3 solids below the threshold get callouts, positions and a section
+    assert ref["geometry"]["solids"] == 3
+    assert any(d["kind"] == "diameter" for d in ref["dimensions"])
+    assert ref["section"] is not None and ref["section"]["loops"] > 0
+    kinds = {u["kind"] for u in ref["undimensioned"]}
+    assert {"body_extent", "body_position"} <= kinds, ref["undimensioned"]
+    monkeypatch.setattr(pl, "_ASSEMBLY_MIN_SOLIDS", 2)
+    code, rep = pl.run(plate_row_3, str(tmp_path / "asm"), _opts(**o))
+    assert rep["ok"] is True, rep["error"]
+    assert rep["dimensions"] and all(d["kind"] == "linear" for d in rep["dimensions"])
+    ext = sorted(round(v, 3) for v in rep["geometry"]["extents"])
+    assert all(round(d["value_mm"], 3) in ext for d in rep["dimensions"]), rep["dimensions"]
+    asm = [u for u in rep["undimensioned"] if u.get("reason") == "assembly"]
+    assert asm and all(u["kind"] == "hole_group" for u in asm)
+    assert sum(int(u["count"]) for u in asm) == 3 * 5            # 3 plates x 5 holes
+    codes = _codes(rep)
+    assert codes.get("dimensions_omitted_assembly") == "info"
+    assert codes.get("section_skipped_assembly") == "info"
+    assert rep["section"] is None
+    # an explicit plane still draws the section of the assembly
+    _, rep2 = pl.run(plate_row_3, str(tmp_path / "asm_front"), _opts(section="front", **o))
+    assert rep2["ok"] is True, rep2["error"]
+    assert rep2["section"] is not None and rep2["section"]["loops"] > 0
+    assert "section_skipped_assembly" not in _codes(rep2)
+    assert _codes(rep2).get("dimensions_omitted_assembly") == "info"
+
+
+@needs_ocp
+def test_r2_issue11_section_skipped_when_its_estimated_cost_exceeds_the_budget(
+        plate_files, tmp_path, monkeypatch):
+    import src.drawing.pipeline as pl
+    o = dict(formats=("svg",), views=("front", "top"))
+    _, ref = pl.run(plate_files["step"], str(tmp_path / "a"), _opts(**o))
+    assert ref["section"] is not None and "section_skipped_budget" not in _codes(ref)
+    # the estimate is _SECTION_COST_VIEWS x the mean view time: make it absurd
+    monkeypatch.setattr(pl, "_SECTION_COST_VIEWS", 1e9)
+    code, rep = pl.run(plate_files["step"], str(tmp_path / "b"), _opts(**o))
+    assert rep["ok"] is True, rep["error"]
+    assert rep["section"] is None
+    fl = [f for f in rep["quality"]["flags"] if f["code"] == "section_skipped_budget"]
+    assert len(fl) == 1 and "estimated" in fl[0]["detail"]
+    assert code == 2
+
+
+def _inverted_sphere_one_face_back():
+    import trimesh
+    s = trimesh.creation.icosphere(subdivisions=3, radius=20.0)
+    f = s.faces[:, ::-1].copy()                      # inside out ...
+    f[0] = f[0, ::-1]                                # ... except one triangle: 3 conflicts
+    return trimesh.Trimesh(s.vertices, f, process=False)
+
+
+@needs_ocp
+def test_r2_issue8_inverted_mesh_with_a_few_conflicts_is_flagged_once(tmp_path):
+    from src.drawing.mesh_load import mesh_census
+    from src.drawing.pipeline import run
+    mesh = _inverted_sphere_one_face_back()
+    c = mesh_census(mesh)
+    # precondition: the old rule (conflicts == 0) would not flag this mesh
+    assert c["inverted"] and c["winding_conflicts"] > 0 and c["inverted_solid"]
+    assert c["volume_raw_signed_mm3"] < 0
+    p = str(tmp_path / "inv.stl")
+    mesh.export(p)
+    _, rep = run(p, str(tmp_path / "o"), _opts(formats=("svg",), stl_to_step="off",
+                                               section="off", views=("front",)))
+    assert rep["ok"] is True, rep["error"]
+    fl = {f["code"]: f for f in rep["quality"]["flags"]}
+    assert fl["inverted_solid"]["severity"] == "warning"
+    assert "-3" in fl["inverted_solid"]["detail"]           # the signed raw sum, -33174
+    assert fl["winding_repaired"]["severity"] == "info"
+    assert str(c["winding_conflicts"]) in fl["winding_repaired"]["detail"]
+    winding = [w for w in rep["warnings"] if "winding" in w]
+    assert len(winding) <= 1, rep["warnings"]
+    assert not any("winding is inconsistent" in w for w in rep["warnings"])
+
+
+def test_r2_issue10_text_collision_is_a_warning_moves_are_info(tmp_path):
+    from src.drawing.report import ESCALATABLE_FLAGS, FLAGS, Report
+    assert FLAGS["layout_text_collision"] == "warning"
+    assert FLAGS["layout_text_moved"] == "info" and FLAGS["layout_dims_dropped"] == "info"
+    assert "section_gaps_bridged" in ESCALATABLE_FLAGS
+    rep = Report(str(tmp_path / "p.step"), str(tmp_path), _opts())
+    rep.flag("layout_text_moved", "info", "2 texts moved")
+    assert rep.finish(True)[0] == 0
+    rep2 = Report(str(tmp_path / "p.step"), str(tmp_path), _opts())
+    rep2.flag("layout_text_collision", None, "1 left")
+    assert rep2.finish(True)[0] == 2
+
+
+@needs_ocp
+def test_r2_issue21_section_fill_reported_and_blackened_flag(plate_files, tmp_path):
+    from src.drawing.pipeline import run
+    thin = _write_step(_box_shape(200, 150, 1), tmp_path / "thin.step")
+    _, rep = run(thin, str(tmp_path / "a"), _opts(formats=("svg",), views=("front", "top")))
+    assert rep["ok"] is True, rep["error"]
+    s = rep["section"]
+    # precondition: a 1 mm wall at 1:1 or smaller is under the 2.1 mm fill limit
+    assert s is not None and s["loops"] > 0 and rep["sheet"]["scale"] in ("1:1", "1:2"), \
+        rep["sheet"]["scale"]
+    assert s["fill"] == "solid" and s["filled_regions"] >= 1
+    assert s["filled_area_fraction"] > 0.5
+    # review R5: a 1 mm plate is thin-walled by design (filled at 1:1 too): no flag
+    assert s["thin_walled_by_design"] is True and max(s["body_thickness_model_mm"]) < 2.1
+    assert "section_blackened" not in _codes(rep)
+    # a 4 mm wall at 1:5 (NIST FTC 07 shape of the problem): the scale blackened it
+    wall = _write_step(_box_shape(800, 600, 4), tmp_path / "wall.step")
+    _, rw = run(wall, str(tmp_path / "w"), _opts(formats=("svg",), views=("front", "top")))
+    assert rw["ok"] is True, rw["error"]
+    sw = rw["section"]
+    assert rw["sheet"]["scale"] == "1:5" and sw["fill"] == "solid", (rw["sheet"], sw)
+    assert sw["body_thickness_paper_mm"][0] == pytest.approx(0.8, abs=0.01)
+    assert sw["body_thickness_model_mm"][0] == pytest.approx(4.0, abs=0.05)
+    assert sw["thin_walled_by_design"] is False
+    assert _codes(rw).get("section_blackened") == "info"
+    # control: the 15 mm plate is hatched and not flagged
+    _, ref = run(plate_files["step"], str(tmp_path / "b"), _opts(formats=("svg",),
+                                                                 views=("front", "top")))
+    assert ref["section"]["fill"] == "hatch" and ref["section"]["filled_area_fraction"] == 0.0
+    assert ref["section"]["hatch_segments"] > 0
+    assert "section_blackened" not in _codes(ref)
+
+
+@needs_ocp
+def test_r2_issue21_bridged_mesh_section_gaps_are_flagged(tmp_path):
+    import trimesh
+    from src.drawing.pipeline import run
+    b = trimesh.creation.box(extents=(40.0, 20.0, 30.0))
+    keep = ~(b.triangles_center[:, 0] > 19.9)                     # drop the +X face
+    open_box = trimesh.Trimesh(b.vertices, b.faces[keep], process=False)
+    assert not open_box.is_watertight                             # precondition
+    p = str(tmp_path / "open.stl")
+    open_box.export(p)
+    o = _opts(formats=("svg",), stl_to_step="off", views=("front", "top"))
+    _, rep = run(p, str(tmp_path / "o"), o)
+    assert rep["ok"] is True, rep["error"]
+    assert rep["section"]["bridged_gaps"] >= 1
+    fl = [f for f in rep["quality"]["flags"] if f["code"] == "section_gaps_bridged"]
+    # a 20-30 mm chord on a 40 mm section: far above 5 % of the extent -> warning
+    assert len(fl) == 1 and fl[0]["severity"] == "warning", fl
+    # control: the closed box bridges nothing
+    q = str(tmp_path / "closed.stl")
+    b.export(q)
+    _, rep2 = run(q, str(tmp_path / "o2"), o)
+    assert rep2["section"]["bridged_gaps"] == 0
+    assert "section_gaps_bridged" not in _codes(rep2)
+
+
+_TESS_EXTRA_R5 = (
+    "#30=COORDINATES_LIST('',2,((0.0,0.0,0.0),(1.0,0.0,0.0)));\n"
+    "#31=TESSELLATED_CURVE_SET('',#30,((1,2)));\n"
+    "#32=TESSELLATED_GEOMETRIC_SET('flatness',(#31));\n"
+    "#34=PRESENTATION_STYLE_ASSIGNMENT(());\n"
+    "#35=TESSELLATED_ANNOTATION_OCCURRENCE('Flatness.1',(#34),#32);\n"
+    "#40=TRIANGULATED_FACE('',#20,8,(),$,(1,2,3,4,5,6,7,8),((1,2,3)));\n"
+    "#41=TESSELLATED_SHELL('supp',(#40),$);\n"
+    "#42=CONSTRUCTIVE_GEOMETRY_REPRESENTATION('supplemental geometry',(#41),#14);\n")
+
+
+@needs_ocp
+def test_r2_issue24_tessellated_route_reports_what_it_leaves_out(tmp_path):
+    from src.drawing.pipeline import run
+    plain = tmp_path / "tess.stp"
+    plain.write_text(_tess_step_text(), encoding="ascii")
+    _, ref = run(str(plain), str(tmp_path / "a"), _opts(formats=("svg",), views=("front",)))
+    assert ref["ok"] is True, ref["error"]
+    # control: nothing is left out of the plain file
+    assert not {"supplemental_shells_ignored", "loose_curves_ignored"} & set(_codes(ref))
+    assert ref["route"]["stl_to_step"]["skipped_reason"] == "tessellated_step"
+    assert ref["geometry"]["bodies"] is not None
+    p = tmp_path / "tess_extra.stp"
+    p.write_text(_tess_step_text().replace("ENDSEC;\nEND-ISO", _TESS_EXTRA_R5 + "ENDSEC;\nEND-ISO"),
+                 encoding="ascii")
+    _, rep = run(str(p), str(tmp_path / "b"), _opts(formats=("svg",), views=("front",)))
+    assert rep["ok"] is True, rep["error"]
+    assert rep["route"]["source"] == "step_tessellated_mesh"      # precondition
+    codes = _codes(rep)
+    assert codes.get("supplemental_shells_ignored") == "info"
+    assert codes.get("loose_curves_ignored") == "info"
+    dropped = rep["geometry"]["bodies"]["dropped"]
+    assert dropped.get("tessellated_shells_outside") == 1
+    assert dropped.get("annotation_occurrences") == 1
+    assert rep["route"]["stl_to_step"]["skipped_reason"] == "tessellated_step"
+
+
+@needs_ocp
+def test_r2_issue30_unit_note_on_the_sheet_when_the_unit_is_doubtful(plate_files, tmp_path):
+    from src.drawing.pipeline import run
+    inch = _box_stl(tmp_path / "inch_part.stl", (5.0, 2.5, 1.375))
+    o = _opts(formats=("svg",), views=("front", "top"), stl_to_step="off")
+    _, rep = run(inch, str(tmp_path / "a"), o)
+    assert rep["ok"] is True, rep["error"]
+    assert _codes(rep).get("unit_suspect") == "warning"            # precondition
+    svg = (tmp_path / "a" / "inch_part.svg").read_text(encoding="utf-8")
+    assert "unit assumed" in svg
+    assert "unit assumed" in (rep["sheet"].get("unit_note") or "")
+    # control: a plain mm STEP keeps the plain note
+    _, ref = run(plate_files["step"], str(tmp_path / "b"), _opts(formats=("svg",),
+                                                                 views=("front",)))
+    svg2 = (tmp_path / "b" / "plate.svg").read_text(encoding="utf-8")
+    assert "Dimensions in mm" in svg2 and "unit assumed" not in svg2
+    assert ref["sheet"].get("unit_note") is None
+
+
+@needs_ocp
+def test_r2_view_entries_carry_the_clean_up_counts_and_writers_dash_adapted(plate_files,
+                                                                             tmp_path):
+    from src.drawing.pipeline import run
+    _, rep = run(plate_files["step"], str(tmp_path / "a"), _opts(formats=("svg", "pdf", "dxf"),
+                                                                 views=("front", "top")))
+    assert rep["ok"] is True, rep["error"]
+    for v in rep["views"]:
+        assert isinstance(v.get("hidden_curves_dropped"), int), v
+        assert isinstance(v.get("hidden_curves_trimmed"), int), v
+    da = rep["writers"]["dash_adapted"]
+    assert set(da) == {"svg", "pdf", "dxf"} and all(isinstance(n, int) for n in da.values())
+    blob = _blob_stl(str(tmp_path / "blob.stl"))
+    _, rep2 = run(blob, str(tmp_path / "b"), _opts(formats=("svg",), views=("front",),
+                                                   section="off"))
+    assert rep2["route"]["pipeline"] == "mesh"                     # precondition
+    v = rep2["views"][0]
+    for key in ("welded_ends", "hairpins_removed", "closed_loops_dropped", "dropped_chains",
+                "n_sliver_pairs"):
+        assert isinstance(v.get(key), int), (key, v)
+
+
+def _pocket_box(pocket_side):
+    """150 x 30 x 75 box, a 100 x 15 x 50 pocket opening to -Y (side -1) or +Y (+1), and
+    twelve 3 x 1 x 3 notches on the opposite face (more, smaller faces there)."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    shape = _box_shape(150, 30, 75)
+    y_pocket = 0.0 if pocket_side < 0 else 15.0
+    shape = BRepAlgoAPI_Cut(shape, _box_shape(100, 15, 50, (25, y_pocket, 12.5))).Shape()
+    y_notch = 29.0 if pocket_side < 0 else 0.0
+    for i in range(6):
+        for z in (10.0, 60.0):
+            shape = BRepAlgoAPI_Cut(shape, _box_shape(3, 1, 3, (15 + 22 * i, y_notch, z))).Shape()
+    return shape
+
+
+@needs_ocp
+def test_r2_issue4_pipeline_depth_sign_follows_the_open_pocket(tmp_path):
+    from src.drawing.brep_features import score_depth_sign
+    from src.drawing.pipeline import run
+    near = _pocket_box(-1)
+    plus, minus = score_depth_sign(near, (0.0, -1.0, 0.0))
+    assert minus > 1.25 * plus                     # precondition: the face count would turn it
+    o = _opts(formats=("svg",), section="off", views=("front",))
+    _, rn = run(_write_step(near, tmp_path / "near.step"), str(tmp_path / "a"), o)
+    _, rf = run(_write_step(_pocket_box(+1), tmp_path / "far.step"), str(tmp_path / "b"), o)
+    assert rn["ok"] and rf["ok"], (rn["error"], rf["error"])
+    on, of = rn["route"]["orientation"], rf["route"]["orientation"]
+    assert on["permutation"] == of["permutation"] == [0, 1, 2]
+    assert on["depth_method"] == of["depth_method"] == "brep_cavity"
+    assert on["depth_flipped"] is False and of["depth_flipped"] is True
+    for key in ("cavity_kept", "cavity_flipped", "mean_recess_kept", "housing"):
+        assert key in on["depth_scores"], on["depth_scores"]
+
+
+@needs_ocp
+def test_r2_hidden_only_holes_are_flagged(tmp_path):
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+    from src.drawing.pipeline import run
+    box = _box_shape(50, 20, 30)
+    hole = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(25, 21, 15), gp_Dir(0, -1, 0)), 2.5, 11.0).Shape()
+    p = _write_step(BRepAlgoAPI_Cut(box, hole).Shape(), tmp_path / "blind_back.step")
+    _, rep = run(p, str(tmp_path / "o"), _opts(formats=("svg",), section="off", views=("front",),
+                                                orient="fixed"))
+    assert rep["ok"] is True, rep["error"]
+    assert rep["geometry"]["features"]["holes"] == 1                # precondition
+    assert not any(d["kind"] == "diameter" for d in rep["dimensions"])
+    fl = [f for f in rep["quality"]["flags"] if f["code"] == "dimension_hidden_only"]
+    assert len(fl) == 1 and fl[0]["severity"] == "info"
+
+
+def test_r2_issue12_docs_list_every_flag_with_its_severity():
+    from src.drawing.report import FLAG_MEANINGS, FLAGS, LEVELS, flag_table_markdown
+    assert set(FLAG_MEANINGS) == set(FLAGS)
+    assert not [c for c, m in FLAG_MEANINGS.items() if "|" in m or not m]   # table-safe
+    path = os.path.join(REPO, "docs", "drawing_module.md")
+    text = open(path, encoding="utf-8").read()
+    missing = [c for c in FLAGS if f"`{c}`" not in text]
+    assert not missing, missing
+    # the table in the doc is the generated one (severity, escalation, meaning)
+    assert flag_table_markdown() in text
+    for level in LEVELS:
+        assert f"`{level}`" in text, level
+    for value in ("assumed_mm", "stl_binary_truncated", "step_tessellated_mesh",
+                  "--stl-unit", "--hidden-lines-force", "--max-hidden-primitives",
+                  "tessellated_step", "HIDDEN_ISO"):
+        assert value in text, value
+    spec = open(os.path.join(REPO, "docs", "superpowers", "specs",
+                             "2026-10-17-drawing-module-design.md"), encoding="utf-8").read()
+    s38 = spec.split("### 3.8", 1)[1].split("### 3.9", 1)[0]
+    missing_spec = [c for c in FLAGS if f"`{c}`" not in s38]
+    assert not missing_spec, missing_spec
+
+
+# ======================================== QA round 2 (R5 review follow-up) ==
+
+def _pinned_plate_row(n=3, pitch=120.0, pin_r=3.0):
+    """n plates of _plate() in a row, each with a separate pin solid (radius pin_r)
+    in its hole at (8, 8): 2 n solids, n filled holes of radius 3.25."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
+    plate = _plate()
+    parts = []
+    for i in range(n):
+        t = gp_Trsf()
+        t.SetTranslation(gp_Vec(pitch * i, 0.0, 0.0))
+        parts.append(BRepBuilderAPI_Transform(plate, t, False).Shape())
+        parts.append(BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(8 + pitch * i, 8, 0), gp_Dir(0, 0, 1)),
+                                              pin_r, 15.0).Shape())
+    return _compound(parts)
+
+
+def test_r5_assembly_hole_groups_list_filled_holes_too():
+    """Review R5: the assembly gate drops 'hole' AND 'filled_hole' features; the filled
+    ones must be listed too (reason filled_by_fastener), not vanish."""
+    from types import SimpleNamespace as NS
+    from src.drawing.pipeline import _assembly_hole_groups
+    feats = ([NS(kind="hole", radius=3.25)] * 4 + [NS(kind="filled_hole", radius=3.25)] * 3
+             + [NS(kind="filled_hole", radius=5.0)] + [NS(kind="boss", radius=15.0)])
+    groups = _assembly_hole_groups(feats)
+    assert all(g["kind"] == "hole_group" for g in groups)
+    plain = {g["radius"]: g["count"] for g in groups if g["reason"] == "assembly"}
+    filled = {g["radius"]: g["count"] for g in groups if g["reason"] == "filled_by_fastener"}
+    assert plain == {3.25: 4}
+    assert filled == {3.25: 3, 5.0: 1}, groups
+    assert sum(g["count"] for g in groups) == 8          # every hole feature disclosed once
+
+
+@needs_ocp
+def test_r5_assembly_filled_holes_are_disclosed_end_to_end(tmp_path, monkeypatch):
+    import src.drawing.pipeline as pl
+    p = _write_step(_pinned_plate_row(3), tmp_path / "pinned.step")
+    monkeypatch.setattr(pl, "_ASSEMBLY_MIN_SOLIDS", 2)
+    _, rep = pl.run(p, str(tmp_path / "o"), _opts(formats=("svg",), views=("front", "top")))
+    assert rep["ok"] is True, rep["error"]
+    feats = rep["geometry"]["features"]
+    # precondition: the pins fill one hole per plate (a real filled_hole feature)
+    assert rep["geometry"]["solids"] == 6
+    assert feats.get("filled_holes") == 3 and feats["holes"] == 3 * 4, feats
+    und = rep["undimensioned"]
+    filled = [u for u in und if u.get("reason") == "filled_by_fastener"]
+    asm = [u for u in und if u.get("reason") == "assembly"]
+    assert sum(int(u["count"]) for u in filled) == 3, und
+    assert sum(int(u["count"]) for u in asm) == 12, und
+    fl = [f for f in rep["quality"]["flags"] if f["code"] == "dimensions_omitted_assembly"]
+    assert len(fl) == 1 and "15 hole feature(s)" in fl[0]["detail"], fl
+    assert "3 filled" in fl[0]["detail"], fl
+
+
+def _section_report_for(tmp_path, sl, scale=None):
+    from src.drawing.pipeline import _report_section_fill
+    from src.drawing.report import Report
+    rep = Report(str(tmp_path / "p.step"), str(tmp_path), _opts())
+    rep.data["section"] = {"loops": 2}
+    if scale is None:
+        _report_section_fill(rep, sl)
+    else:
+        _report_section_fill(rep, sl, scale=scale)
+    return rep
+
+
+def test_r5_section_thickness_is_paper_mm_and_thin_by_design_is_not_flagged(tmp_path):
+    """Review R5: body_thickness from the layout is 2A/P ON THE SHEET; the report keys
+    say so (paper / model mm), and section_blackened is only raised when the walls
+    would be hatched at 1:1 (blackened by the scale, not thin-walled by design)."""
+    from src.drawing.style import section_fill_below
+    limit = section_fill_below()
+    sl = {"fill": "solid", "filled_regions": 1, "filled_area_fraction": 1.0, "bodies": 1,
+          "body_thickness": [0.8], "hatch_segments": 0}
+    # 4 mm wall drawn at 1:5 -> 0.8 mm on paper: blackened by the scale -> flagged
+    rep = _section_report_for(tmp_path, sl, scale=0.2)
+    sec = rep.data["section"]
+    assert "body_thickness_mm" not in sec
+    assert sec["body_thickness_paper_mm"] == [0.8]
+    assert sec["body_thickness_model_mm"] == [4.0]
+    assert 4.0 > limit and sec["thin_walled_by_design"] is False      # precondition
+    assert rep.has_flag("section_blackened")
+    # 0.8 mm sheet metal at 1:1: thin by design, filled whatever the scale -> no flag
+    rep2 = _section_report_for(tmp_path, sl, scale=1.0)
+    sec2 = rep2.data["section"]
+    assert sec2["filled_area_fraction"] > 0.5 and sec2["body_thickness_model_mm"] == [0.8]
+    assert sec2["thin_walled_by_design"] is True
+    assert not rep2.has_flag("section_blackened")
+    # no scale known: old behaviour (flag on the area share alone), no model thickness
+    rep3 = _section_report_for(tmp_path, sl)
+    assert "body_thickness_model_mm" not in rep3.data["section"]
+    assert rep3.has_flag("section_blackened")
+
+
+@needs_ocp
+def test_r5_timing_has_features_dimensions_and_layout_buckets(plate_files, tmp_path):
+    """Review R5: about 25 s of the RC buggy's child total sat in no timing bucket
+    (feature detection, dimension planning, layout); each has its own bucket now."""
+    from src.drawing.pipeline import run
+    _, rep = run(plate_files["step"], str(tmp_path / "o"),
+                 _opts(formats=("svg",), views=("front", "top")))
+    assert rep["ok"] is True, rep["error"]
+    t = rep["timing"]
+    for key in ("features_s", "dimensions_s", "layout_s", "writers_s"):
+        assert isinstance(t.get(key), float) and t[key] >= 0.0, (key, t)
+    assert t["features_s"] > 0.0                       # cylinder_features ran on the plate
+    # write_s stays the whole sheet stage: dimensions + layout + writers
+    parts = t["dimensions_s"] + t["layout_s"] + t["writers_s"]
+    assert abs(parts - t["write_s"]) < 0.05 + 0.02 * t["write_s"], t

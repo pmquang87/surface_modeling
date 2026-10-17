@@ -10,7 +10,8 @@ Facts this module relies on (writers probe, ezdxf 1.4.4, re-read with
 
 * ``ezdxf.new("R2010", setup=True)`` has no ``HIDDEN`` linetype; a layer
   that asks for it saves fine and ``audit`` then silently replaces it by
-  CONTINUOUS (1 fix). Hidden lines therefore use ``DASHED``; ``write_dxf``
+  CONTINUOUS (1 fix). The writer therefore defines its own linetypes
+  (``add_iso_linetypes``) before the layers ask for them; ``write_dxf``
   re-reads the file and reports ``audit_errors`` / ``audit_fixes`` so an
   undefined linetype cannot pass unnoticed.
 * The ``EZDXF`` dimstyle is a cm style (``dimlfac=100``, tick arrows) and
@@ -31,14 +32,17 @@ Facts this module relies on (writers probe, ezdxf 1.4.4, re-read with
   the explicit lines' spacing and direction; ``hatch_style`` 0 (odd parity)
   leaves holes unhatched.
 
-Layers (spec 3.7): VISIBLE 50, HIDDEN (DASHED) 25, SECTION 50, HATCH 25,
-CENTER (CENTER) 25, CUTTING (CENTER) 50, DIM 25, TEXT 25, FRAME 70 (the
-0.7 mm ISO 5457 frame of ``SheetStyle``), TITLE 25. FRAME 70 and the extra
-CUTTING layer deviate from the spec text (FRAME 50, no CUTTING) on purpose.
-``$LTSCALE`` is set so the DASHED dash is the ISO hidden dash (3 mm; DASHED
-is 1.27 long at scale 1); the gaps (0.6 mm) and the CENTER pattern
-(7.5/1.5/1.5/1.5 mm, also used for CUTTING) only approximate the ISO
-patterns the PDF/SVG draw exactly.
+Layers (spec 3.7): VISIBLE 50, HIDDEN (HIDDEN_ISO) 25, SECTION 50, HATCH 25,
+CENTER (CENTER_ISO) 25, CUTTING (CUTTING_ISO) 50, DIM 25, TEXT 25, FRAME 70
+(the 0.7 mm ISO 5457 frame of ``SheetStyle``), TITLE 25. FRAME 70 and the
+extra CUTTING layer deviate from the spec text (FRAME 50, no CUTTING) on
+purpose. The three ``*_ISO`` linetypes are built from the ``SheetStyle``
+dashes (hidden 3/0.75, centre 6/0.75/0.125/0.75, cutting 12/1.5/0.25/1.5)
+and ``$LTSCALE`` is 1, so the DXF draws the same patterns as the PDF/SVG
+(QA round 2 issue 22; the stock DASHED/CENTER patterns only approximated
+them: gaps 0.6 mm, centre 7.5/1.5/1.5/1.5). Short hidden entities get a
+per-entity ``ltscale`` that shows two dashes (closed: >= 4 periods) on
+them (QA round 2 issue 2); a hidden circle stays one CIRCLE.
 
 Text height: ``Text.height`` is the em size in the PDF/SVG; DXF TEXT height
 is the capital height, so TEXT entities and dimension text (``dimtxt``) get
@@ -80,7 +84,7 @@ import numpy as np
 from ..model import (Arc, Circle, Dimension, HatchLines, LineStyle, Polygon, Polyline, Segment,
                      Sheet, Text)
 from ..style import DEFAULT_STYLE, SheetStyle
-from . import CAP_HEIGHT, arc_span, clean_text, valid_item
+from . import CAP_HEIGHT, arc_span, clean_text, hidden_ltscale, valid_item
 from .svg import polyline_points
 
 log = logging.getLogger(__name__)
@@ -104,21 +108,48 @@ _EZDXF_MARKER_NAMES = (b"CREATED_BY_EZDXF", b"WRITTEN_BY_EZDXF")
 # name, ACI colour, linetype, lineweight (1/100 mm)
 LAYERS: Dict[LineStyle, Tuple[str, int, str, int]] = {
     LineStyle.VISIBLE: ("VISIBLE", 7, "CONTINUOUS", 50),
-    LineStyle.HIDDEN: ("HIDDEN", 8, "DASHED", 25),
+    LineStyle.HIDDEN: ("HIDDEN", 8, "HIDDEN_ISO", 25),
     LineStyle.SECTION: ("SECTION", 7, "CONTINUOUS", 50),
     LineStyle.HATCH: ("HATCH", 7, "CONTINUOUS", 25),
-    LineStyle.CENTER: ("CENTER", 1, "CENTER", 25),
-    LineStyle.CUTTING: ("CUTTING", 1, "CENTER", 50),
+    LineStyle.CENTER: ("CENTER", 1, "CENTER_ISO", 25),
+    LineStyle.CUTTING: ("CUTTING", 1, "CUTTING_ISO", 50),
     LineStyle.DIMENSION: ("DIM", 3, "CONTINUOUS", 25),
     LineStyle.TEXT: ("TEXT", 7, "CONTINUOUS", 25),
     LineStyle.FRAME: ("FRAME", 7, "CONTINUOUS", 70),
     LineStyle.TITLE: ("TITLE", 7, "CONTINUOUS", 25),
 }
-DASHED_DASH = 1.27          # DASHED dash length at LTSCALE 1 (ezdxf setup linetype)
+DASHED_DASH = 1.27          # stock DASHED dash length at LTSCALE 1 (kept for callers; $LTSCALE is 1 now)
+# custom ISO 128 linetypes (QA round 2 issue 22): name -> (SheetStyle attribute, description)
+ISO_LINETYPES: Dict[str, Tuple[str, str]] = {
+    "HIDDEN_ISO": ("dash_hidden", "ISO 128 hidden 02.1"),
+    "CENTER_ISO": ("dash_center", "ISO 128 centre 04.1"),
+    "CUTTING_ISO": ("dash_cutting", "ISO 128 cutting plane 04.2"),
+}
 ANSI31_SPACING = 3.175      # ANSI31 line spacing at pattern scale 1 (measured)
 DIAMETER_REGION_REACH = 45.0   # default leader reach (mm beyond the circle) searched for copies
 SHELF_TOL = 0.01               # mm, a shelf must start on the leader ray
 HORIZONTAL_TOL = 1e-3          # mm, |dy| of a horizontal shelf segment
+
+
+def iso_linetype_pattern(dash) -> List[float]:
+    """ezdxf linetype pattern ``[total, dash, -gap, dash, -gap, ...]`` of a SheetStyle dash tuple."""
+    vals = [abs(float(v)) for v in dash]
+    return [sum(vals)] + [v if i % 2 == 0 else -v for i, v in enumerate(vals)]
+
+
+def add_iso_linetypes(doc, sheet_style: SheetStyle = DEFAULT_STYLE) -> None:
+    """Define HIDDEN_ISO / CENTER_ISO / CUTTING_ISO from the SheetStyle dashes.
+
+    At ``$LTSCALE`` 1 the DXF then draws the same ISO 128 patterns as the
+    PDF/SVG (the stock DASHED/CENTER patterns of ``ezdxf.new(setup=True)``
+    are 1.27/0.635 and 31.75/6.35/6.35/6.35 at scale 1, so no single
+    ``$LTSCALE`` matches both).
+    """
+    for name, (attr, descr) in ISO_LINETYPES.items():
+        if name in doc.linetypes:
+            continue
+        doc.linetypes.add(name, iso_linetype_pattern(getattr(sheet_style, attr)),
+                          description=descr)
 
 
 def _layer(style) -> str:
@@ -330,10 +361,17 @@ def _exact_copies(sheet: Sheet, written: List[bool]) -> Optional[set]:
     return drop
 
 
-def _add_item(msp, item, sheet_style: SheetStyle) -> int:
-    """Add one item; returns the number of entities created."""
+def _add_item(msp, item, sheet_style: SheetStyle, ltscale: Optional[float] = None) -> int:
+    """Add one item; returns the number of entities created.
+
+    ``ltscale`` (optional) is written as the entity linetype scale (group 48)
+    of a Segment / Polyline / Circle / Arc (short hidden elements, QA round 2
+    issue 2).
+    """
     layer = _layer(item.style)
     attribs = {"layer": layer}
+    if ltscale is not None and isinstance(item, (Segment, Polyline, Circle, Arc)):
+        attribs["ltscale"] = float(ltscale)
     if isinstance(item, Segment):
         msp.add_line(tuple(map(float, item.a)), tuple(map(float, item.b)), dxfattribs=attribs)
         return 1
@@ -516,7 +554,9 @@ def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE, 
 
     Returns ``{"bytes", "entities", "layers": {name: count}, "dimensions",
     "dimensions_skipped", "dimension_items_replaced", "dimension_match",
-    "skipped", "audit_errors", "audit_fixes", "fingerprint_guid"}``;
+    "skipped", "audit_errors", "audit_fixes", "fingerprint_guid", "dash_adapted"}``;
+    ``dash_adapted`` counts the short hidden entities written with their own
+    linetype scale (``writers.hidden_ltscale``);
     ``dimension_match`` is ``"exact"`` (``meta["dimension_items"]``) or
     ``"geometric"``; ``skipped`` counts skipped items plus skipped
     dimensions; the audit numbers come from re-reading the written file.
@@ -540,7 +580,8 @@ def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE, 
     doc.header["$INSUNITS"] = 4
     doc.header["$MEASUREMENT"] = 1
     doc.header["$LWDISPLAY"] = 1
-    doc.header["$LTSCALE"] = round(float(sheet_style.dash_hidden[0]) / DASHED_DASH, 4)
+    doc.header["$LTSCALE"] = 1.0
+    add_iso_linetypes(doc, sheet_style)
     for name, color, lt, lw in LAYERS.values():
         if name not in doc.layers:
             doc.layers.add(name, color=color, linetype=lt, lineweight=lw)
@@ -577,6 +618,7 @@ def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE, 
     exact = _exact_copies(sheet, written)
     skipped = 0
     replaced = 0
+    adapted = 0
     for idx, item in enumerate(sheet.items):
         if not valid_item(item):
             skipped += 1
@@ -585,7 +627,11 @@ def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE, 
         if copy:
             replaced += 1
             continue
-        _add_item(msp, item, sheet_style)
+        k = None
+        if isinstance(item, (Segment, Polyline, Circle, Arc)):
+            k = hidden_ltscale(item, sheet_style)
+            adapted += int(k is not None)
+        _add_item(msp, item, sheet_style, ltscale=k)
     if skipped:
         log.warning("dxf: skipped %d degenerate or non-finite items", skipped)
 
@@ -628,4 +674,5 @@ def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE, 
             "dimension_match": "exact" if exact is not None else "geometric",
             "skipped": skipped + dims_skipped,
             "audit_errors": audit_errors, "audit_fixes": audit_fixes, "audited": audited,
+            "dash_adapted": adapted,
             "fingerprint_guid": fingerprint}

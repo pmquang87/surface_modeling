@@ -138,11 +138,15 @@ class TessellatedOnlyError(ValueError):
     faces, duplicate nodes merged) for the mesh route; ``faces`` and
     ``triangles`` count what it came from; ``source_unit`` /
     ``source_unit_factor`` / ``roots`` / ``bodies`` are as on ``BrepModel``.
+    ``dropped`` (QA round 2 issue 24, ``tessellated_dropped``): what the mesh
+    leaves out, e.g. ``{"free_shells": 1, "tessellated_shells_outside": 1,
+    "annotation_occurrences": 60}`` on NIST FTC 08; only non-zero counts.
     """
 
     def __init__(self, message: str, mesh: Any = None, *, faces: int = 0, triangles: int = 0,
                  source_unit: str = "unknown", source_unit_factor: Optional[float] = None,
-                 roots: int = 1, bodies: Optional[dict] = None) -> None:
+                 roots: int = 1, bodies: Optional[dict] = None,
+                 dropped: Optional[dict] = None) -> None:
         super().__init__(message)
         self.mesh = mesh
         self.faces = int(faces)
@@ -151,6 +155,7 @@ class TessellatedOnlyError(ValueError):
         self.source_unit_factor = source_unit_factor
         self.roots = int(roots)
         self.bodies = dict(bodies or {})
+        self.dropped = dict(dropped or {})
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +967,78 @@ def _normalize_unit(token: Optional[str]) -> str:
     return normalize_unit(token)[0]
 
 
+_TESS_BODY_RE = re.compile(rb"=\s*(TESSELLATED_SOLID|TESSELLATED_SHELL)\s*\(")
+# simple instances and complex ones whose first (alphabetical) part is the annotation
+_ANNOTATION_RE = re.compile(rb"=\s*\(?\s*[A-Z0-9_]*ANNOTATION[A-Z0-9_]*OCCURRENCE\s*\(")
+_SCAN_OVERLAP = 512
+
+
+def step_entity_census(path: str) -> Dict[str, int]:
+    """OCP-free count of the Part 21 records the OCCT transfer does not turn
+    into drawn geometry (QA round 2 issue 24): ``tessellated_solids``,
+    ``tessellated_shells`` (``TESSELLATED_SOLID`` / ``TESSELLATED_SHELL``
+    records) and ``annotation_occurrences`` (``*ANNOTATION*OCCURRENCE``
+    records: ``TESSELLATED_ANNOTATION_OCCURRENCE``,
+    ``ANNOTATION_CURVE_OCCURRENCE``, ... ; a complex instance counts when an
+    annotation occurrence is its first part). Streams the file in
+    ``_SNIFF_CHUNK`` pieces with an overlap; NIST FTC 08 (2.1 MB): 1 solid,
+    1 shell, 60 annotations. Zeros for an unreadable file."""
+    out = {"tessellated_solids": 0, "tessellated_shells": 0, "annotation_occurrences": 0}
+    try:
+        with open(path, "rb") as fh:
+            carry = b""
+            while True:
+                chunk = fh.read(_SNIFF_CHUNK)
+                buf = carry + chunk
+                last = not chunk
+                # count matches starting before the carried tail (the next buffer
+                # starts with it); the last buffer counts everything
+                limit = len(buf) if last else max(0, len(buf) - _SCAN_OVERLAP)
+                for m in _TESS_BODY_RE.finditer(buf):
+                    if m.start() < limit:
+                        key = ("tessellated_solids" if m.group(1) == b"TESSELLATED_SOLID"
+                               else "tessellated_shells")
+                        out[key] += 1
+                out["annotation_occurrences"] += sum(
+                    1 for m in _ANNOTATION_RE.finditer(buf) if m.start() < limit)
+                if last:
+                    break
+                carry = buf[limit:]
+    except OSError as exc:
+        logger.debug("STEP entity census failed: %s", exc)
+    return out
+
+
+def tessellated_dropped(path: str, bodies: Dict[str, Any]) -> Dict[str, int]:
+    """What a tessellated-only STEP leaves out of the drawn mesh (issue 24).
+
+    The transfer's own left-outs (``bodies["dropped"]``: free shells next to
+    the solid, loose edges, ...) plus, from the text
+    (``step_entity_census``): ``tessellated_shells_outside`` = tessellated
+    solids and shells beyond the drawn bodies (the larger of the transfer's
+    dropped free shells / faces / tessellated bodies and the text count
+    minus the drawn bodies; NIST FTC 08: 1, a 'BRepFtrWithContract' shell
+    of the supplemental geometry) and ``annotation_occurrences`` (PMI
+    presentation, never transferred as shapes; FTC 08: 60). Only non-zero
+    counts are kept."""
+    out: Dict[str, int] = {k: int(v) for k, v in (bodies.get("dropped") or {}).items()
+                           if int(v or 0) > 0}
+    text = step_entity_census(path)
+    if bodies.get("drawn") == "solids":
+        drawn = int(bodies.get("solids") or 0)
+    else:
+        drawn = int(bodies.get("free_shells") or 0) + (1 if bodies.get("free_faces") else 0)
+    from_transfer = sum(int(out.get(k, 0)) for k in ("free_shells", "free_faces",
+                                                      "tessellated_bodies"))
+    outside = max(from_transfer,
+                  text["tessellated_solids"] + text["tessellated_shells"] - drawn)
+    if outside > 0:
+        out["tessellated_shells_outside"] = int(outside)
+    if text["annotation_occurrences"] > 0:
+        out["annotation_occurrences"] = int(text["annotation_occurrences"])
+    return out
+
+
 def step_unit_sniff(path: str) -> str:
     """Length unit from the Part 21 text, normalised: "mm", "inch", "m",
     "cm", "ft", ... (keys of ``UNIT_FACTORS``) or "unknown" for an
@@ -1052,11 +1129,16 @@ def load_step(path: str, fast_census_above_faces: Optional[int] = None) -> BrepM
         except Exception as exc:
             mesh, used, n_tri = None, 0, 0
             logger.warning("tessellated STEP: no mesh could be built: %s", exc)
+        try:
+            dropped = tessellated_dropped(path, bodies)
+        except Exception as exc:
+            logger.debug("tessellated left-out census failed: %s", exc)
+            dropped = dict(bodies.get("dropped") or {})
         raise TessellatedOnlyError(
             f"tessellated-only STEP: all {n_faces} face(s) are triangulations without a "
             f"surface (AP242 TESSELLATED_SOLID / TRIANGULATED_FACE); use the mesh route",
             mesh, faces=used, triangles=n_tri, source_unit=source_unit,
-            source_unit_factor=factor, roots=roots, bodies=bodies)
+            source_unit_factor=factor, roots=roots, bodies=bodies, dropped=dropped)
 
     model = analyze_shape(drawn, source_unit=source_unit, roots=roots,
                           fast_above_faces=fast_census_above_faces)

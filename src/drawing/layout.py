@@ -28,8 +28,9 @@ Sourced rules (ISO texts read through their BIS adoptions):
   ``views_overflow`` is flagged. ``LayoutResult.flags`` starts with the
   plan's own flags (``DimensionPlan.flags``, e.g. ``dimension_extent_mismatch``).
 * ISO 128-40: cutting line = wide long-dashed dotted (04.2) dashes of
-  ``section_dash_len`` (12 mm) at both ends, from 3 mm inside the view
-  outline to 9 mm outside; arrows = continuous wide shaft (CUTTING style,
+  ``section_dash_len`` (12 mm) at both ends, from ``MARKER_GAP`` (1.5 mm)
+  OUTSIDE the view outline to 13.5 mm (QA round 2 issue 13: they started
+  3 mm inside and covered part edges); arrows = continuous wide shaft (CUTTING style,
   so it lands on the cutting-line layer, not among the model edges; the
   shaft is shorter than the first 12 mm dash and renders solid), filled 30
   degree head 5 mm long, ``section_arrow_len`` (10 mm) overall, pointing in
@@ -51,10 +52,10 @@ Conventions of this module (no standard behind them):
   k * dim_pitch`` mm (10 + 7k, spec 3.6); band ``i`` puts the dimension line
   at ``dim_first_offset + i * dim_pitch`` from the view outline.
 * Extra room, added to the bands: the section view and the iso view
-  reserve the label height above them; the marker view reserves 12 mm
-  (plus the bands it has to clear, see below) on the sides the cutting line
-  leaves through and 11 mm on the side the arrows point to (when the bands
-  do not already cover it). Diameter callouts reserve, per scale, the
+  reserve the label height above them. The marker view reserves, per
+  scale, the exact reach of the rendered cutting-line marker beyond the
+  outline (``_marker_room``, round 2; it replaced the fixed 12 mm along
+  and 11 mm across). Diameter callouts reserve, per scale, the
   exact reach of the rendered callout beyond the outline
   (``_callout_room``), taken as the MAX with the bands, not added to them
   (QA round 1 issue 7: the old fixed reach from the circle, added to the
@@ -62,33 +63,55 @@ Conventions of this module (no standard behind them):
   1:5 to 1:10 once bands appeared on four sides).
 * Text collisions (``_resolve_text_collisions``, after the dimensions are
   rendered): a linear dimension text crossed by the section marker (wide
-  dash, narrow connector, arrows, letters) is shifted along its line
+  dash, arrows, letters) is shifted along its line
   (``Dimension.text_offset``, QA issue 4); a callout whose text overlaps
   another text (``TEXT_CLEARANCE`` = 1 mm), sits on the marker, or whose
-  leader runs through another text tries the four leader angles and
+  leader or shelf runs through another text or touches the marker (round 2
+  issue 10) tries the four leader angles and
   longer leaders; the shortest leader that stays in its placement rect,
   off view outlines and off foreign dimension lines wins (QA issue 8).
   Texts that still overlap afterwards give the flag
-  ``layout_text_collision`` (info); ``sheet.meta["text_collisions"]``
-  counts the moves.
+  ``layout_text_collision`` (WARNING since round 2 issue 10: overprinted
+  dimensions); texts the pass moved give ``layout_text_moved`` (info);
+  ``sheet.meta["text_collisions"]`` counts the moves.
 * Scale-dependent room (``min_mm_fn`` of ``choose_scale``): a linear
   dimension whose sheet span is shorter than two arrows + 0.5 mm is drawn
   with the arrows outside and its line ``arrow_length + 2`` mm longer at
-  both ends (``dimensions._render_linear``); a value text wider than the
-  span sticks out by half the difference. That reach is reserved along the
-  dimension direction at each candidate scale.
-* Section marker and dimension bands: when the side the cutting line leaves
-  through carries dimension bands, the arrow and the letter move beyond the
-  outermost band (``band_extent + MARKER_BAND_CLEAR``) so they do not sit
-  on the first dimension line; the wide dash stays at the outline and a
-  narrow long-dash-dot (CENTER) piece joins it to the arrow (ISO 128-40:
-  the cutting plane is narrow 04.1 with wide ends).
+  both ends (``dimensions._render_linear``); a value text that does not
+  fit between the extension lines is placed outside, beyond the arrow, by
+  the layout itself (``_outside_high``: the end whose text box no outer
+  band's extension line crosses, then the end with more room inside the
+  view; round 2 issue 17). That reach, the rendered section marker
+  (``_marker_room``) and the rendered callouts (``_callout_room``) are
+  reserved at each candidate scale.
+* Section marker and dimension bands (round 2 issue 14): the marker never
+  crosses a dimension line. With bands on the side the cutting line leaves
+  through, the wide dash ends ``MARKER_BAND_CLEAR`` before the first
+  dimension line, the arrow stays ``MARKER_ARROW_AT`` out and the letter
+  goes beyond the arrow head (round 1 moved the arrow past the bands and
+  joined it with a narrow chain across every dimension and extension
+  line). When an extension line of that side lies on the cutting line
+  (the plane through a dimensioned hole centre), that end moves past the
+  outermost dimension line, its overshoot and its text; flipping or
+  re-datuming the dimension cannot help, because the extension line at the
+  hole centre is the same on both sides and from both datums.
+* Position-dimension bands (round 2 issue 7): when capping the position
+  dims at ``POSITION_BAND_CAP`` (3) bands per view side wins a scale step,
+  the excess ones (outermost first, never an overall dim) are dropped,
+  listed in ``LayoutResult.plan.undimensioned`` with reason
+  ``layout_space`` and flagged ``layout_dims_dropped`` (info).
 * Iso view label: ``ISO (1:n)`` with the iso view's own scale (5 mm, spec
   3.6 "labelled with its scale") ``LABEL_GAP`` above the iso view.
 * Grid: cells from ``projection.grid_cell`` (empty columns/rows are
   collapsed). The section view goes to the free middle-row cell on the side
   opposite the right-side view, else to the row below F, else above; the
-  iso view to (1, 1), else the next free corner cell. Inside one column the
+  iso view to (1, 1), else the next free corner cell. When that does not
+  fit a scale, the section tries the free cells of the front column (below
+  / above the top-bottom stack, ``section_column_cells``) and then floats
+  in free space like the iso view, before the scale drops (round 2 issue
+  6: a thin top-profile section in the side cell doubled the grid width;
+  measured on 80 box sizes x A3/A4, 78 of 160 cases get a larger scale and
+  none a smaller one, choose_scale at most 117 ms). Inside one column the
   views whose 2D x axis is the same world direction share one x origin
   (front and top share X); inside one row the views with the same 2D y axis
   share one y origin (front, right, front-direction section share Z); other
@@ -122,10 +145,16 @@ Conventions of this module (no standard behind them):
 * Hidden lines are not drawn in the iso view; the section body shows its
   visible edges only. Hatch: one ``HatchLines`` per region (outer loop
   with its holes), ``hatch_spacing`` of the section's shorter extent ON THE
-  SHEET for every region it crosses with two or more lines, a finer
-  ``style.region_hatch_spacing`` for narrower regions, and a filled
-  ``Polygon`` for regions under ``HATCH_FILL_BELOW`` (2 mm); 45 degrees,
-  phase-locked to the sheet origin (``_section_items``).
+  SHEET for every region at least two spacings thick, ``t / 3`` (at least
+  0.7 mm) for thinner ones; fill or hatch is decided per BODY
+  (``SectionView.loop_body``) from its mean thickness ``t = 2A/P``: below
+  2.1 mm the body is filled (keyhole ``Polygon``, holes stay open), so one
+  wall is never half black, half hatched (round 2 issue 3). Body k is
+  hatched at 45 / 135 degrees alternately, with a half-spacing phase
+  shift every second pair (issue 28); lines are phase-locked to the sheet
+  origin (``_section_items``).
+* Strip: ``meta["unit_note"]`` replaces "Dimensions in mm" (round 2 issue
+  30, e.g. "Dimensions in mm (unit assumed, see report)").
 """
 from __future__ import annotations
 
@@ -145,8 +174,9 @@ from .model import (TEXT_ADVANCE, BBox2D, Circle, Dimension, HatchLines, LineSty
                     transform_primitive)
 from .options import DrawingOptions
 from .projection import PRINCIPAL, VIEWS, ViewSpec, grid_cell
-from .style import (HATCH_FILL_BELOW, SHEETS, STANDARD_SCALES, SheetSize, SheetStyle, hatch_spacing,
-                    region_hatch_spacing, scale_text)
+from .style import (HATCH_MIN_SEGMENTS, MIN_LETTERING_HEIGHT, SHEETS, STANDARD_SCALES, THICK_CORE_FRACTION,
+                    SheetSize, SheetStyle, hatch_spacing, region_fill_below, scale_text,
+                    section_fill_below, thin_region_spacing)
 
 log = logging.getLogger(__name__)
 
@@ -155,14 +185,18 @@ CLEARANCE = 5.0               # views stay this far from the frame and the title
 MARK_CLEARANCE = 2.0          # views stay this far from the inner part of a centring mark
 LEADER_EXIT_MARGIN = 3.0      # a callout leader ends this far outside the view outline
 LABEL_GAP = 3.0               # A-A baseline above the section view
-MARKER_INSIDE = 3.0           # cutting dash starts this far inside the outline
+MARKER_GAP = 1.5              # the wide cutting dash starts this far OUTSIDE the outline (round 2 issue 13)
+MARKER_INSIDE = -MARKER_GAP   # (round 1 name) negative: the dash no longer starts inside the outline
 MARKER_ARROW_AT = 6.0         # arrow shaft this far outside the outline, along the line
 MARKER_LETTER_AT = 4.0        # letter this far beyond the shaft, along the line
-MARKER_ALONG = 12.0           # room the marker needs beyond the outline along the line (no bands)
-MARKER_PERP = 11.0            # room on the side the arrows point to
-MARKER_BAND_CLEAR = 2.0       # arrow shaft this far beyond the outermost dimension band
+MARKER_LETTER_GAP = 1.0       # letter this far beyond the arrow tip (bands on that side)
+MARKER_ALONG = MARKER_GAP + 12.0   # (informative) marker reach along the line without bands; see _marker_room
+MARKER_PERP = 11.0            # (informative, round 1) room on the arrow side; _marker_room measures it
+MARKER_BAND_CLEAR = 2.0       # wide dash ends this far before the first dimension line
 SHORT_SPAN_EXTRA = 2.0        # dimensions._render_linear extends a short span's line by L + this
 ISO_SCALE_STEPS = 2           # a floating iso view may drop this many standard scales below the sheet's
+_SECTION_ALTERNATIVES = True  # QA round 2 issue 6: try front-column / floating section placements
+POSITION_BAND_CAP: Optional[int] = 3   # QA round 2 issue 7: position-dim bands per side when it wins a scale
 STRIP_COLS = (0.0, 40.0, 62.0, 112.0, 180.0)   # SCALE | symbol | Dimensions in mm | source
 _EPS = 1e-9
 
@@ -178,6 +212,9 @@ class LayoutResult:
     placements: Dict[str, Tuple[Point, BBox2D]]      # view -> (offset, sheet bbox incl. dimension bands)
     overflow: bool
     flags: List[Tuple[str, str, str]]                 # (code, severity, detail)
+    # the dimension plan actually drawn: the input plan, or (QA round 2 issue 7) a copy with the
+    # excess position dims removed and listed in undimensioned with reason "layout_space"
+    plan: Optional[DimensionPlan] = None
 
 
 # ------------------------------------------------------------------ bands --
@@ -219,10 +256,122 @@ def band_counts(plan: DimensionPlan) -> Dict[str, Tuple[int, int, int, int]]:
     return {v: (c[0], c[1], c[2], c[3]) for v, c in counts.items()}
 
 
+OVERALL_SPAN_FRACTION = 0.98   # review R4: an outermost-band dim spanning >= 98 % of the extent is overall
+
+
+def _dim_role(d: Dimension) -> Optional[str]:
+    """The planner's role marker of a dim (``Dimension.role``: "overall", "hole_position", ...), or None."""
+    r = getattr(d, "role", None)
+    return str(r) if r else None
+
+
+def _is_overall(d: Dimension, boxes: Dict[str, BBox2D], outermost: bool = False) -> bool:
+    """A linear dim that spans its view's whole extent along its direction (an overall dim).
+
+    A role marker from the planner (``Dimension.role``) decides when set.
+    Otherwise: the span (or value) matches the view bbox extent within
+    max(0.01, 1e-3 ext), or (review R4, ``outermost``: the dim sits in the
+    outermost band of its side) the span is at least OVERALL_SPAN_FRACTION
+    of the extent; the planner takes overall values from the model extents,
+    so a view bbox a few tenths of a mm larger must not demote it.
+    """
+    role = _dim_role(d)
+    if role is not None:
+        return role == "overall"
+    bb = boxes.get(d.view)
+    if bb is None or d.kind != "linear":
+        return False
+    a = math.radians(float(d.angle_deg))
+    axis = 0 if abs(math.sin(a)) < 0.5 else 1
+    ext = bb.width if axis == 0 else bb.height
+    span = abs(float(d.p2[axis]) - float(d.p1[axis]))
+    tol = max(0.01, 1e-3 * ext)
+    if abs(span - ext) <= tol or float(d.value) >= ext - tol:
+        return True
+    return bool(outermost) and max(span, float(d.value)) >= OVERALL_SPAN_FRACTION * ext
+
+
+def _cap_bands(plan: DimensionPlan, boxes: Dict[str, BBox2D], max_rows: int
+               ) -> Tuple[DimensionPlan, List[dict]]:
+    """``(plan with at most max_rows position-dim bands per view side, dropped entries)``.
+
+    QA round 2 issue 7: deep position-dimension stacks (one band each) force
+    the scale down. Per (view, side) the overall dims are always kept; of the
+    position dims the ``max_rows`` nearest the outline (lowest band index =
+    shortest values) are kept and the rest dropped, the largest band index
+    first. The kept dims are renumbered 0..n-1 per side in their old order.
+    Dropped dims come back as ``undimensioned`` entries with reason
+    ``layout_space`` and kind ``Dimension.role`` (when the planner sets it)
+    or ``"linear"``. Returns the input plan itself when nothing is dropped.
+    """
+    resolved = _resolved_bands(plan)
+    per_side: Dict[Tuple[str, str], List[int]] = {}
+    for i, (d, b) in enumerate(zip(plan.dims, resolved)):
+        if b is not None:
+            per_side.setdefault((d.view, b[0]), []).append(i)
+    drop: set = set()
+    for _key, idx in per_side.items():
+        k_out = max(resolved[i][1] for i in idx)
+        pos = sorted((i for i in idx if not _is_overall(plan.dims[i], boxes, resolved[i][1] == k_out)),
+                     key=lambda i: (resolved[i][1], i))
+        drop.update(pos[max(0, int(max_rows)):])
+    if not drop:
+        return plan, []
+    dims: List[Dimension] = []
+    bands: List[Optional[Tuple[str, int]]] = []
+    for i, (d, b) in enumerate(zip(plan.dims, resolved)):
+        if i not in drop:
+            dims.append(d)
+            bands.append(b)
+    renum: Dict[Tuple[str, str], List[int]] = {}
+    for j, (d, b) in enumerate(zip(dims, bands)):
+        if b is not None:
+            renum.setdefault((d.view, b[0]), []).append(j)
+    for (_, side), idx in renum.items():
+        for k, j in enumerate(sorted(idx, key=lambda j: (bands[j][1], j))):
+            bands[j] = (side, k)
+    # review R4: the entry kind is the planner's role marker when it sets one, else the generic
+    # "linear" (the text says which dim); a fixed "hole_position" would mislabel step dims
+    dropped = [{"kind": _dim_role(plan.dims[i]) or "linear", "view": plan.dims[i].view,
+                "value": float(plan.dims[i].value),
+                "text": plan.dims[i].text, "side": resolved[i][0], "count": 1, "radius": None,
+                "reason": "layout_space"} for i in sorted(drop)]
+    try:
+        new = dataclasses.replace(plan, dims=dims, undimensioned=list(plan.undimensioned) + dropped, bands=bands)
+    except Exception:                 # not a dataclass (duck-typed plan): the base fields only
+        new = DimensionPlan(dims=dims, undimensioned=list(plan.undimensioned) + dropped, bands=bands,
+                            flags=list(getattr(plan, "flags", None) or []))
+    return new, dropped
+
+
 # ------------------------------------------------------------------- grid --
 
-def grid_cells(view_names: Sequence[str], projection: str, has_section: bool = False) -> Dict[str, Tuple[int, int]]:
-    """(col, row) per view relative to front at (0, 0); adds ``section`` and moves ``iso`` when taken."""
+def section_column_cells(view_names: Sequence[str], projection: str) -> List[Tuple[int, int]]:
+    """Free cells of the front column for the section view: below / above the top-bottom stack.
+
+    QA round 2 issue 6: a section seen as the top-view profile is as wide as
+    the front view but only a few mm tall; in the side cell of the front row
+    it doubles the grid width. In the front column it shares the front's x
+    origin (same 2D x axis) and costs only its height plus one view gap.
+    Order: below the lowest view of the column, above the highest, then the
+    remaining free cells next to the front view.
+    """
+    taken = {grid_cell(n, projection) for n in view_names if n in PRINCIPAL}
+    rows = sorted(r for c, r in taken if c == 0) or [0]
+    out: List[Tuple[int, int]] = []
+    for cand in ((0, rows[0] - 1), (0, rows[-1] + 1), (0, -1), (0, 1), (0, -2), (0, 2)):
+        if cand not in taken and cand not in out:
+            out.append(cand)
+    return out
+
+
+def grid_cells(view_names: Sequence[str], projection: str, has_section: bool = False,
+               section_cell: Optional[Tuple[int, int]] = None) -> Dict[str, Tuple[int, int]]:
+    """(col, row) per view relative to front at (0, 0); adds ``section`` and moves ``iso`` when taken.
+
+    ``section_cell``: preferred cell of the section view (used when free),
+    else the default order (side cell of the front row first).
+    """
     cells: Dict[str, Tuple[int, int]] = {}
     for name in view_names:
         if name in PRINCIPAL:
@@ -231,8 +380,9 @@ def grid_cells(view_names: Sequence[str], projection: str, has_section: bool = F
     if has_section:
         side = grid_cell("right", projection)[0]
         other = -side
-        for cand in ((other, 0), (side, 0), (other, -1), (side, -1), (other, 1), (side, 1),
-                     (2 * other, 0), (2 * side, 0)):
+        pref = [tuple(section_cell)] if section_cell is not None else []
+        for cand in pref + [(other, 0), (side, 0), (other, -1), (side, -1), (other, 1), (side, 1),
+                            (2 * other, 0), (2 * side, 0)]:
             if cand not in taken:
                 cells[SECTION_KEY] = cand
                 taken.add(cand)
@@ -348,9 +498,11 @@ def _shift(r: BBox2D, dx: float, dy: float) -> BBox2D:
 
 
 _SWEEP_STEPS = 40          # grid-position sweep resolution per axis (at least 2.5 mm per step)
+_ALT_SWEEP_STEPS = 12      # coarser sweep for the alternative section placements (round 2 issue 6)
 
 
-def _grid_candidates(W: float, H: float, inner: BBox2D, tz: BBox2D) -> List[Tuple[float, float]]:
+def _grid_candidates(W: float, H: float, inner: BBox2D, tz: BBox2D,
+                     steps: int = _SWEEP_STEPS) -> List[Tuple[float, float]]:
     """Grid bottom-left positions: six preferred ones, then a sweep ordered by distance from the centre."""
     cx = inner.xmin + 0.5 * (inner.width - W)
     cy = inner.ymin + 0.5 * (inner.height - H)
@@ -361,8 +513,8 @@ def _grid_candidates(W: float, H: float, inner: BBox2D, tz: BBox2D) -> List[Tupl
              (inner.xmax - W, inner.ymax - H),
              (inner.xmin, inner.ymin)]
     xr, yr = inner.width - W, inner.height - H
-    nx = int(min(_SWEEP_STEPS, max(1, math.floor(xr / 2.5)))) if xr > _EPS else 0
-    ny = int(min(_SWEEP_STEPS, max(1, math.floor(yr / 2.5)))) if yr > _EPS else 0
+    nx = int(min(steps, max(1, math.floor(xr / 2.5)))) if xr > _EPS else 0
+    ny = int(min(steps, max(1, math.floor(yr / 2.5)))) if yr > _EPS else 0
     xs = [inner.xmin + xr * i / nx for i in range(nx + 1)] if nx else [inner.xmin]
     ys = [inner.ymin + yr * j / ny for j in range(ny + 1)] if ny else [inner.ymin]
     sweep = [(x, y) for x in xs for y in ys]
@@ -384,20 +536,28 @@ def _free_candidates(w: float, h: float, grid: BBox2D, inner: BBox2D, tz: BBox2D
 
 
 def _place(arr: _Arrangement, sheet: SheetSize, style: SheetStyle,
-           float_size: Optional[Tuple[float, float]] = None):
+           float_size: Optional[Tuple[float, float]] = None,
+           float_sizes: Optional[Sequence[Tuple[float, float]]] = None,
+           sweep_steps: int = _SWEEP_STEPS):
     """``(dx, dy, float_ll)`` for the grid's bottom-left corner, or None when it does not fit.
 
     With ``float_size = (w, h)`` a floating rectangle (the iso view) must be
     placed too, at least ``view_gap`` clear of every grid rectangle;
     ``float_ll`` is its lower-left corner (None without a floating view).
+    With ``float_sizes`` (several floating rectangles, e.g. the iso view and
+    the section, QA round 2 issue 6) they are placed one after the other,
+    each ``view_gap`` clear of the grid and of the ones placed before, and
+    ``float_ll`` is the list of their lower-left corners.
     """
+    many = float_sizes is not None
+    sizes = list(float_sizes) if many else ([float_size] if float_size is not None else [])
     inner = _frame_rect(sheet, style).expanded(-CLEARANCE)
     tz = _title_zone(sheet, style).expanded(CLEARANCE)
     obstacles = _obstacles(sheet, style)
     W, H = arr.width, arr.height
     if W > inner.width + _EPS or H > inner.height + _EPS:
         return None
-    if float_size is not None and (float_size[0] > inner.width + _EPS or float_size[1] > inner.height + _EPS):
+    if any(w > inner.width + _EPS or h > inner.height + _EPS for w, h in sizes):
         return None
     rects = list(arr.rects.values())
     gap = style.view_gap
@@ -405,27 +565,34 @@ def _place(arr: _Arrangement, sheet: SheetSize, style: SheetStyle,
     def free(r: BBox2D) -> bool:
         return _inside(r, inner) and not any(_overlaps(r, o) for o in obstacles)
 
-    spots = None
-    if float_size is not None:
-        spots = _float_spots(float_size[0], float_size[1], inner, obstacles)
-    for dx, dy in _grid_candidates(W, H, inner, tz):
+    spots = [_float_spots(w, h, inner, obstacles) for w, h in sizes]
+    for dx, dy in _grid_candidates(W, H, inner, tz, sweep_steps):
         shifted = [_shift(r, dx, dy) for r in rects]
         if not all(free(s) for s in shifted):
             continue
-        if float_size is None:
-            return dx, dy, None
-        w, h = float_size
+        if not sizes:
+            return dx, dy, ([] if many else None)
         grid = BBox2D(dx, dy, dx + W, dy + H)
-        for fx, fy in _free_candidates(w, h, grid, inner, tz, gap):
-            fr = BBox2D(fx, fy, fx + w, fy + h)
-            if not free(fr):
-                continue
-            if any(_overlaps(fr.expanded(gap - 1e-6), s) for s in shifted):
-                continue
-            return dx, dy, (fx, fy)
-        hit = _first_clear_spot(spots, w, h, shifted, gap - 1e-6)
-        if hit is not None:
-            return dx, dy, hit
+        placed: List[BBox2D] = []
+        lls: List[Tuple[float, float]] = []
+        for (w, h), sp in zip(sizes, spots):
+            hit = None
+            for fx, fy in _free_candidates(w, h, grid, inner, tz, gap):
+                fr = BBox2D(fx, fy, fx + w, fy + h)
+                if not free(fr):
+                    continue
+                if any(_overlaps(fr.expanded(gap - 1e-6), s) for s in shifted + placed):
+                    continue
+                hit = (fx, fy)
+                break
+            if hit is None:
+                hit = _first_clear_spot(sp, w, h, shifted + placed, gap - 1e-6)
+            if hit is None:
+                break
+            lls.append(hit)
+            placed.append(BBox2D(hit[0], hit[1], hit[0] + w, hit[1] + h))
+        if len(lls) == len(sizes):
+            return dx, dy, (lls if many else lls[0])
     return None
 
 
@@ -520,6 +687,12 @@ def choose_scale(view_boxes: Dict[str, BBox2D], bands: Dict[str, Tuple[int, int,
     ``iso_mode`` and ``iso_scale`` (the scale the iso view is drawn at; it
     equals ``scale`` unless the floating iso view had to drop up to
     ``ISO_SCALE_STEPS`` standard scales; None without an iso view).
+    QA round 2 issue 6: at every scale the section view tries the default
+    cell, then the free cells of the front column (``section_column_cells``),
+    then floating in free space like the iso view, before the scale drops;
+    ``info["section_mode"]`` = "cell" | "free" | None and
+    ``info["scale_candidates"]`` = ``[(scale, fitted, detail)]`` per scale
+    tried (detail: the placement that fitted, or why the closest one failed).
     """
     boxes: Dict[str, BBox2D] = {n: b for n, b in view_boxes.items()
                                 if b is not None and (n in PRINCIPAL or n in ("iso", SECTION_KEY))}
@@ -536,72 +709,132 @@ def choose_scale(view_boxes: Dict[str, BBox2D], bands: Dict[str, Tuple[int, int,
     if not has_section:
         boxes.pop(SECTION_KEY, None)
     names = [n for n in boxes if n != SECTION_KEY]
-    cells = grid_cells(names, projection, has_section=SECTION_KEY in boxes)
-    cells_free = {n: c for n, c in cells.items() if n != "iso"}
-    spec_map = {n: ((specs or {}).get(n) or _default_spec(n)) for n in cells}
+    has_sec = SECTION_KEY in boxes
+    has_iso_box = "iso" in boxes
+    cells = grid_cells(names, projection, has_section=has_sec)
+    # section placements, tried in this order at every scale (QA round 2 issue 6): the default
+    # cell, the free cells of the front column, then floating like the iso view
+    variants: List[Tuple[str, Dict[str, Tuple[int, int]], bool]] = [("cell", cells, False)]
+    if has_sec and _SECTION_ALTERNATIVES:
+        for cc in section_column_cells(names, projection):
+            if cc == cells.get(SECTION_KEY):
+                continue
+            cv = grid_cells(names, projection, has_section=True, section_cell=cc)
+            if cv.get(SECTION_KEY) == cc:
+                variants.append(("cell", cv, False))
+        variants.append(("free", grid_cells(names, projection, has_section=False), True))
+    spec_map = {n: ((specs or {}).get(n) or _default_spec(n)) for n in boxes}
     extra = extra_mm or {}
     base_sides: Dict[str, Sides] = {}
-    for n in cells:
+    for n in boxes:
         k = bands.get(n, (0, 0, 0, 0))
         e = extra.get(n, (0.0, 0.0, 0.0, 0.0))
         base_sides[n] = tuple(band_extent(style, int(k[i])) + float(e[i]) for i in range(4))   # type: ignore[assignment]
     sides: Dict[str, Sides] = dict(base_sides)
-    info: dict = {"cells": cells, "tried": [], "overflow": False, "sheet": sheet.name, "iso_mode": None}
+    info: dict = {"cells": cells, "tried": [], "overflow": False, "sheet": sheet.name, "iso_mode": None,
+                  "section_mode": None, "scale_candidates": []}
     if not cells:
         info.update(scale=1.0, origins={}, rects={}, grid=(0.0, 0.0))
         return 1.0, info
+    inner = _frame_rect(sheet, style).expanded(-CLEARANCE)
+    mins_cache: Dict[float, Dict[str, Sides]] = {}
+
+    def mins_at(s: float) -> Dict[str, Sides]:
+        # min_mm_fn renders callouts / the marker: evaluate it once per scale
+        key = float(s)
+        if key not in mins_cache:
+            mins_cache[key] = min_mm_fn(key) if min_mm_fn is not None else {}
+        return mins_cache[key]
 
     def set_sides(s: float) -> None:
-        mins = min_mm_fn(float(s)) if min_mm_fn is not None else {}
+        mins = mins_at(s)
         for n, bs in base_sides.items():
             m = mins.get(n)
             sides[n] = bs if m is None else tuple(max(float(bs[i]), float(m[i])) for i in range(4))  # type: ignore[assignment]
 
-    def iso_rel(s: float) -> Tuple[float, float, float, float]:
-        # room at the iso view's own scale (it may differ from the sheet scale)
-        bb = boxes["iso"]
-        bs = base_sides["iso"]
-        m = (min_mm_fn(float(s)) if min_mm_fn is not None else {}).get("iso")
+    def own_rel(name: str, s: float) -> Tuple[float, float, float, float]:
+        # room of a floating view at its own scale (the iso view may differ from the sheet scale)
+        bb = boxes[name]
+        bs = base_sides[name]
+        m = mins_at(s).get(name)
         l, b, r, t = bs if m is None else tuple(max(float(bs[i]), float(m[i])) for i in range(4))
         return (s * bb.xmin - l, s * bb.ymin - b, s * bb.xmax + r, s * bb.ymax + t)
 
-    def accept(s, arr, pos, mode, iso_s):
-        dx, dy, fll = pos
+    def try_one(var, s: float, iso_s: float, iso_float: bool):
+        _, cv, sec_float = var
+        use = {n: c for n, c in cv.items() if not (iso_float and n == "iso")}
+        arr = _arrange(boxes, use, spec_map, sides, float(s), style.view_gap)
+        floats: List[Tuple[str, Tuple[float, float, float, float]]] = []
+        if iso_float:
+            floats.append(("iso", own_rel("iso", float(iso_s))))
+        if sec_float:
+            floats.append((SECTION_KEY, own_rel(SECTION_KEY, float(s))))
+        # the alternative section placements sweep a coarser grid (measured: the full 41 x 41 sweep
+        # with two floating views took up to 0.53 s per choose_scale on extreme boxes)
+        steps = _SWEEP_STEPS if var is variants[0] else _ALT_SWEEP_STEPS
+        if floats:
+            pos = _place(arr, sheet, style, float_sizes=[(r[2] - r[0], r[3] - r[1]) for _, r in floats],
+                         sweep_steps=steps)
+        else:
+            pos = _place(arr, sheet, style, sweep_steps=steps)
+            if pos is not None:
+                pos = (pos[0], pos[1], [])
+        return arr, use, floats, pos
+
+    def accept(s, arr, use, floats, pos, var, iso_float, iso_s):
+        dx, dy, lls = pos
         origins = {n: (o[0] + dx, o[1] + dy) for n, o in arr.origins.items()}
         rects = {n: _shift(r, dx, dy) for n, r in arr.rects.items()}
-        if fll is not None:
-            rl = iso_rel(float(iso_s))
-            origins["iso"] = (fll[0] - rl[0], fll[1] - rl[1])
-            rects["iso"] = BBox2D(fll[0], fll[1], fll[0] + rl[2] - rl[0], fll[1] + rl[3] - rl[1])
-        info.update(scale=s, grid=(arr.width, arr.height), origins=origins, rects=rects, iso_mode=mode,
-                    cells=cells if mode != "free" else cells_free,
-                    iso_scale=(iso_s if "iso" in origins else None))
+        for (name, rl), ll in zip(floats, lls):
+            origins[name] = (ll[0] - rl[0], ll[1] - rl[1])
+            rects[name] = BBox2D(ll[0], ll[1], ll[0] + rl[2] - rl[0], ll[1] + rl[3] - rl[1])
+        iso_mode = "free" if iso_float else ("cell" if "iso" in use else None)
+        sec_mode = None if not has_sec else ("free" if var[2] else "cell")
+        info.update(scale=s, grid=(arr.width, arr.height), origins=origins, rects=rects, iso_mode=iso_mode,
+                    section_mode=sec_mode, cells=use, iso_scale=(iso_s if "iso" in origins else None))
+        desc = []
+        if has_sec:
+            desc.append(f"section {sec_mode}" + (f" {use[SECTION_KEY]}" if SECTION_KEY in use else ""))
+        if "iso" in origins:
+            desc.append(f"iso {iso_mode} {scale_text(iso_s)}")
+        return ", ".join(desc) or "grid"
 
     for idx, s in enumerate(STANDARD_SCALES):
         set_sides(s)
-        arr = _arrange(boxes, cells, spec_map, sides, float(s), style.view_gap)
-        pos = _place(arr, sheet, style)
-        mode = "cell" if "iso" in cells else None
-        iso_s = s
-        if pos is None and "iso" in cells:
-            # the iso view does not fit its grid cell: float it into free space, at the
-            # sheet scale or up to ISO_SCALE_STEPS standard scales smaller (labelled)
-            arr = _arrange(boxes, cells_free, spec_map, sides, float(s), style.view_gap)
-            mode = "free"
-            for iso_s in STANDARD_SCALES[idx: idx + 1 + ISO_SCALE_STEPS]:
-                rl = iso_rel(float(iso_s))
-                pos = _place(arr, sheet, style, float_size=(rl[2] - rl[0], rl[3] - rl[1]))
-                if pos is not None:
-                    break
-        info["tried"].append((s, pos is not None))
-        if pos is not None:
-            accept(s, arr, pos, mode, iso_s)
-            return s, info
+        order = []
+        for var in variants:
+            if not has_iso_box or "iso" in var[1]:
+                order.append((var, s, False))
+            if has_iso_box:
+                # the iso view does not fit its grid cell: float it into free space, at the
+                # sheet scale or up to ISO_SCALE_STEPS standard scales smaller (labelled)
+                order.append((var, s, True))
+        if has_iso_box:
+            for iso_s in STANDARD_SCALES[idx + 1: idx + 1 + ISO_SCALE_STEPS]:
+                order.extend((var, iso_s, True) for var in variants)
+        worst = None
+        for var, iso_s, iso_float in order:
+            arr, use, floats, pos = try_one(var, s, iso_s, iso_float)
+            if pos is not None:
+                info["tried"].append((s, True))
+                desc = accept(s, arr, use, floats, pos, var, iso_float, iso_s)
+                info["scale_candidates"].append((s, True, desc))
+                return s, info
+            over = max(arr.width - inner.width, arr.height - inner.height)
+            if worst is None or over < worst[0]:
+                worst = (over, arr.width, arr.height)
+        info["tried"].append((s, False))
+        if worst is not None and worst[0] > _EPS:
+            reason = (f"smallest grid {worst[1]:.1f} x {worst[2]:.1f} mm exceeds the drawing space "
+                      f"{inner.width:.1f} x {inner.height:.1f} mm")
+        else:
+            reason = "no position clear of the title block, the centring marks and the floating views"
+        info["scale_candidates"].append((s, False, reason))
     s = STANDARD_SCALES[-1]
     set_sides(s)
-    arr = _arrange(boxes, cells, spec_map, sides, float(s), style.view_gap)
-    inner = _frame_rect(sheet, style).expanded(-CLEARANCE)
-    accept(s, arr, (inner.xmin, inner.ymax - arr.height, None), "cell" if "iso" in cells else None, s)
+    use = cells
+    arr = _arrange(boxes, use, spec_map, sides, float(s), style.view_gap)
+    accept(s, arr, use, [], (inner.xmin, inner.ymax - arr.height, []), variants[0], False, s)
     info["overflow"] = True
     log.warning("layout: views do not fit %s even at %s", sheet.name, scale_text(s))
     return None, info
@@ -816,9 +1049,49 @@ def title_block_items(sheet: SheetSize, style: SheetStyle, fields: Dict[str, str
     return items
 
 
+NOTE_LINE_GAP = 1.0           # strip: gap between and around the two lines of a wrapped note
+
+
+def _note_lines(text: str, cx: float, cy: float, width: float, cell_h: float, height: float) -> List[Text]:
+    """A note centred in a ``width`` x ``cell_h`` cell, on one or two lines, never below 2.5 mm.
+
+    Review R4: shrinking the 43-character unit caveat to one line gave 1.9 mm
+    text, below the lettering minimum (MIN_LETTERING_HEIGHT). One line is kept
+    when it fits at ``MIN_LETTERING_HEIGHT`` or more; otherwise the words are
+    split in two lines (before a word that opens a parenthesis when both lines
+    then fit, else the most balanced split), each as high as the cell allows
+    (``(cell_h - 3 gaps) / 2``, at most ``height``).
+    """
+    if not text:
+        return []
+    one = width / (TEXT_ADVANCE * len(text))
+    words = text.split()
+    if one >= min(height, MIN_LETTERING_HEIGHT) - 1e-9 or len(words) < 2:
+        t, h = _fit_text(text, width, height, min_height=min(height, MIN_LETTERING_HEIGHT))
+        return [Text((cx, cy), t, h, anchor="middle", valign="middle")]
+    h2 = min(height, 0.5 * (cell_h - 3.0 * NOTE_LINE_GAP))
+    splits = [(" ".join(words[:k]), " ".join(words[k:])) for k in range(1, len(words))]
+    fits = [s for s in splits if TEXT_ADVANCE * MIN_LETTERING_HEIGHT * max(len(s[0]), len(s[1])) <= width + 1e-9]
+    paren = [s for k, s in enumerate(splits, start=1) if words[k].startswith("(") and s in fits]
+    a, b = paren[0] if paren else min(splits, key=lambda s: max(len(s[0]), len(s[1])))
+    h = max(MIN_LETTERING_HEIGHT, min(h2, width / (TEXT_ADVANCE * max(len(a), len(b)))))
+    dy = 0.5 * (h + NOTE_LINE_GAP)
+    out = []
+    for txt, y in ((a, cy + dy), (b, cy - dy)):
+        t, hh = _fit_text(txt, width, h, min_height=MIN_LETTERING_HEIGHT)
+        out.append(Text((cx, y), t, hh, anchor="middle", valign="middle"))
+    return out
+
+
 def strip_items(sheet: SheetSize, style: SheetStyle, scale_label: str, projection: str,
-                source_note: str) -> List[SheetItem]:
-    """180 x 9 strip above the title block: SCALE | projection symbol | Dimensions in mm | source."""
+                source_note: str, unit_note: Optional[str] = None) -> List[SheetItem]:
+    """180 x 9 strip above the title block: SCALE | projection symbol | Dimensions in mm | source.
+
+    ``unit_note`` replaces "Dimensions in mm" when given (QA round 2 issue
+    30: an STL whose unit was assumed prints the caveat on the sheet, e.g.
+    "Dimensions in mm (unit assumed, see report)"; set on two lines rather
+    than shrunk below 2.5 mm, review R4, see ``_note_lines``).
+    """
     f = _frame_rect(sheet, style)
     x0 = f.xmax - style.title_block_w
     y0 = f.ymin + style.title_block_h
@@ -829,12 +1102,14 @@ def strip_items(sheet: SheetSize, style: SheetStyle, scale_label: str, projectio
     for c in STRIP_COLS[1:-1]:
         items.append(Segment((x0 + c, y0), (x0 + c, y1), LineStyle.TITLE))
     cells = list(zip(STRIP_COLS[:-1], STRIP_COLS[1:]))
-    for (c0, c1), txt in ((cells[0], f"SCALE {scale_label}"), (cells[2], "Dimensions in mm"),
-                          (cells[3], source_note)):
+    units = str(unit_note).strip() if unit_note else "Dimensions in mm"
+    for (c0, c1), txt in ((cells[0], f"SCALE {scale_label}"), (cells[3], source_note)):
         if not txt:
             continue
         t, h = _fit_text(txt, c1 - c0 - 2.0, style.text_height)
         items.append(Text((x0 + 0.5 * (c0 + c1), ym), t, h, anchor="middle", valign="middle"))
+    c0, c1 = cells[2]
+    items += _note_lines(units, x0 + 0.5 * (c0 + c1), ym, c1 - c0 - 2.0, style.strip_h, style.text_height)
     c0, c1 = cells[1]
     items += projection_symbol((x0 + 0.5 * (c0 + c1), ym), style.symbol_h, projection)
     return items
@@ -876,56 +1151,247 @@ def _min_width(points: np.ndarray) -> float:
     return float(np.min(np.ptp(proj, axis=0)))
 
 
+def _loop_area_perimeter(lp: np.ndarray) -> Tuple[float, float]:
+    """(|shoelace area|, perimeter) of one closed loop (no repeated end point)."""
+    p = np.asarray(lp, dtype=float).reshape(-1, 2)
+    if len(p) < 3:
+        return 0.0, 0.0
+    q = np.roll(p, -1, axis=0)
+    area = 0.5 * abs(float(np.sum(p[:, 0] * q[:, 1] - q[:, 0] * p[:, 1])))
+    return area, float(np.sum(np.linalg.norm(q - p, axis=1)))
+
+
+def _region_area_perimeter(outer: np.ndarray, holes: Sequence[np.ndarray]) -> Tuple[float, float]:
+    """Material area (outer minus holes) and the summed perimeter of all loops of a region."""
+    a, p = _loop_area_perimeter(outer)
+    for h in holes:
+        ha, hp = _loop_area_perimeter(h)
+        a -= ha
+        p += hp
+    return max(a, 0.0), p
+
+
+def _keyhole(outer: np.ndarray, holes: Sequence[np.ndarray]) -> np.ndarray:
+    """One simple fill polygon of ``outer`` with its ``holes`` cut out through zero-width bridges.
+
+    ``Polygon`` has no holes, so a filled region with holes would be filled
+    across them (a thin ring drawn as a black disc). Each hole (CW from
+    ``nest_loops``, outer CCW) is joined to the nearest vertex of the polygon
+    built so far: ``... P_i, H_j ... H_j, P_i ...``. The slit has zero width,
+    so even-odd and non-zero fills both leave the hole open.
+    """
+    poly = np.asarray(outer, dtype=float).reshape(-1, 2)
+    for h in sorted((np.asarray(x, dtype=float).reshape(-1, 2) for x in holes),
+                    key=lambda x: -float(x[:, 0].max())):
+        if len(h) < 3:
+            continue
+        d = np.linalg.norm(poly[:, None, :] - h[None, :, :], axis=2)
+        i, j = np.unravel_index(int(np.argmin(d)), d.shape)
+        ring = np.vstack([h[j:], h[:j + 1]])
+        poly = np.vstack([poly[:i + 1], ring, poly[i:]])
+    return poly.copy()
+
+
+_CORE_SAMPLES = 3000          # sample points per body / region for the thick-core test
+_CORE_WORK = 2.0e8            # cap on points x edges of the distance computation
+
+
+def _thick_core_fraction(nested: Sequence[Tuple[np.ndarray, Sequence[np.ndarray]]], depth: float) -> float:
+    """Area fraction of the material of ``nested`` (outer, holes) deeper than ``depth`` (sheet mm).
+
+    Review R4: the mean thickness 2A/P of a finned body (a heat sink) is pulled
+    below the fill limit by its fins although its base is thick. The material
+    is sampled on horizontal scan-line chords (``hatch_lines`` at 0 degrees,
+    even-odd, so holes are excluded) with about ``_CORE_SAMPLES`` points, each
+    weighted by its share of chord length; a point is deep when its distance
+    to every loop edge exceeds ``depth``. 0.0 on degenerate input or failure.
+    """
+    try:
+        loops = [np.asarray(lp, dtype=float).reshape(-1, 2) for outer, holes in nested
+                 for lp in [outer] + list(holes)]
+        loops = [lp for lp in loops if len(lp) >= 3]
+        if not loops:
+            return 0.0
+        area = sum(_region_area_perimeter(o, h)[0] for o, h in nested)
+        if area <= _EPS:
+            return 0.0
+        a = np.concatenate(loops)
+        b = np.concatenate([np.roll(lp, -1, axis=0) for lp in loops])
+        n_e = len(a)
+        step = max(0.2, math.sqrt(area / _CORE_SAMPLES), math.sqrt(area * n_e / _CORE_WORK))
+        chords = [hatch_lines([o] + list(h), step, 0.0, 0.5 * step) for o, h in nested]
+        chords = [c for c in chords if len(c)]
+        if not chords:
+            return 0.0
+        segs = np.concatenate(chords)
+        x0 = np.minimum(segs[:, 0, 0], segs[:, 1, 0])
+        length = np.abs(segs[:, 1, 0] - segs[:, 0, 0])
+        n = np.maximum(1, np.round(length / step).astype(int))
+        rep = np.repeat(np.arange(len(segs)), n)
+        k = np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n)
+        px = x0[rep] + (k + 0.5) * (length[rep] / n[rep])
+        pts = np.column_stack([px, segs[rep, 0, 1]])
+        w = length[rep] / n[rep]
+        tot = float(w.sum())
+        # the chord ends lie on the boundary: a point within depth of them is shallow (cheap
+        # pre-filter; the exact edge distance runs on the survivors only)
+        cand = np.flatnonzero((px - x0[rep] > depth) & (x0[rep] + length[rep] - px > depth))
+        if not len(cand) or tot <= _EPS:
+            return 0.0
+        d = b - a
+        dd = np.maximum(np.einsum("ij,ij->i", d, d), 1e-300)
+        e_lo = np.minimum(a, b)
+        e_hi = np.maximum(a, b)
+        deep = np.zeros(len(pts), dtype=bool)
+        cand = cand[np.argsort(pts[cand, 1], kind="stable")]
+        chunk = 256
+        for i0 in range(0, len(cand), chunk):
+            ids = cand[i0:i0 + chunk]
+            p = pts[ids]
+            lo = p.min(axis=0) - depth
+            hi = p.max(axis=0) + depth
+            near = np.flatnonzero(np.all(e_hi >= lo, axis=1) & np.all(e_lo <= hi, axis=1))
+            if not len(near):                 # no edge within depth of the chunk: all deep
+                deep[ids] = True
+                continue
+            an, dn = a[near], d[near]
+            rel = p[:, None, :] - an[None, :, :]
+            t = np.clip(np.einsum("mnj,nj->mn", rel, dn) / dd[near][None, :], 0.0, 1.0)
+            r = rel - t[:, :, None] * dn[None, :, :]
+            deep[ids] = np.einsum("mnj,mnj->mn", r, r).min(axis=1) > depth * depth
+        return float(w[deep].sum() / tot)
+    except Exception as exc:          # a guard only: never lose the section over it
+        log.warning("layout: thick-core test failed (%s)", exc)
+        return 0.0
+
+
+def _section_bodies(section: SectionView, loops: List[np.ndarray]) -> List[Tuple[object, List[np.ndarray]]]:
+    """``[(body id, loops)]`` from ``section.loop_body`` (parallel to ``section.loops``), sorted by id.
+
+    No ``loop_body`` (or one that does not match the loops) -> one body. The
+    loops of each body are nested on their own, so a hole always belongs to
+    an outer loop of its own body.
+    """
+    raw = [lp for lp in section.loops]
+    ids = getattr(section, "loop_body", None)
+    if ids is None:
+        return [(0, loops)]
+    try:
+        ids = list(ids)
+    except Exception:
+        return [(0, loops)]
+    if len(ids) != len(raw):
+        log.info("layout: section.loop_body has %d entries for %d loops; one body assumed", len(ids), len(raw))
+        return [(0, loops)]
+    kept = [ids[i] for i, lp in enumerate(raw) if np.size(lp)]
+    groups: Dict[object, List[np.ndarray]] = {}
+    for b, lp in zip(kept, loops):
+        groups.setdefault(b, []).append(lp)
+    try:
+        order = sorted(groups)
+    except Exception:
+        order = list(groups)
+    return [(b, groups[b]) for b in order]
+
+
 def _section_items(section: SectionView, origin: Point, scale: float, style: SheetStyle,
                    geom: BBox2D) -> Tuple[List[SheetItem], dict]:
     """Section outlines, hatch per region (outer loop with its holes), body edges, A-A label.
 
-    The section spacing ``hatch_spacing`` of the shorter extent of all loops
-    on the sheet is used for every region that it crosses with at least two
-    lines (ISO 128-50: one part, one hatching). A region narrower than two
-    spacings across the 45 degree lines gets ``region_hatch_spacing``
-    (width / 3, at least 0.7 mm); a region whose smallest width (caliper
-    width of its outer loop, ``_min_width``, so a thin strip at any angle
-    counts, not only an axis-aligned one) is below
-    ``HATCH_FILL_BELOW`` (2 mm on the sheet) is filled solid (ISO 128-50
-    blackened thin section). QA round 1 issue 29: one spacing from the box of
-    all loops left 4 mm regions with 0 or 1 line, so they read as holes.
+    QA round 2 issue 3: the fill decision is made per BODY (``section.loop_body``,
+    the solid each loop comes from; missing -> one body), from the body's mean
+    wall thickness on the sheet ``t = 2 A / P`` over all its loops (A = outer
+    areas minus hole areas, P = all perimeters; a strip of width w gives about
+    w whatever its shape, an annulus its radial width). A body with ``t`` below
+    ``style.section_fill_below()`` (2.1 mm) is filled solid (ISO 128-50
+    blackened thin section); otherwise every region of the body is hatched
+    (one part, one treatment: a wall is never half black, half hatched). The
+    section spacing ``hatch_spacing`` of the shorter extent of all loops is
+    used for every region at least two spacings thick; a thinner region gets
+    ``thin_region_spacing`` (t / 3, at least 0.7 mm). Round 1 (per region,
+    bbox and hull caliper) filled the straight piece of a wall and hatched its
+    L piece, and kept 3 mm hatching on a 0.8 mm ring.
+    Review R4 guards: a thin body is still hatched when more than
+    ``THICK_CORE_FRACTION`` of its area lies deeper than the fill limit inside
+    the material (``_thick_core_fraction``: fins pull 2A/P down, the thick base
+    must not go black; counted in ``stats["thick_core_bodies"]``); a region of
+    a hatched body with its own t below ``region_fill_below()`` (1.4 mm), or
+    with fewer than ``HATCH_MIN_SEGMENTS`` hatch lines, is filled (a 0.8 mm
+    island with one hatch line reads as an empty pocket), giving ``"mixed"``.
+    Issue 28: bodies are ranked by id; body k is hatched at 45 degrees (k even)
+    or 135 degrees (k odd), with a half-spacing phase shift for k = 2, 3 mod 4,
+    so adjacent parts of an assembly read apart.
     """
     items: List[SheetItem] = []
     stats = {"hatch_segments": 0, "hatch_spacing": None, "loops": 0, "hatch_spacings": [],
-             "filled_regions": 0}
+             "filled_regions": 0, "fill": None, "filled_area_fraction": 0.0, "bodies": 0,
+             "body_thickness": [], "hatch_angles": [], "thick_core_bodies": 0}
     off = np.array([float(origin[0]), float(origin[1])])
     loops = [np.asarray(lp, dtype=float).reshape(-1, 2) * scale + off for lp in section.loops if np.size(lp)]
-    nested = nest_loops(loops) if loops else []
+    bodies = [(b, nest_loops(lps)) for b, lps in _section_bodies(section, loops)] if loops else []
+    bodies = [(b, nested) for b, nested in bodies if nested]
     ordered: List[np.ndarray] = []
-    for outer, holes in nested:
-        ordered.append(outer)
-        ordered.extend(holes)
+    for _, nested in bodies:
+        for outer, holes in nested:
+            ordered.append(outer)
+            ordered.extend(holes)
     for lp in ordered:
         items.append(Polyline(lp, True, LineStyle.SECTION))
     if ordered:
         bb = BBox2D.from_points(np.vstack(ordered))
         spacing = hatch_spacing(style, min(bb.width, bb.height))
-        nrm = np.array([-math.sin(math.pi / 4.0), math.cos(math.pi / 4.0)])
+        fill_below = section_fill_below()
         n_segs = 0
-        for outer, holes in nested:
-            ob = BBox2D.from_points(outer)
-            if min(ob.width, ob.height, _min_width(outer)) < HATCH_FILL_BELOW:
-                items.append(Polygon(outer.copy(), LineStyle.SECTION))
-                stats["filled_regions"] += 1
+        area_all = area_filled = 0.0
+        n_hatched = 0
+        for rank, (_, nested) in enumerate(bodies):
+            metrics = [_region_area_perimeter(outer, holes) for outer, holes in nested]
+            a_sum = sum(m[0] for m in metrics)
+            p_sum = sum(m[1] for m in metrics)
+            t_body = 2.0 * a_sum / p_sum if p_sum > _EPS else 0.0
+            stats["body_thickness"].append(float(t_body))
+            area_all += a_sum
+            thick_core = False
+            if t_body < fill_below:
+                # review R4: thin fins pull 2A/P down; a body with a thick core is hatched
+                thick_core = _thick_core_fraction(nested, fill_below) > THICK_CORE_FRACTION
+                stats["thick_core_bodies"] += int(thick_core)
+            if t_body < fill_below and not thick_core:
+                for outer, holes in nested:
+                    # holes stay open: one keyhole polygon (a filled 0.8 mm ring is a ring, not a disc)
+                    items.append(Polygon(_keyhole(outer, holes), LineStyle.SECTION))
+                    stats["filled_regions"] += 1
+                area_filled += a_sum
                 continue
-            across = float(np.ptp(outer @ nrm))
-            s = spacing if across >= 2.0 * spacing else region_hatch_spacing(spacing, across)
-            region = [outer] + list(holes)
-            try:
-                segs = hatch_lines(region, s, 45.0)
-            except Exception as exc:              # pragma: no cover - cap on absurd inputs
-                log.warning("layout: hatch failed (%s)", exc)
-                segs = np.zeros((0, 2, 2))
-            items.append(HatchLines(segs, [lp.copy() for lp in region], LineStyle.HATCH))
-            stats["hatch_spacings"].append(float(s))
-            n_segs += int(len(segs))
-        stats.update(hatch_segments=n_segs, hatch_spacing=spacing, loops=len(ordered))
+            angle = 45.0 if rank % 2 == 0 else 135.0
+            for (outer, holes), (a_r, p_r) in zip(nested, metrics):
+                t = 2.0 * a_r / p_r if p_r > _EPS else 0.0
+                s = thin_region_spacing(spacing, t)
+                phase = 0.5 * s if (rank // 2) % 2 == 1 else 0.0
+                region = [outer] + list(holes)
+                try:
+                    segs = hatch_lines(region, s, angle, phase)
+                except Exception as exc:              # pragma: no cover - cap on absurd inputs
+                    log.warning("layout: hatch failed (%s)", exc)
+                    segs = np.zeros((0, 2, 2))
+                # review R4: a tiny island of a hatched body (t < 1.4 mm, or fewer than 2 hatch
+                # lines) reads as an empty pocket when hatched; it is filled unless it has a
+                # thick core (fins on a thick base)
+                if (t < region_fill_below() or (len(segs) < HATCH_MIN_SEGMENTS and t < fill_below)) \
+                        and _thick_core_fraction([(outer, holes)], fill_below) <= THICK_CORE_FRACTION:
+                    items.append(Polygon(_keyhole(outer, holes), LineStyle.SECTION))
+                    stats["filled_regions"] += 1
+                    area_filled += a_r
+                    continue
+                items.append(HatchLines(segs, [lp.copy() for lp in region], LineStyle.HATCH))
+                stats["hatch_spacings"].append(float(s))
+                stats["hatch_angles"].append(float(angle))
+                n_segs += int(len(segs))
+                n_hatched += 1
+        fill = ("solid" if n_hatched == 0 else "hatch" if stats["filled_regions"] == 0 else "mixed")
+        stats.update(hatch_segments=n_segs, hatch_spacing=spacing, loops=len(ordered), fill=fill,
+                     bodies=len(bodies),
+                     filled_area_fraction=float(area_filled / area_all) if area_all > _EPS else 0.0)
     if section.body is not None:
         for p in section.body.visible:
             items.append(_restyle(transform_primitive(p, origin, scale), LineStyle.VISIBLE))
@@ -940,37 +1406,124 @@ def iso_label(scale: float) -> str:
     return f"ISO ({scale_text(scale)})"
 
 
-def marker_arrow_at(style: SheetStyle, k: int) -> float:
+def _marker_end(style: SheetStyle, k: int, collinear: bool) -> Tuple[float, float, float, bool]:
+    """``(dash start, dash end, arrow at, letter beside the arrow tip)`` along one end of the cutting
+    line, sheet mm from the view outline, with ``k`` dimension bands on that side.
+
+    QA round 2 issues 13 / 14: the wide dash starts ``MARKER_GAP`` outside the
+    outline (it used to start 3 mm inside and covered part edges), and the
+    marker never crosses a dimension line: with bands on that side the dash
+    ends ``MARKER_BAND_CLEAR`` before the first dimension line, the arrow
+    stays at ``MARKER_ARROW_AT`` and the letter goes beyond the arrow head
+    (round 1 moved the arrow beyond the bands and joined it with a narrow
+    chain across every dimension and extension line). When an extension line
+    of that side lies on the cutting line (``collinear``: the plane passes
+    through a dimensioned hole centre; flipping or re-datuming the dimension
+    cannot help, the extension line at the hole centre is the same on both
+    sides and from both datums), the whole end moves past the outermost
+    dimension line, its overshoot and a text on its far side.
+    """
+    dash = float(style.section_dash_len)
+    if k > 0 and collinear:
+        # past the outermost dimension line, its extension-line overshoot and a value text
+        # drawn on the far side of it
+        start = (style.dim_first_offset + (k - 1) * style.dim_pitch
+                 + max(style.ext_overshoot, style.dim_text_gap + style.text_height) + MARKER_GAP)
+        return start, start + dash, start + (MARKER_ARROW_AT - MARKER_GAP), False
+    if k > 0:
+        end = max(MARKER_GAP + 1.0, min(MARKER_GAP + dash, style.dim_first_offset - MARKER_BAND_CLEAR))
+        return MARKER_GAP, end, min(MARKER_ARROW_AT, end), True
+    return MARKER_GAP, MARKER_GAP + dash, MARKER_ARROW_AT, False
+
+
+def marker_arrow_at(style: SheetStyle, k: int, collinear: bool = False) -> float:
     """Distance of the section arrow from the outline along the cutting line, given ``k`` bands there."""
-    return MARKER_ARROW_AT if k <= 0 else band_extent(style, k) + MARKER_BAND_CLEAR
+    return _marker_end(style, int(k), bool(collinear))[2]
 
 
 def _pt2(v) -> Point:
     return (float(v[0]), float(v[1]))
 
 
+def _collinear_sides(geo, plan: DimensionPlan, scale: float, tol: float = 0.5) -> set:
+    """Sides of the marker view whose dimension extension lines lie on the cutting line.
+
+    An extension line of a linear dim is perpendicular to the dimension and
+    runs from a measured point toward the dim's band side. It lies on the
+    cutting line when the cutting line is parallel to it and the measured
+    point is within ``tol`` sheet mm of it (QA round 2 issue 14: the plane
+    through a hole centre and the position dim of that hole).
+    """
+    name, p2, d2, _a2, (_t0, s0, _t1, s1) = geo
+    out: set = set()
+    if not plan.dims:
+        return out
+    for d, b in zip(plan.dims, _resolved_bands(plan)):
+        if b is None or d.kind != "linear" or d.view != name or b[0] not in (s0, s1):
+            continue
+        a = math.radians(float(d.angle_deg))
+        ext = np.array([-math.sin(a), math.cos(a)])
+        if abs(float(ext[0] * d2[1] - ext[1] * d2[0])) > 1e-6:
+            continue                                  # the cutting line is not parallel to the ext lines
+        for p in (d.p1, d.p2):
+            r = np.asarray(p, dtype=float) - p2
+            if abs(float(r[0] * d2[1] - r[1] * d2[0])) * scale < tol:
+                out.add(b[0])
+                break
+    return out
+
+
 def _marker_items(geo, origin: Point, scale: float, style: SheetStyle, label: str,
-                  counts: Tuple[int, int, int, int] = (0, 0, 0, 0)) -> List[SheetItem]:
+                  counts: Tuple[int, int, int, int] = (0, 0, 0, 0),
+                  collinear: Sequence[str] = ()) -> List[SheetItem]:
+    """Cutting-line marker: per end a wide dash, an arrow (shaft + head) and the letter.
+
+    See ``_marker_end`` for the positions along the line; ``collinear``: the
+    sides where an extension line lies on the cutting line
+    (``_collinear_sides``).
+    """
     _, p2, d2, a2, (t0, s0, t1, s1) = geo
     off = np.array([float(origin[0]), float(origin[1])])
     items: List[SheetItem] = []
-    dash_out = style.section_dash_len - MARKER_INSIDE
+    h = style.label_height
     for t, side, outward in ((t0, s0, -d2), (t1, s1, d2)):
         e = off + scale * (p2 + t * d2)
-        a = e - MARKER_INSIDE * outward
-        b = e + dash_out * outward
-        items.append(Segment(_pt2(a), _pt2(b), LineStyle.CUTTING))
-        at = marker_arrow_at(style, int(counts[SIDES.index(side)]))
+        start, end, at, beside = _marker_end(style, int(counts[SIDES.index(side)]), side in collinear)
+        items.append(Segment(_pt2(e + start * outward), _pt2(e + end * outward), LineStyle.CUTTING))
         s = e + at * outward
-        if at > dash_out + _EPS:          # arrow beyond the dimension bands: narrow chain joins it
-            items.append(Segment(_pt2(b), _pt2(s), LineStyle.CENTER))
         tip = s + style.section_arrow_len * a2
         neck = tip - style.section_head_len * a2
         items.append(Segment(_pt2(s), _pt2(neck), LineStyle.CUTTING))
         items.append(arrowhead(tip, a2, style.section_head_len, style.section_head_angle_deg, LineStyle.CUTTING))
-        c = s + MARKER_LETTER_AT * outward + 0.5 * style.section_arrow_len * a2
-        items.append(Text(_pt2(c), label, style.label_height, anchor="middle", valign="middle"))
+        if beside:
+            half = 0.5 * (TEXT_ADVANCE * h * len(label) if abs(a2[0]) >= abs(a2[1]) else h)
+            c = tip + (MARKER_LETTER_GAP + half) * a2
+        else:
+            c = s + MARKER_LETTER_AT * outward + 0.5 * style.section_arrow_len * a2
+        items.append(Text(_pt2(c), label, h, anchor="middle", valign="middle"))
     return items
+
+
+def _marker_room(marker, plan: DimensionPlan, boxes: Dict[str, BBox2D], style: SheetStyle, label: str
+                 ) -> Callable[[float], Dict[str, Sides]]:
+    """``scale -> {marker view: sides}``: sheet mm the rendered marker reaches beyond the view outline."""
+    if marker is None or boxes.get(marker[0]) is None:
+        return lambda scale: {}
+    name = marker[0]
+    counts = band_counts(plan).get(name, (0, 0, 0, 0))
+
+    def room(scale: float) -> Dict[str, Sides]:
+        bb = boxes[name]
+        geom = BBox2D(scale * bb.xmin, scale * bb.ymin, scale * bb.xmax, scale * bb.ymax)
+        items = _marker_items(marker, (0.0, 0.0), scale, style, label, counts,
+                              _collinear_sides(marker, plan, scale))
+        box = BBox2D.of_primitives(items)
+        if box is None:
+            return {}
+        reach = (geom.xmin - box.xmin, geom.ymin - box.ymin, box.xmax - geom.xmax, box.ymax - geom.ymax)
+        return {name: tuple(max(0.0, float(r)) for r in reach)}      # type: ignore[dict-item]
+
+    return room
 
 
 def _dim_to_sheet(d: Dimension, band: Optional[Tuple[str, int]], origin: Point, scale: float,
@@ -1048,6 +1601,40 @@ def _segment_hits_box(a, b, box: BBox2D) -> bool:
         if t0 > t1 - 1e-12:
             return False
     return True
+
+
+def _segments_intersect(a, b, c, d, eps: float = 1e-9) -> bool:
+    """Do the closed segments a-b and c-d touch or cross (collinear overlap counts)?"""
+    p, r = np.asarray(a, dtype=float), np.asarray(b, dtype=float) - np.asarray(a, dtype=float)
+    q, s = np.asarray(c, dtype=float), np.asarray(d, dtype=float) - np.asarray(c, dtype=float)
+    rxs = float(r[0] * s[1] - r[1] * s[0])
+    qp = q - p
+    qpxr = float(qp[0] * r[1] - qp[1] * r[0])
+    if abs(rxs) < eps:
+        if abs(qpxr) > eps * max(1.0, float(np.linalg.norm(r))):
+            return False                              # parallel, apart
+        rr = float(r @ r)
+        if rr < eps:                                  # a-b is a point: on c-d?
+            ss = float(s @ s)
+            if ss < eps:
+                return float(np.linalg.norm(qp)) < 1e-6
+            w = float((p - q) @ s) / ss
+            return -eps <= w <= 1.0 + eps and float(np.linalg.norm(q + w * s - p)) < 1e-6
+        t0 = float(qp @ r) / rr
+        t1 = t0 + float(s @ r) / rr
+        lo, hi = min(t0, t1), max(t0, t1)
+        return hi >= -eps and lo <= 1.0 + eps
+    t = float(qp[0] * s[1] - qp[1] * s[0]) / rxs
+    u = qpxr / rxs
+    return -eps <= t <= 1.0 + eps and -eps <= u <= 1.0 + eps
+
+
+def _item_hits_segment(item, a, b) -> bool:
+    """Does the segment a-b touch a marker item (Segment exactly, other items by their box)?"""
+    if isinstance(item, Segment):
+        return _segments_intersect(a, b, item.a, item.b)
+    box = _box_of(item)
+    return box is not None and _segment_hits_box(a, b, box)
 
 
 def _item_hits_box(item, box: BBox2D) -> bool:
@@ -1179,8 +1766,12 @@ def _resolve_text_collisions(items: List[SheetItem], sheet: Sheet, groups: List[
             return True
         if any(_overlaps(tb, o.expanded(TEXT_CLEARANCE)) for o in others) or hits_marker(tb):
             return True
-        for it in rendered:          # own leader / shelf across another text
-            if isinstance(it, Segment) and any(_segment_hits_box(it.a, it.b, o.expanded(-0.2)) for o in others):
+        for it in rendered:          # own leader / shelf across another text or the section marker
+            if not isinstance(it, Segment):
+                continue
+            if any(_segment_hits_box(it.a, it.b, o.expanded(-0.2)) for o in others):
+                return True
+            if any(_item_hits_segment(m, it.a, it.b) for m in marker):     # round 2 issue 10
                 return True
         return False
 
@@ -1272,18 +1863,7 @@ def _extra_allowances(plan: DimensionPlan, boxes: Dict[str, BBox2D], counts: Dic
     for labelled in (SECTION_KEY, "iso"):
         if labelled in boxes:
             add(labelled, "top", LABEL_GAP + style.label_height + 1.0)
-    if marker is not None:
-        name, _, _, a2, (_, s0, _, s1) = marker
-        k = counts.get(name, (0, 0, 0, 0))
-        e = extra.get(name, [0.0, 0.0, 0.0, 0.0])
-        needs = [(side, MARKER_ALONG + marker_arrow_at(style, k[SIDES.index(side)]) - MARKER_ARROW_AT)
-                 for side in (s0, s1)]
-        needs.append((_dominant_side(a2), MARKER_PERP))
-        for side, need in needs:
-            i = SIDES.index(side)
-            have = band_extent(style, k[i]) + e[i]
-            if have < need:
-                add(name, side, e[i] + (need - have))
+    # the section marker: scale-dependent exact reach, see _marker_room (round 2 issues 13 / 14)
     return {v: (e[0], e[1], e[2], e[3]) for v, e in extra.items()}
 
 
@@ -1332,6 +1912,99 @@ def _max_room(*fns: Callable[[float], Dict[str, Sides]]) -> Callable[[float], Di
     return room
 
 
+def _outside_goes_high(room_lo: float, room_hi: float) -> bool:
+    """The outside text goes past the high end when that end has at least as much room."""
+    return room_hi >= room_lo - 1e-6
+
+
+def _linear_axis(d: Dimension) -> Optional[int]:
+    a = math.radians(float(d.angle_deg))
+    if abs(math.sin(a)) < 1e-6:
+        return 0
+    if abs(math.cos(a)) < 1e-6:
+        return 1
+    return None
+
+
+def _ext_index(plan: DimensionPlan) -> Dict[Tuple[str, str], List[Tuple[int, int, float]]]:
+    """(view, side) -> [(band, axis, measured coordinate along the dim axis)] of the linear dims."""
+    out: Dict[Tuple[str, str], List[Tuple[int, int, float]]] = {}
+    for d, b in zip(plan.dims, _resolved_bands(plan)):
+        axis = _linear_axis(d) if d.kind == "linear" else None
+        if b is None or axis is None:
+            continue
+        for p in (d.p1, d.p2):
+            out.setdefault((d.view, b[0]), []).append((int(b[1]), axis, float(p[axis])))
+    return out
+
+
+def _outside_high(d: Dimension, band: Optional[Tuple[str, int]], bb: BBox2D, scale: float,
+                  style: SheetStyle, ext_index) -> Optional[bool]:
+    """Which end an outside value text of the view-space linear dim ``d`` goes past (True = high
+    coordinate end), or None when the text fits between the extension lines.
+
+    The end whose text box is crossed by fewer extension lines of the outer
+    bands of the same side wins (those lines run through this band's zone),
+    then the end with more room inside the view's extent. ``compose`` and
+    ``_short_span_room`` both use it, so the reserved room is what is drawn.
+    """
+    axis = _linear_axis(d)
+    if axis is None or d.p1 is None or d.p2 is None:
+        return None
+    c1, c2 = float(d.p1[axis]), float(d.p2[axis])
+    lo, hi = min(c1, c2), max(c1, c2)
+    span = scale * (hi - lo)
+    tw = TEXT_ADVANCE * style.text_height * len(d.text or "")
+    if tw + 2.0 * style.dim_text_gap <= span:
+        return None
+    reach = style.arrow_length + SHORT_SPAN_EXTRA
+    side, k = band if band is not None else ("bottom" if axis == 0 else "left", 0)
+    lines = [scale * c for j, ax, c in (ext_index or {}).get((d.view, side), []) if j > k and ax == axis]
+    crossings = []
+    for a0, a1 in ((scale * hi + reach, scale * hi + reach + tw), (scale * lo - reach - tw, scale * lo - reach)):
+        crossings.append(sum(1 for c in lines if a0 - 0.5 <= c <= a1 + 0.5))
+    if crossings[0] != crossings[1]:
+        return crossings[0] < crossings[1]
+    bmin, bmax = (bb.xmin, bb.xmax) if axis == 0 else (bb.ymin, bb.ymax)
+    return _outside_goes_high(scale * (lo - bmin), scale * (bmax - hi))
+
+
+def _outside_text_offset(d: Dimension, geom: BBox2D, style: SheetStyle,
+                         go_high: Optional[bool] = None) -> float:
+    """``text_offset`` for a sheet-space linear dim whose value text does not fit its span.
+
+    QA round 2 issue 17: a text wider than the gap between the extension
+    lines is put outside, beyond the arrow (``span / 2 + arrow_length +
+    SHORT_SPAN_EXTRA + width / 2`` from the centre, the dimension line
+    extended under it), at the end with more room inside the view's extent
+    (for a position dim that is the hole end, so the text does not sit on
+    the overall dim's extension line at the view edge). The layout sets it
+    explicitly so the room reserved by ``_short_span_room`` is exactly what
+    is drawn, whatever default ``render_dimension`` uses. An offset already
+    set is kept; 0 when the text fits.
+    """
+    if d.kind != "linear" or float(d.text_offset or 0.0) != 0.0:
+        return float(d.text_offset or 0.0)
+    a = math.radians(float(d.angle_deg))
+    if abs(math.sin(a)) < 1e-6:
+        axis = 0
+    elif abs(math.cos(a)) < 1e-6:
+        axis = 1
+    else:
+        return 0.0
+    c1, c2 = float(d.p1[axis]), float(d.p2[axis])
+    span = abs(c2 - c1)
+    tw = TEXT_ADVANCE * style.text_height * len(d.text or "")
+    if tw + 2.0 * style.dim_text_gap <= span:
+        return 0.0
+    if go_high is None:
+        gmin, gmax = (geom.xmin, geom.xmax) if axis == 0 else (geom.ymin, geom.ymax)
+        lo, hi = min(c1, c2), max(c1, c2)
+        go_high = _outside_goes_high(lo - gmin, gmax - hi)
+    mag = 0.5 * span + style.arrow_length + SHORT_SPAN_EXTRA + 0.5 * tw
+    return mag if go_high == (c2 >= c1) else -mag
+
+
 def _short_span_room(plan: DimensionPlan, boxes: Dict[str, BBox2D], style: SheetStyle,
                      labels: Optional[Dict[str, Callable[[float], str]]] = None
                      ) -> Callable[[float], Dict[str, Sides]]:
@@ -1339,8 +2012,11 @@ def _short_span_room(plan: DimensionPlan, boxes: Dict[str, BBox2D], style: Sheet
 
     Mirrors ``dimensions._render_linear``: a span shorter than
     ``2 * arrow_length + 0.5`` on the sheet gets its line extended by
-    ``arrow_length + SHORT_SPAN_EXTRA`` at both ends; a value text wider than
-    the span reaches half the difference past each end. The reach is
+    ``arrow_length + SHORT_SPAN_EXTRA`` at both ends; a value text that does
+    not fit between the extension lines (width + 2 x ``dim_text_gap`` > span)
+    is placed outside by ``compose`` (``_outside_text_offset``, QA round 2
+    issue 17) and reaches ``arrow_length + SHORT_SPAN_EXTRA + width`` past
+    the end with more room inside the view's extent. The reach is
     measured from the view's geometry box (the bands lie across the
     dimension direction and are reserved separately). ``labels``: view ->
     ``scale -> label text`` of a centred view label (A-A, ISO (1:n)); a label
@@ -1349,31 +2025,37 @@ def _short_span_room(plan: DimensionPlan, boxes: Dict[str, BBox2D], style: Sheet
     L = float(style.arrow_length)
     h = float(style.text_height)
     lin = []
-    for d in plan.dims:
+    ext_index = _ext_index(plan)
+    for d, band in zip(plan.dims, _resolved_bands(plan)):
         if d.kind != "linear" or d.view not in boxes or d.p1 is None or d.p2 is None:
             continue
-        a = math.radians(float(d.angle_deg))
-        if abs(math.sin(a)) < 1e-6:
-            axis = 0
-        elif abs(math.cos(a)) < 1e-6:
-            axis = 1
-        else:
+        axis = _linear_axis(d)
+        if axis is None:
             continue                      # the plan only makes horizontal and vertical dims
         lo = min(float(d.p1[axis]), float(d.p2[axis]))
         hi = max(float(d.p1[axis]), float(d.p2[axis]))
-        lin.append((d.view, axis, lo, hi, TEXT_ADVANCE * h * len(d.text or "")))
+        lin.append((d, band, d.view, axis, lo, hi, TEXT_ADVANCE * h * len(d.text or "")))
 
     def room(scale: float) -> Dict[str, Sides]:
         out: Dict[str, List[float]] = {}
-        for view, axis, lo, hi, tw in lin:
+        for d, band, view, axis, lo, hi, tw in lin:
             bb = boxes[view]
             span = scale * (hi - lo)
-            reach = max(L + SHORT_SPAN_EXTRA if span < 2.0 * L + 0.5 else 0.0, 0.5 * (tw - span))
-            if reach <= 0.0:
-                continue
             bmin, bmax = (bb.xmin, bb.xmax) if axis == 0 else (bb.ymin, bb.ymax)
-            need_lo = reach - scale * (lo - bmin)
-            need_hi = reach - scale * (bmax - hi)
+            room_lo, room_hi = scale * (lo - bmin), scale * (bmax - hi)
+            reach_lo = reach_hi = L + SHORT_SPAN_EXTRA if span < 2.0 * L + 0.5 else 0.0
+            go_high = _outside_high(d, band, bb, scale, style, ext_index)
+            if go_high is not None:
+                # the text goes outside, beyond the arrow (_outside_high / _outside_text_offset)
+                out_reach = L + SHORT_SPAN_EXTRA + tw
+                if go_high:
+                    reach_hi = max(reach_hi, out_reach)
+                else:
+                    reach_lo = max(reach_lo, out_reach)
+            if reach_lo <= 0.0 and reach_hi <= 0.0:
+                continue
+            need_lo = reach_lo - room_lo
+            need_hi = reach_hi - room_hi
             e = out.setdefault(view, [0.0, 0.0, 0.0, 0.0])
             i_lo, i_hi = (0, 2) if axis == 0 else (1, 3)
             e[i_lo] = max(e[i_lo], need_lo)
@@ -1423,33 +2105,72 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
     has_section = SECTION_KEY in boxes
     has_iso = "iso" in boxes
     marker = _marker_geometry(section, views, boxes) if has_section else None
-    counts = band_counts(plan)
-    extra = _extra_allowances(plan, boxes, counts, marker, style)
     labels: Dict[str, Callable[[float], str]] = {}
+    sec_letter = str(section.label) if section is not None else "A"
     if has_section:
         sec_label = f"{section.label}-{section.label}"
         labels[SECTION_KEY] = lambda s: sec_label
     if has_iso:
         labels["iso"] = lambda s: iso_label(s)
-    short_room = _max_room(_short_span_room(plan, boxes, style, labels), _callout_room(plan, boxes, style))
 
-    def attempt(size: SheetSize):
-        return choose_scale(boxes, counts, size, style, options.projection, has_section, has_iso,
-                            specs=specs, extra_mm=extra, min_mm_fn=short_room)
+    def fit(size: SheetSize, p: DimensionPlan):
+        counts_p = band_counts(p)
+        extra = _extra_allowances(p, boxes, counts_p, marker, style)
+        room = _max_room(_short_span_room(p, boxes, style, labels), _callout_room(p, boxes, style),
+                         _marker_room(marker, p, boxes, style, sec_letter))
+        return choose_scale(boxes, counts_p, size, style, options.projection, has_section, has_iso,
+                            specs=specs, extra_mm=extra, min_mm_fn=room)
+
+    # QA round 2 issue 7: when capping the position-dimension bands wins a scale step, the
+    # excess position dims are dropped (undimensioned, reason layout_space)
+    capped, dropped = (plan, [])
+    if POSITION_BAND_CAP is not None:
+        try:
+            capped, dropped = _cap_bands(plan, boxes, int(POSITION_BAND_CAP))
+        except Exception as exc:      # never lose the sheet over the cap
+            log.warning("layout: band cap failed (%s)", exc)
+            capped, dropped = plan, []
+
+    def attempt(size: SheetSize, full=None):
+        s_full, info_full = full if full is not None else fit(size, plan)
+        if not dropped:
+            return s_full, info_full, plan, []
+        s_cap, info_cap = fit(size, capped)
+        if s_cap is not None and (s_full is None or s_cap > s_full * (1.0 + 1e-9)):
+            return s_cap, info_cap, capped, dropped
+        return s_full, info_full, plan, []
 
     if options.sheet == "auto":
-        chosen = None
-        for name in ("A4", "A3"):
-            s, info = attempt(SHEETS[name])
-            if s is not None and s >= 1.0 - 1e-12:
-                chosen = (SHEETS[name], s, info)
+        # review R4: the sheet is chosen from the UNCAPPED plan (A4 when it holds every dim at
+        # >= 1:1, else A3); the cap is tried on the chosen sheet only. Capping on A4 first kept
+        # A4 by dropping dims that A3 shows in full, often at a larger scale.
+        # When the cap wins a step on A4, A3 is still preferred if it shows every dim at that
+        # scale or larger (measured: a 30 x 20 part with 8 position dims, A4 capped 2:1 with 5
+        # dims dropped against A3 5:1 with all dims).
+        names = ("A4", "A3")
+        fulls: Dict[str, tuple] = {}
+        pick = names[-1]
+        for name in names:
+            fulls[name] = fit(SHEETS[name], plan)
+            if fulls[name][0] is not None and fulls[name][0] >= 1.0 - 1e-12:
+                pick = name
                 break
-            chosen = (SHEETS[name], s, info)      # A3 is tried last and kept
+        size = SHEETS[pick]
+        s, info, p_used, p_dropped = attempt(size, fulls[pick])
+        if p_dropped and pick != names[-1]:
+            big = names[-1]
+            if big not in fulls:
+                fulls[big] = fit(SHEETS[big], plan)
+            s_big, info_big = fulls[big]
+            if s_big is not None and s_big >= s * (1.0 - 1e-9):
+                size, s, info, p_used, p_dropped = SHEETS[big], s_big, info_big, plan, []
+        chosen = (size, s, info, p_used, p_dropped)
     else:
         size = SHEETS[options.sheet]
-        s, info = attempt(size)
-        chosen = (size, s, info)
-    size, s, info = chosen
+        s, info, p_used, p_dropped = attempt(size)
+        chosen = (size, s, info, p_used, p_dropped)
+    size, s, info, plan, dropped = chosen
+    counts = band_counts(plan)
     overflow = s is None
     scale = float(info["scale"])
     stext = scale_text(scale)
@@ -1484,16 +2205,23 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
         items += sec_items
         if marker is not None:
             mk = _marker_items(marker, origins[marker[0]], scale, style, section.label,
-                               counts.get(marker[0], (0, 0, 0, 0)))
+                               counts.get(marker[0], (0, 0, 0, 0)), _collinear_sides(marker, plan, scale))
             marker_idx = list(range(len(items), len(items) + len(mk)))
             items += mk
     label_idx = [i for i, it in enumerate(items) if isinstance(it, Text) and i not in marker_idx]
     dimension_items: List[List[int]] = []
+    ext_index = _ext_index(plan)
     for d, band in zip(plan.dims, _resolved_bands(plan)):
         if d.view not in origins or d.view == SECTION_KEY:
             log.debug("layout: dimension %r of undrawn view %r skipped", d.text, d.view)
             continue
         ds = _dim_to_sheet(d, band, origins[d.view], view_scale[d.view], geoms[d.view], style)
+        if ds.kind == "linear":                                         # round 2 issue 17
+            go_high = _outside_high(d, band, boxes[d.view], view_scale[d.view], style, ext_index)
+            off = _outside_text_offset(ds, geoms[d.view], style, go_high) if go_high is not None else 0.0
+            off = float(ds.text_offset or 0.0) or off
+            if off != float(ds.text_offset or 0.0):
+                ds = dataclasses.replace(ds, text_offset=off)
         rendered = render_dimension(ds, style)
         dimension_items.append(list(range(len(items), len(items) + len(rendered))))
         items += rendered
@@ -1536,7 +2264,8 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
         "keywords": meta.get("keywords", ""),
     }
     items += title_block_items(size, style, fields)
-    items += strip_items(size, style, stext, options.projection, str(meta.get("source_note", "")))
+    items += strip_items(size, style, stext, options.projection, str(meta.get("source_note", "")),
+                         unit_note=meta.get("unit_note") or None)
 
     sheet.meta.update(meta)
     sheet.meta.update({"size": size.name, "orientation": size.orientation, "iso5457": size.iso5457,
@@ -1546,7 +2275,11 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
                        "date": fields["date"], "section_layout": section_stats,
                        "iso_scale": (iso_scale if "iso" in origins else None),
                        "marker_view": marker[0] if marker is not None else None,
-                       "text_collisions": collision_stats})
+                       "text_collisions": collision_stats,
+                       "scale_candidates": [(float(c[0]), bool(c[1]), str(c[2]))
+                                            for c in info.get("scale_candidates", [])],
+                       "section_mode": info.get("section_mode"),
+                       "dims_dropped": [dict(u) for u in dropped]})
     # the planner's flags (dimension_extent_mismatch, QA issue 2) travel with the layout's, so the
     # pipeline's existing loop over LayoutResult.flags reports them with no extra step
     flags: List[Tuple[str, str, str]] = [tuple(f) for f in (getattr(plan, "flags", None) or [])]
@@ -1556,15 +2289,25 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
     if overflow:
         flags.append(("views_overflow", "warning",
                       f"the views do not fit {size.name} even at {stext}"))
+    if dropped:
+        flags.append(("layout_dims_dropped", "info",
+                      f"{len(dropped)} position dimension(s) dropped to keep {stext} (at most "
+                      f"{POSITION_BAND_CAP} position bands per side; listed in undimensioned, reason layout_space)"))
+    # QA round 2 issue 10: overlaps left after the resolution pass are a warning (overprinted
+    # dimensions); texts the pass moved are reported as info
     if collisions:
-        flags.append(("layout_text_collision", "info",
+        flags.append(("layout_text_collision", "warning",
                       f"{len(collisions)} text collision(s) left: " + "; ".join(collisions[:5])))
+    moved = int(collision_stats.get("linear_text_shifted", 0) or 0) + int(collision_stats.get("callouts_moved", 0) or 0)
+    if moved:
+        flags.append(("layout_text_moved", "info",
+                      f"{moved} dimension text(s) moved off the section marker or other texts"))
     placements = {n: ((float(origins[n][0]), float(origins[n][1])), rects[n]) for n in origins}
     log.debug("layout: %s at %s, %d items, %d dims", size.name, stext, len(items), len(sheet.dimensions))
     return LayoutResult(sheet=sheet, scale=scale, scale_text=stext, sheet_size=size,
-                        placements=placements, overflow=overflow, flags=flags)
+                        placements=placements, overflow=overflow, flags=flags, plan=plan)
 
 
 __all__ = ["LayoutResult", "compose", "choose_scale", "grid_cells", "band_counts", "band_extent",
            "frame_items", "title_block_items", "strip_items", "projection_symbol", "marker_arrow_at",
-           "SECTION_KEY", "text_collisions"]
+           "SECTION_KEY", "text_collisions", "section_column_cells", "POSITION_BAND_CAP"]

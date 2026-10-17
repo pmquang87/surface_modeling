@@ -17,7 +17,8 @@ and the quality level at the end:
 
 Severities: ``FLAGS`` maps every flag code to its severity (spec 3.8 plus
 this implementation's additions); ``WARNING_FLAGS`` / ``INFO_FLAGS`` are
-derived from it. ``flag(code)`` takes the table severity when none is
+derived from it, ``FLAG_MEANINGS`` gives each code a one-line meaning and
+``flag_table_markdown()`` renders the table the docs carry. ``flag(code)`` takes the table severity when none is
 passed; an unknown code needs an explicit severity and is logged, and a
 severity that disagrees with the table is logged (a typo would otherwise
 change the exit code silently), except the info -> warning raise allowed
@@ -100,10 +101,21 @@ FLAGS: Dict[str, str] = {
     "mesh_non_manifold": "warning",
     "section_fallback": "info",
     "interior_silhouettes_omitted": "info",
-    "layout_text_collision": "info",       # layout.py: labels/dimension texts overlap
+    # layout.py: dimension texts still overlap after the resolution pass (QA round 2
+    # issue 10: overprinted dimensions are a warning; resolved moves are layout_text_moved)
+    "layout_text_collision": "warning",
     # ---- F7-perf: large assemblies and the run deadline ----
     "hidden_lines_omitted_assembly": "info",   # large assembly: no hidden lines by design
     "section_skipped_budget": "warning",   # run deadline near: the section was not drawn
+    # ---- QA round 2 ----
+    "layout_text_moved": "info",           # texts moved off the marker / other texts
+    "layout_dims_dropped": "info",         # position dims dropped to keep the scale
+    "dimensions_omitted_assembly": "info",  # large assembly: no hole callouts / positions
+    "section_skipped_assembly": "info",    # large assembly: no auto section
+    "section_blackened": "info",           # more than half the cut area is solid-filled
+    "section_gaps_bridged": "info",        # open-mesh section gaps closed by chords; may be raised
+    "winding_repaired": "info",            # inconsistent winding; volume of a repaired copy
+    "dimension_hidden_only": "info",       # holes seen only hidden in their axial view
     # sandbox breaches (the run failed; exit 1 regardless of the severity)
     "sandbox_timeout": "warning",
     "sandbox_memory_exceeded": "warning",
@@ -113,7 +125,94 @@ FLAGS: Dict[str, str] = {
 }
 #: Codes whose default severity is ``info`` but which a caller may raise to
 #: ``warning`` (for example ``unit_assumed_mm`` when the size is implausible).
-ESCALATABLE_FLAGS = frozenset({"unit_assumed_mm", "unit_suspect"})
+ESCALATABLE_FLAGS = frozenset({"unit_assumed_mm", "unit_suspect", "section_gaps_bridged"})
+#: One line per flag code: what it means for the drawing. ``docs/drawing_module.md``
+#: carries the same table (``flag_table_markdown``; a test keeps them in step).
+FLAG_MEANINGS: Dict[str, str] = {
+    "mesh_not_watertight": "the mesh has boundary or non-manifold edges; volume and section "
+                           "may be approximate",
+    "multiple_bodies": "more than one solid (STEP) or mesh component (STL); drawn as one part",
+    "brepcheck_invalid": "BRepCheck_Analyzer reports the B-rep invalid",
+    "open_shell": "no solid, or free edges: an open surface model (no section, volume null)",
+    "inverted_solid": "the solid or mesh is inside out (negative signed volume); the absolute "
+                      "volume is reported, the signed raw sum is in the detail",
+    "fallback_to_mesh": "the B-rep stage of an STL input failed; drawn on the mesh route",
+    "hlr_timeout": "a view's native HLR exceeded hlr_time_budget_s; that view is missing",
+    "section_empty": "the section plane cuts no closed loop; no section view",
+    "section_open_wires": "open section wires were dropped from the section",
+    "views_overflow": "the views do not fit the sheet even at the smallest standard scale",
+    "dimensions_capped": "more hole groups than max_hole_callouts; the rest are listed in "
+                         "undimensioned (reason cap)",
+    "unit_not_mm": "the STEP length unit is not mm; OCCT converted the geometry on read",
+    "sheet_not_iso5457": "the sheet is not an ISO 5457 sheet (A4 landscape)",
+    "holes_not_detected_mesh_route": "faceted or mesh route: no hole features, no diameter "
+                                     "callouts",
+    "organic_classified": "the STL classifier found an organic shape (mesh route)",
+    "too_many_triangles": "more triangles than faceted_max_triangles: no faceted STEP",
+    "extension_mismatch": "the content format differs from the file extension",
+    "facet_edges_suppressed": "facet edges below facet_smooth_angle_deg are coded smooth and "
+                              "not drawn",
+    "hlr_poly_used": "more faces than exact_hlr_max_faces: polygonal HLR on a meshed copy",
+    "section_nudged": "the section plane gave no loop or lay in a face; moved by 1 % of the "
+                      "depth",
+    "degenerate_faces_removed": "degenerate triangles were skipped in the faceted STEP",
+    "approval_blank": "the approval field is blank (always, for an auto-generated drawing)",
+    "view_failed": "a view could not be drawn (error, or HLR returned no edges)",
+    "section_failed": "the section stage raised an error; no section view",
+    "writer_failed": "an output format could not be written",
+    "dimensions_failed": "dimension planning failed; the drawing has no dimensions",
+    "faceted_audit_mismatch": "the drawn faceted body disagrees with the closed mesh "
+                              "(topology or volume)",
+    "loose_curves_ignored": "loose edges / vertices (sketch, PMI curve sets) or tessellated "
+                            "PMI annotations are not drawn and not in the bbox",
+    "supplemental_shells_ignored": "free shells / faces or tessellated bodies next to the drawn "
+                                   "bodies are not drawn",
+    "supplemental_geometry_ignored": "other supplemental geometry is not drawn",
+    "loose_curves_drawn": "a pure wireframe or surface model keeps its loose curves",
+    "dimension_extent_mismatch": "an overall dimension differs from the model extent",
+    "unit_assumed_mm": "an STL carries no unit and was read as mm (warning when the size "
+                       "looks implausible)",
+    "unit_suspect": "the sizes look like another unit; the alternative reading is in the "
+                    "detail",
+    "views_tiny": "at the largest standard scale the views fill under 10 % of the frame: "
+                  "check the unit",
+    "step_tessellated_only": "the STEP holds triangulations only; drawn from the triangles "
+                             "(mesh route)",
+    "hidden_lines_dropped": "a view lost its hidden lines (time budget or "
+                            "max_hidden_primitives)",
+    "not_a_solid": "no closed component (triangle soup): no section, no overall dimensions, "
+                   "level minimal",
+    "mesh_non_manifold": "the mesh has edges with more than two faces",
+    "section_fallback": "no hole axis fits the section mode: bbox centre, thin-part plane, or "
+                        "no solid (no section)",
+    "interior_silhouettes_omitted": "organic mesh too large for silhouette candidates: interior "
+                                    "silhouettes are not drawn",
+    "layout_text_collision": "dimension texts still overlap after the resolution pass",
+    "hidden_lines_omitted_assembly": "large assembly (more than 20 solids, or 50000 raw hidden "
+                                     "edges in a view): no hidden lines",
+    "section_skipped_budget": "the run deadline was too close (or the section's estimated "
+                              "cost too high): no section view",
+    "layout_text_moved": "dimension texts were moved off the section marker or other texts",
+    "layout_dims_dropped": "position dimensions were dropped to keep the scale (undimensioned, "
+                           "reason layout_space)",
+    "dimensions_omitted_assembly": "large assembly: no hole callouts and no position "
+                                   "dimensions (undimensioned, reason assembly)",
+    "section_skipped_assembly": "large assembly: no automatic section (--section front, top "
+                                "or right draws one)",
+    "section_blackened": "more than half of the cut area is filled solid (walls thin at this "
+                         "scale but hatched at 1:1; not raised for thin-walled parts)",
+    "section_gaps_bridged": "open section chains of a mesh were closed by straight chords "
+                            "(warning when a chord exceeds 5 % of the section extent)",
+    "winding_repaired": "the face winding is inconsistent; the volume comes from a "
+                        "winding-repaired copy",
+    "dimension_hidden_only": "hole features seen only as hidden circles in their axial view "
+                             "get no callout (undimensioned)",
+    "sandbox_timeout": "the child exceeded the wall-clock limit (run failed)",
+    "sandbox_memory_exceeded": "the child exceeded the memory limit (run failed)",
+    "sandbox_cpu_exceeded": "the child exceeded the CPU-time backstop (run failed)",
+    "sandbox_output_exceeded": "the child exceeded the output cap (run failed)",
+    "sandbox_killed": "the child was killed (run failed)",
+}
 WARNING_FLAGS = frozenset(c for c, s in FLAGS.items() if s == "warning")
 INFO_FLAGS = frozenset(c for c, s in FLAGS.items() if s == "info")
 SEVERITIES = ("info", "warning")
@@ -136,6 +235,20 @@ _MAX_TEXT = 500
 def flag_severity(code: str) -> Optional[str]:
     """The table severity of ``code``, or None for an unknown code."""
     return FLAGS.get(str(code))
+
+
+def flag_table_markdown() -> str:
+    """The flag table of ``docs/drawing_module.md`` (code, severity, raised to warning,
+    meaning), generated from ``FLAGS`` / ``ESCALATABLE_FLAGS`` / ``FLAG_MEANINGS``:
+    warning codes first, then info, each in table order."""
+    rows = ["| Code | Severity | Can be raised to warning | Meaning |", "|---|---|---|---|"]
+    for sev in ("warning", "info"):
+        for code, s in FLAGS.items():
+            if s != sev:
+                continue
+            esc = "yes" if code in ESCALATABLE_FLAGS else ""
+            rows.append(f"| `{code}` | {s} | {esc} | {FLAG_MEANINGS.get(code, '')} |")
+    return "\n".join(rows)
 
 
 def _sandbox_disabled() -> Dict[str, Any]:
@@ -286,8 +399,11 @@ class Report:
             "writers": {"dxf_audited": None},
             "quality": {"level": None, "flags": [], "last_stage": None},
             "warnings": [],
+            # write_s: the whole sheet stage = dimensions_s + layout_s + writers_s;
+            # features_s: B-rep cylinder feature detection (review R5)
             "timing": {"total_s": None, "load_s": None, "views_s": None, "section_s": None,
-                       "write_s": None},
+                       "write_s": None, "features_s": None, "dimensions_s": None,
+                       "layout_s": None, "writers_s": None},
             "sandbox": _sandbox_disabled(),
             "version": _versions(),
         }
@@ -385,7 +501,8 @@ class Report:
                     d["geometry"][key] = val
         timing = p.get("timing")
         if isinstance(timing, dict):
-            for key in ("load_s", "views_s", "section_s", "write_s"):
+            for key in ("load_s", "views_s", "section_s", "write_s", "features_s",
+                        "dimensions_s", "layout_s", "writers_s"):
                 val = timing.get(key)
                 if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
                     d["timing"][key] = float(val)
@@ -494,4 +611,5 @@ def write_report_json(data: dict, path: str) -> None:
 
 __all__ = ["Report", "SCHEMA", "FLAGS", "ESCALATABLE_FLAGS", "WARNING_FLAGS", "INFO_FLAGS",
            "LEVELS", "MINIMAL_LEVEL_FLAGS", "PROGRESS_ENV", "PROGRESS_FILENAME", "flag_severity",
-           "progress_path_from_env", "write_progress", "write_report_json"]
+           "progress_path_from_env", "write_progress", "write_report_json", "FLAG_MEANINGS",
+           "flag_table_markdown"]

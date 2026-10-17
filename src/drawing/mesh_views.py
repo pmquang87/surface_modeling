@@ -53,7 +53,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .geometry2d import (chain_to_primitives, dedupe_primitives, merge_collinear,
+from .geometry2d import (chain_to_primitives, dedupe_primitives, merge_collinear, weld_chain_ends,
                          premerge_collinear, subtract_covered)
 from .model import BBox2D, LineStyle, Polyline, ProjectedView, Segment
 
@@ -66,6 +66,11 @@ _OUTLINE_COVER_PX = 3.0           # organic: runs within this of the mask outlin
 _MIN_CHAIN_PX = 2.0               # chains shorter than this are noise (QA issue 24)
 _ORGANIC_MIN_CHAIN_PAPER_MM = 3.0  # organic meshes: shorter chains are dropped (QA issues 13, 24)
 _DASH_PERIOD_PAPER_MM = 3.0       # one hidden dash: chains with >= 2 shorter chords -> Polyline
+_ORGANIC_MIN_LOOP_PAPER_MM = 1.0  # organic meshes: closed loops shorter than this are dropped (QA2 #25)
+_WELD_PAPER_MM = 0.3              # dangling chain ends this close are joined before chaining (QA2 #19)
+_SIMPLIFY_PAPER_MM = 0.05         # Douglas-Peucker tolerance of the chains (QA2 #19)
+_HAIRPIN_PAPER_MM = 0.5           # hairpin vertices with an adjacent edge shorter than this go (QA2 #19)
+_SLIVER_REL = 1e-5                # faces with a min altitude below this x bbox diagonal: no normal (QA2 #19)
 _DEFAULT_VIEW_PAPER_MM = 120.0    # paper-scale guess: the view's long side spans this on paper
 _MAX_ORGANIC_SILHOUETTE_FACES = 2_000_000   # above: organic silhouettes skipped and disclosed
 _SKIMAGE_WARM = {"done": False}
@@ -400,24 +405,45 @@ def candidate_edges(mesh, n: np.ndarray, feature_angle_deg: float,
     sharp (dihedral angle > feature angle) + boundary (+ silhouette when
     ``silhouettes``: adjacent faces on opposite sides, front-facing meaning
     ``dot(normal, n) > 1e-9``). Returns (unique sorted pairs, counts).
+
+    QA round 2 issue 19: an adjacency pair is not classified (neither sharp
+    nor silhouette) when one of its faces is degenerate - smallest altitude
+    (2 x area / longest edge) below ``_SLIVER_REL`` (1e-5) x the bbox
+    diagonal - because such a face has no reliable normal and gives
+    spurious sharp/silhouette wedges (``counts["sliver_pairs"]``). The
+    triage's shape test (inradius / longest edge < 0.02) is NOT used: it
+    flags every face of a 256-section cylinder (ratio 0.004, their normals
+    are exact) and 360 of the 1534 sharp edges of NIST FTC 08, median
+    dihedral 90 degrees (real rims).
     """
     import trimesh
 
     adj = np.asarray(mesh.face_adjacency)
     adj_e = np.asarray(mesh.face_adjacency_edges)
-    counts = {"sharp": 0, "silhouette": 0, "boundary": 0}
+    counts = {"sharp": 0, "silhouette": 0, "boundary": 0, "sliver_pairs": 0}
     parts = []
     if len(adj):
         ang = np.asarray(mesh.face_adjacency_angles, dtype=float)
         sharp = ang > math.radians(float(feature_angle_deg))
+        bad = _degenerate_faces(mesh)
+        if bad is not None and bad.any():
+            unreliable = bad[adj[:, 0]] | bad[adj[:, 1]]
+            counts["sliver_pairs"] = int(unreliable.sum())
+        else:
+            unreliable = None
         sel = sharp.copy()
         counts["sharp"] = int(sharp.sum())
         if silhouettes:
             s = np.asarray(mesh.face_normals, dtype=float) @ np.asarray(n, dtype=float)
             front = s > FRONT_EPS
             sil = front[adj[:, 0]] != front[adj[:, 1]]
+            if unreliable is not None:
+                sil &= ~unreliable
             counts["silhouette"] = int(sil.sum())
             sel |= sil
+        if unreliable is not None:
+            sel &= ~unreliable
+            counts["sharp"] = int((sharp & ~unreliable).sum())
         parts.append(adj_e[sel])
     es = np.asarray(mesh.edges_sorted)
     if len(es):
@@ -430,6 +456,24 @@ def candidate_edges(mesh, n: np.ndarray, feature_angle_deg: float,
         return np.zeros((0, 2), dtype=np.int64), counts
     cand = np.unique(np.sort(np.vstack(parts), axis=1), axis=0)
     return cand.astype(np.int64), counts
+
+
+def _degenerate_faces(mesh) -> Optional[np.ndarray]:
+    """Bool per face: smallest altitude below ``_SLIVER_REL`` x the bbox diagonal."""
+    try:
+        v = np.asarray(mesh.vertices, dtype=np.float64)[np.asarray(mesh.faces, dtype=np.int64)]
+        if len(v) == 0:
+            return None
+        e = np.linalg.norm(v[:, [1, 2, 0]] - v, axis=2).max(axis=1)
+        area = np.asarray(mesh.area_faces, dtype=np.float64)
+        diag = float(np.linalg.norm(np.ptp(np.asarray(mesh.vertices, dtype=np.float64), axis=0)))
+        if not diag > 0.0:
+            return None
+        hmin = 2.0 * area / np.where(e > 0.0, e, 1.0)
+        return hmin < _SLIVER_REL * diag
+    except Exception as exc:  # the classification just runs unfiltered
+        log.debug("degenerate-face test failed: %s", exc)
+        return None
 
 
 # --------------------------------------------------------------- projection
@@ -530,9 +574,17 @@ def _project(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: b
     vis = _clean_segments(vis, tol)
     short_len = _DASH_PERIOD_PAPER_MM / scale
     min_chain = max(_MIN_CHAIN_PX * px, (_ORGANIC_MIN_CHAIN_PAPER_MM / scale) if organic else 0.0)
+    min_loop = max(_MIN_CHAIN_PX * px, (_ORGANIC_MIN_LOOP_PAPER_MM / scale) if organic else 0.0)
+    min_loop = min(min_loop, min_chain)
+    weld_r = max(tol, _WELD_PAPER_MM / scale)
+    chain_kw = dict(short_len=short_len, min_chain_len=min_chain, min_closed_len=min_loop,
+                    simplify_tol=max(tol, _SIMPLIFY_PAPER_MM / scale),
+                    hairpin_len=_HAIRPIN_PAPER_MM / scale)
     stats["min_chain_len"] = min_chain
-    visible = chain_to_primitives(vis, LineStyle.VISIBLE, tol, short_len=short_len,
-                                  min_chain_len=min_chain)
+    stats["min_loop_len"] = min_loop
+    cst: dict = {}
+    vis, n_weld = weld_chain_ends(vis, tol, weld_r)
+    visible = chain_to_primitives(vis, LineStyle.VISIBLE, tol, stats=cst, **chain_kw)
     hidden_prims: list = []
     if hidden and len(hid):
         try:
@@ -544,12 +596,18 @@ def _project(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: b
                 hid = subtract_covered(hid, outline_edges, _OUTLINE_COVER_PX * px, loose=True,
                                        deadline=deadline, min_len=tol)
             hid = _clean_segments(hid, tol, deadline)
-            hidden_prims = chain_to_primitives(hid, LineStyle.HIDDEN, tol, short_len=short_len,
-                                               min_chain_len=min_chain, deadline=deadline)
+            hid, nw_h = weld_chain_ends(hid, tol, weld_r)
+            n_weld += nw_h
+            hidden_prims = chain_to_primitives(hid, LineStyle.HIDDEN, tol, deadline=deadline,
+                                               stats=cst, **chain_kw)
         except TimeoutError:
             hidden_prims = []
             stats["hidden_dropped"] = True
             stats["hidden_dropped_reason"] = "time_budget"
+    stats["welded_ends"] = int(n_weld)
+    stats["closed_loops_dropped"] = int(cst.get("closed_dropped", 0))
+    stats["dropped_chains"] = int(cst.get("open_dropped", 0) + cst.get("closed_dropped", 0))
+    stats["hairpins_removed"] = int(cst.get("hairpins_removed", 0))
     visible = dedupe_primitives(visible, tol)
     hidden_prims = dedupe_primitives(hidden_prims, tol) if hidden else []
     stats["visibility_s"] = time.perf_counter() - t0
@@ -591,6 +649,17 @@ def project_mesh(mesh, spec, *, raster_px: int, feature_angle_deg: float, organi
     tessellation survive until they are chained. For organic meshes above
     ``_MAX_ORGANIC_SILHOUETTE_FACES`` faces the silhouettes are skipped and
     ``stats["interior_silhouettes_omitted"]`` is True.
+
+    QA round 2 (issues 19, 25): before chaining, dangling chain ends within
+    0.3 mm on paper are joined (``weld_chain_ends``; ``stats["welded_ends"]``);
+    every chain is simplified (Douglas-Peucker 0.05 mm on paper, hairpin
+    vertices under 20 degrees with an edge shorter than 0.5 mm on paper
+    removed; ``stats["hairpins_removed"]``); closed loops of organic meshes
+    are kept down to 1 mm on paper instead of 3 mm (small through-holes on
+    the iso view; ``stats["closed_loops_dropped"]``, ``stats["dropped_chains"]``
+    counts open and closed drops, ``stats["min_loop_len"]``); faces whose
+    smallest altitude is below 1e-5 x the bbox diagonal do not classify
+    their edges (``stats["n_sliver_pairs"]``, see ``candidate_edges``).
 
     ``paper_scale`` (paper mm per model mm) sets those paper lengths; the
     default guesses that the view's long side spans 120 mm on paper.

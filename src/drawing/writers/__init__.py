@@ -1,13 +1,13 @@
 """Writers that render a ``Sheet`` (sheet mm, origin bottom-left, Y up).
 
-* ``write_svg(sheet, path)`` -> ``{"bytes", "elements", "skipped"}``
+* ``write_svg(sheet, path)`` -> ``{"bytes", "elements", "skipped", "dash_adapted"}``
 * ``write_dxf(sheet, path)`` -> ``{"bytes", "entities", "layers", "dimensions",
   "dimensions_skipped", "dimension_items_replaced", "dimension_match",
   "audit_errors", "audit_fixes", "skipped"}`` (ezdxf imported lazily); it
   drops the rendered copies of each written dimension exactly when
   ``sheet.meta["dimension_items"]`` lists them (one list of item indices per
   ``sheet.dimensions`` entry), else by a tight geometric match
-* ``write_pdf(sheet, path)`` -> ``{"bytes", "objects", "skipped"}``
+* ``write_pdf(sheet, path)`` -> ``{"bytes", "objects", "skipped", "dash_adapted"}``
 * ``helvetica_width(text, size)`` - Helvetica advance width in mm.
 
 The helpers below are shared by the three writers and are defined BEFORE
@@ -21,6 +21,16 @@ Shared rules (spec 3.7, writers probe):
   section and cutting lines, narrow 0.25 for hidden, centre, hatch,
   dimension and title lines, 0.7 for the frame. Dashes: hidden 3/0.75,
   centre 6/0.75/0.125/0.75, cutting 12/1.5/0.25/1.5 (mm).
+* Short hidden elements (QA round 2 issue 2): the pattern starts at phase 0
+  on every element, so a hidden element shorter than one dash printed
+  solid. ``item_line_props`` fits the hidden pattern to the element length
+  (``adapt_dash``: >= 2 dashes on an open element shorter than two
+  periods, a whole number >= 4 of periods on a closed curve); the SVG and
+  PDF write the fitted pattern, the DXF keeps its one ``HIDDEN_ISO``
+  linetype and writes a per-entity ``ltscale`` (``hidden_ltscale``). Each
+  writer returns the count as ``dash_adapted``.
+* Joins are ROUND in the SVG and PDF (QA round 2 issue 20: the default
+  miter join drew spikes at hairpin vertices); caps stay butt.
 * U+2300 (diameter sign) is not in WinAnsi/cp1252 (measured: encode
   raises) and is mapped to U+00D8 ``Ø`` in every writer, so the three
   outputs carry the same text.
@@ -70,9 +80,16 @@ def clean_text(text) -> str:
     return ("" if text is None else str(text)).replace(DIAMETER_SIGN, "Ø").translate(_DROP_CHARS)
 
 
-def line_props(style: LineStyle, sheet_style: SheetStyle = DEFAULT_STYLE
+def line_props(style: LineStyle, sheet_style: SheetStyle = DEFAULT_STYLE, *,
+               length: Optional[float] = None, closed: bool = False
                ) -> Tuple[float, Optional[Tuple[float, ...]]]:
-    """(stroke width mm, dash pattern mm or None) for a ``LineStyle``."""
+    """(stroke width mm, dash pattern mm or None) for a ``LineStyle``.
+
+    ``length`` (sheet mm, optional) is the length of the element the pattern
+    is drawn on and ``closed`` whether it is a closed curve; a HIDDEN pattern
+    is then fitted to it with ``adapt_dash`` (QA round 2 issue 2). Without
+    ``length`` the stock pattern is returned.
+    """
     s = sheet_style
     st = LineStyle(style)
     if st in (LineStyle.VISIBLE, LineStyle.SECTION):
@@ -80,7 +97,10 @@ def line_props(style: LineStyle, sheet_style: SheetStyle = DEFAULT_STYLE
     if st == LineStyle.CUTTING:
         return s.wide, tuple(s.dash_cutting)
     if st == LineStyle.HIDDEN:
-        return s.narrow, tuple(s.dash_hidden)
+        dash = tuple(s.dash_hidden)
+        if length is not None:
+            dash = adapt_dash(dash, length, closed)
+        return s.narrow, dash
     if st == LineStyle.CENTER:
         return s.narrow, tuple(s.dash_center)
     if st == LineStyle.FRAME:
@@ -88,6 +108,127 @@ def line_props(style: LineStyle, sheet_style: SheetStyle = DEFAULT_STYLE
     if st == LineStyle.TEXT:
         return s.text_stroke, None
     return s.narrow, None          # HATCH, DIMENSION, TITLE
+
+
+# Short hidden elements (QA round 2 issue 2). Every writer starts the dash
+# pattern at phase 0 on each element, so with the ISO 3/0.75 pattern an
+# element shorter than one dash (blind-hole walls, thin-plate edges, R1 hidden
+# circles: 2 pi r < 3.75) prints as a solid stroke. ``adapt_dash`` fits the
+# pattern to the element instead: an open element shorter than two periods
+# gets exactly two dashes and one gap (scaled 3:0.75 pattern), a closed curve
+# a whole number of periods, at least four (so at least four gaps, and no
+# merged dash at the closing point). Gaps never shrink below
+# MIN_DASH_GAP (or a third of the element), or the narrow 0.25 mm line closes them.
+MIN_DASH_GAP = 0.3          # sheet mm
+_MIN_CLOSED_PERIODS = 4
+
+
+def adapt_dash(dash: Tuple[float, ...], length: float, closed: bool = False
+               ) -> Tuple[float, ...]:
+    """Dash pattern ``dash`` (dash, gap[, dash, gap ...], mm) fitted to an element.
+
+    Open element (``closed`` False): unchanged when ``length`` >= two periods,
+    else two dashes and one gap that fill ``length`` exactly. Closed curve:
+    ``n = max(4, round(length / period))`` periods scaled to fill ``length``
+    (unchanged when it already holds a whole number of at least 4). Patterns
+    with other than two entries are only scaled. Non-finite or non-positive
+    lengths return the pattern unchanged.
+    """
+    dash = tuple(float(v) for v in dash)
+    try:
+        L = float(length)
+    except (TypeError, ValueError):
+        return dash
+    period = sum(dash)
+    if not (math.isfinite(L) and L > 0.0 and period > 0.0) or len(dash) < 2:
+        return dash
+    if closed:
+        n = max(_MIN_CLOSED_PERIODS, int(round(L / period)))
+        k = L / (n * period)
+        if abs(k - 1.0) <= 1e-6:
+            return dash
+        if len(dash) != 2:
+            return tuple(v * k for v in dash)
+        p = L / n
+        gap = min(max(dash[1] * k, min(MIN_DASH_GAP, p / 2.0)), p / 2.0)
+        return (p - gap, gap)
+    if L >= 2.0 * period:
+        return dash
+    if len(dash) != 2:
+        k = L / (2.0 * dash[0] + dash[1]) if len(dash) >= 2 else 1.0
+        return tuple(v * k for v in dash)
+    k = L / (2.0 * dash[0] + dash[1])                    # two dashes + one gap
+    gap = max(dash[1] * k, min(dash[1], MIN_DASH_GAP, L / 3.0))
+    return (0.5 * (L - gap), gap)
+
+
+def item_length(item) -> Tuple[Optional[float], bool]:
+    """(length in the item's units, closed) of a stroked item; (None, False) otherwise.
+
+    Segment: chord; Polyline: sum of its edges (closing edge when closed; a
+    repeated closing point adds nothing); Circle: 2 pi r; Arc: r x sweep (a
+    full-turn Arc is closed).
+    """
+    try:
+        if isinstance(item, Segment):
+            return float(math.dist(tuple(map(float, item.a)), tuple(map(float, item.b)))), False
+        if isinstance(item, Polyline):
+            pts = np.asarray(item.points, dtype=np.float64).reshape(-1, 2)
+            if len(pts) < 2:
+                return None, False
+            closed = bool(item.closed)
+            ring = np.vstack([pts, pts[:1]]) if closed else pts
+            return float(np.linalg.norm(np.diff(ring, axis=0), axis=1).sum()), closed
+        if isinstance(item, Circle):
+            return 2.0 * math.pi * abs(float(item.radius)), True
+        if isinstance(item, Arc):
+            span = arc_span(item.start_deg, item.end_deg)
+            return abs(float(item.radius)) * math.radians(span), span >= 360.0 - 1e-9
+    except (TypeError, ValueError):
+        return None, False
+    return None, False
+
+
+def item_line_props(item, sheet_style: SheetStyle = DEFAULT_STYLE
+                    ) -> Tuple[float, Optional[Tuple[float, ...]], bool]:
+    """(width, dash, adapted) for one stroked item: ``line_props`` with the item's
+    own length, ``adapted`` True when the dash differs from the stock pattern."""
+    width, stock = line_props(item.style, sheet_style)
+    if stock is None or LineStyle(item.style) != LineStyle.HIDDEN:
+        return width, stock, False
+    L, closed = item_length(item)
+    if L is None:
+        return width, stock, False
+    _, dash = line_props(item.style, sheet_style, length=L, closed=closed)
+    adapted = dash is not None and any(abs(a - b) > 1e-9 for a, b in zip(dash, stock))
+    return width, dash, adapted
+
+
+def hidden_ltscale(item, sheet_style: SheetStyle = DEFAULT_STYLE) -> Optional[float]:
+    """Per-entity DXF linetype scale that fits the hidden pattern to ``item``.
+
+    DXF has one pattern per linetype; an entity's ``ltscale`` (group 48)
+    scales it. Returns the factor for which the ``HIDDEN_ISO`` pattern
+    (``sheet_style.dash_hidden`` at ``$LTSCALE`` 1) shows two dashes on a
+    short open element, or a whole number (>= 4) of periods on a closed
+    curve; None when the stock pattern is kept (not HIDDEN, long element,
+    or a factor within 1 % of 1).
+    """
+    if LineStyle(item.style) != LineStyle.HIDDEN:
+        return None
+    L, closed = item_length(item)
+    dash = tuple(float(v) for v in sheet_style.dash_hidden)
+    period = sum(dash)
+    if L is None or not (L > 0.0 and math.isfinite(L)) or period <= 0.0 or len(dash) < 2:
+        return None
+    if closed:
+        n = max(_MIN_CLOSED_PERIODS, int(round(L / period)))
+        k = L / (n * period)
+    elif L >= 2.0 * period:
+        return None
+    else:
+        k = L / (2.0 * dash[0] + dash[1])
+    return None if abs(k - 1.0) <= 0.01 else float(k)
 
 
 def _finite(arr) -> bool:
@@ -142,4 +283,5 @@ from .svg import write_svg  # noqa: E402
 from .dxf import write_dxf  # noqa: E402
 
 __all__ = ["write_svg", "write_dxf", "write_pdf", "PdfWriter", "helvetica_width",
-           "line_props", "clean_text", "valid_item"]
+           "line_props", "clean_text", "valid_item", "adapt_dash", "item_length",
+           "item_line_props", "hidden_ltscale"]

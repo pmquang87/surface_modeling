@@ -471,22 +471,30 @@ def _section_part_edges(part, point, normal) -> List:
     return out
 
 
-def _section_loops(shape, point, normal, spec, deflection: float, bodies=None):
+def _section_loops(shape, point, normal, spec, deflection: float, bodies=None,
+                   skip=None, ids_out: Optional[list] = None):
     """Closed section loops in view 2D + stats for one plane.
 
     Each body (``_parts``) whose bbox reaches the plane is sectioned on its
     own and its edges are joined into wires on their own, so coincident
     faces of touching bodies (a bolt in its hole, a nut on a bolt) do not
     merge their wires into open ones. ``stats["bodies_sectioned"]`` counts
-    them. ``bodies`` (a ``_Bodies`` of ``shape``) shares the box cache."""
+    them. ``bodies`` (a ``_Bodies`` of ``shape``) shares the box cache.
+    Loops are recovered from open wires body by body too.
+
+    ``skip`` (indices into ``_parts``) are not sectioned (fasteners, QA
+    round 2 issue 28); ``stats["bodies_skipped"]`` counts those the plane
+    reaches. ``ids_out`` (a list) receives the ``_parts`` index of each
+    returned loop (QA round 2 issue 3: ``SectionView.loop_body``)."""
     from OCP.BRep import BRep_Tool
     from OCP.ShapeAnalysis import ShapeAnalysis_FreeBounds
     from OCP.TopTools import TopTools_HSequenceOfShape
     from OCP.TopoDS import TopoDS
 
     stats = {"edges": 0, "wires": 0, "open_wires_dropped": 0, "dangling_segments_pruned": 0,
-             "loops_recovered": 0, "bodies_sectioned": 0}
-    groups: List[List] = []
+             "loops_recovered": 0, "bodies_sectioned": 0, "bodies_skipped": 0}
+    skip = set(skip or ())
+    groups: List[Tuple[int, List]] = []
     if _SECTION_PER_BODY:
         if bodies is None:
             bodies = _Bodies(shape)
@@ -498,13 +506,19 @@ def _section_loops(shape, point, normal, spec, deflection: float, bodies=None):
             rng = bodies.range(i, point, normal)
             if rng is None or rng[0] > bodies.tol or rng[1] < -bodies.tol:
                 continue                      # the plane misses this body
+            if i in skip:
+                stats["bodies_skipped"] += 1
+                continue
         edges = _section_part_edges(part, point, normal)
         stats["bodies_sectioned"] += 1
         if edges:
-            groups.append(edges)
-    loops3: List[np.ndarray] = []
-    open_segs = []
-    for edges in groups:
+            groups.append((i, edges))
+    if not groups:
+        return [], stats
+    basis = np.stack([np.asarray(spec.x, float), np.asarray(spec.y, float)], axis=1)   # (3, 2)
+    loops2: List[np.ndarray] = []
+    ids: List[int] = []
+    for body_id, edges in groups:
         seq = TopTools_HSequenceOfShape()
         for e in edges:
             seq.Append(e)
@@ -512,6 +526,7 @@ def _section_loops(shape, point, normal, spec, deflection: float, bodies=None):
         wires = TopTools_HSequenceOfShape()
         ShapeAnalysis_FreeBounds.ConnectEdgesToWires_s(seq, _WIRE_TOL, False, wires)
         stats["wires"] += wires.Length()
+        open_segs = []
         for i in range(1, wires.Length() + 1):
             w = TopoDS.Wire_s(wires.Value(i))
             if BRep_Tool.IsClosed_s(w):
@@ -521,27 +536,27 @@ def _section_loops(shape, point, normal, spec, deflection: float, bodies=None):
                     log.debug("closed section wire skipped: %s", exc)
                     continue
                 if len(P) >= 3:
-                    loops3.append(P)
+                    loops2.append(P @ basis)
+                    ids.append(body_id)
             else:
                 stats["open_wires_dropped"] += 1
                 if _RECOVER_OPEN:
                     open_segs.append(_wire_segments(w, deflection))
-    if not groups:
-        return [], stats
-    basis = np.stack([np.asarray(spec.x, float), np.asarray(spec.y, float)], axis=1)   # (3, 2)
-    loops2 = [P @ basis for P in loops3]
-    if open_segs:
-        segs3 = np.concatenate(open_segs)
-        kept, pruned = _prune_dangling(segs3, _WIRE_TOL)
-        stats["dangling_segments_pruned"] = pruned
-        if len(kept):
-            rec, n_open = chain_segments(kept @ basis, _WIRE_TOL)
-            rec = [L for L in rec if len(L) >= 3]
-            stats["loops_recovered"] = len(rec)
-            loops2 += rec
+        if open_segs:
+            segs3 = np.concatenate(open_segs)
+            kept, pruned = _prune_dangling(segs3, _WIRE_TOL)
+            stats["dangling_segments_pruned"] += pruned
+            if len(kept):
+                rec, n_open = chain_segments(kept @ basis, _WIRE_TOL)
+                rec = [L for L in rec if len(L) >= 3]
+                stats["loops_recovered"] += len(rec)
+                loops2 += rec
+                ids += [body_id] * len(rec)
     if stats["open_wires_dropped"]:
         log.info("section: %d open wire(s) dropped, %d loop(s) recovered from them",
                  stats["open_wires_dropped"], stats["loops_recovered"])
+    if ids_out is not None:
+        ids_out[:] = ids
     return loops2, stats
 
 
@@ -600,6 +615,213 @@ def _normalise_loops(loops: List[np.ndarray]) -> List[np.ndarray]:
     return out
 
 
+_MERGE_MAX_LOOPS = 200     # the containment test is O(n^2) in the loop count
+_SMOOTH_TURN = 0.5         # rad: a sharper vertex is a corner, not a discretised curve
+
+
+def _loop_sagitta(a: np.ndarray) -> float:
+    """Largest chord-to-curve deviation of a closed polygon that discretises
+    curves: per edge ``L x theta / 8`` (the sagitta of a chord L on a circle
+    of radius L / theta), theta the mean turning angle of its smooth end
+    vertices (turn <= ``_SMOOTH_TURN``; corners are not curves). 0 for a
+    polygon of corners only. Straight-through vertices (turn < 1e-6 rad: a
+    mesh cut puts one on every chord where it crosses a facet diagonal) are
+    dropped first, else they halve the chords and the estimate."""
+    a = np.asarray(a, float).reshape(-1, 2)
+    if len(a) < 3:
+        return 0.0
+    for _ in range(2):
+        e = np.roll(a, -1, axis=0) - a
+        prev = np.roll(e, 1, axis=0)
+        cross = prev[:, 0] * e[:, 1] - prev[:, 1] * e[:, 0]
+        dot = np.einsum("ij,ij->i", prev, e)
+        keep = (np.abs(np.arctan2(cross, dot)) >= 1e-6) & (np.einsum("ij,ij->i", e, e) > 0.0)
+        if keep.all() or keep.sum() < 3:
+            break
+        a = a[keep]
+    e = np.roll(a, -1, axis=0) - a                       # edge i: vertex i -> i + 1
+    L = np.linalg.norm(e, axis=1)
+    prev = np.roll(e, 1, axis=0)                         # edge into vertex i
+    cross = prev[:, 0] * e[:, 1] - prev[:, 1] * e[:, 0]
+    dot = np.einsum("ij,ij->i", prev, e)
+    turn = np.abs(np.arctan2(cross, dot))                # at vertex i
+    smooth = turn <= _SMOOTH_TURN
+    t0, t1 = np.where(smooth, turn, 0.0), np.roll(np.where(smooth, turn, 0.0), -1)
+    k = smooth.astype(float) + np.roll(smooth, -1).astype(float)
+    theta = np.where(k > 0, (t0 + t1) / np.maximum(k, 1.0), 0.0)
+    return float(np.max(L * theta) / 8.0)
+
+
+def _max_dist_to_polygon(pts: np.ndarray, poly: np.ndarray, chunk: int = 2048) -> float:
+    """Largest distance of ``pts`` to the closed polygon ``poly`` (its edges)."""
+    a = poly
+    b = np.roll(poly, -1, axis=0)
+    ab = b - a
+    ab2 = np.maximum(np.einsum("ij,ij->i", ab, ab), 1e-300)
+    worst = 0.0
+    for s in range(0, len(pts), chunk):
+        p = pts[s:s + chunk, None, :]                    # (m, 1, 2)
+        t = np.clip(np.einsum("mkj,kj->mk", p - a[None], ab) / ab2, 0.0, 1.0)
+        q = a[None] + t[..., None] * ab[None]
+        d = np.sqrt(np.min(np.sum((p - q) ** 2, axis=2), axis=1))
+        worst = max(worst, float(d.max()))
+    return worst
+
+
+def merge_void_bodies(loops: Sequence[np.ndarray], ids: Sequence[int], is_void,
+                      coincide_tol: Optional[float] = None) -> List[int]:
+    """Body ids with void bodies joined to the body around them (QA round 2 issue 3).
+
+    An internal cavity can arrive as a body of its own: the faceted STL
+    route makes the cavity shell a separate solid (healed to a positive
+    volume: 48000 + 2000 mm3 measured for a 60 x 40 x 20 box with a 20 x 10
+    x 10 cavity), a mesh has it as a separate (negative-volume) component.
+    Its section loop is a hole of the outer body; as a body of its own the
+    layout would nest it alone and fill the void. A body whose loops ALL
+    lie at odd containment depth (holes only) is a void when
+    ``is_void(body_id)`` is True (negative signed volume) or when none of
+    its loops coincides with a loop of another body (it sits in the
+    material of the body around it: a healed cavity or an interference); it
+    takes the body of the smallest loop containing it one level up. Bodies
+    with an outer loop, and bodies whose loop coincides with a hole of
+    another body (an exact-fit bolt seen across its axis: equal areas, so
+    the bolt loop is not inside the hole loop), keep their id. Runs only
+    with more than one body and at most ``_MERGE_MAX_LOOPS`` loops; ``ids``
+    returned unchanged otherwise.
+
+    Two loops coincide when every vertex of each lies within a distance
+    tolerance of the other polygon (symmetric Hausdorff on the vertices;
+    after a cheap area / bbox filter). The tolerance is the larger of
+    ``coincide_tol`` (``section_brep`` passes 2 x deflection + the wire
+    tolerance), 2 x the larger ``_loop_sagitta`` of the pair (an
+    estimate from the polygons themselves, which covers mesh cuts) and
+    1e-6 x the coordinate scale. A bolt modelled with its seam 37 deg away
+    from the hole's has an equal-area loop whose bbox differs by about the
+    sagitta (review of issue 3: the former 1e-6 x scale bbox test joined it
+    to the plate and drew it white)."""
+    from .geometry2d import _loop_inside, polygon_area
+
+    n = len(loops)
+    ids = list(ids)
+    if n < 2 or len(ids) != n or len(set(ids)) < 2 or n > _MERGE_MAX_LOOPS:
+        return ids
+    arrs = [np.asarray(L, float).reshape(-1, 2) for L in loops]
+    areas = [abs(polygon_area(a)) if len(a) >= 3 else 0.0 for a in arrs]
+    scale = max(1.0, max(float(np.abs(a).max()) if a.size else 0.0 for a in arrs))
+    eps = 1e-9 * scale
+    inside = np.zeros((n, n), dtype=bool)
+    for j in range(n):
+        for i in range(n):
+            if i != j and areas[j] > areas[i] > 0.0:
+                try:
+                    inside[i, j] = _loop_inside(arrs[i], arrs[j], eps)
+                except Exception:
+                    inside[i, j] = False
+    depth = inside.sum(axis=1)
+    has_outer = {ids[i] for i in range(n) if depth[i] % 2 == 0}
+    cand = {ids[i] for i in range(n)} - has_outer
+    boxes = [np.concatenate([a.min(axis=0), a.max(axis=0)]) if a.size else np.zeros(4)
+             for a in arrs]
+    base = max(1e-6 * scale, float(coincide_tol) if coincide_tol else 0.0)
+    sag: dict = {}
+    perim: dict = {}
+
+    def sagitta(i: int) -> float:
+        if i not in sag:
+            try:
+                sag[i] = _loop_sagitta(arrs[i])
+            except Exception:
+                sag[i] = 0.0
+        return sag[i]
+
+    def perimeter(i: int) -> float:
+        if i not in perim:
+            a = arrs[i]
+            perim[i] = float(np.linalg.norm(np.roll(a, -1, axis=0) - a, axis=1).sum()) if len(a) else 0.0
+        return perim[i]
+
+    def pair(i: int, k: int) -> bool:
+        tol = max(base, 2.0 * max(sagitta(i), sagitta(k)) + base)
+        if float(np.max(np.abs(boxes[k] - boxes[i]))) > tol:
+            return False
+        if abs(areas[k] - areas[i]) > (2.0 * max(perimeter(i), perimeter(k)) * tol
+                                       + 1e-6 * max(areas[i], 1.0)):
+            return False
+        if len(arrs[i]) < 3 or len(arrs[k]) < 3:
+            return False
+        try:
+            return (_max_dist_to_polygon(arrs[i], arrs[k]) <= tol
+                    and _max_dist_to_polygon(arrs[k], arrs[i]) <= tol)
+        except Exception as exc:
+            log.debug("loop coincidence check failed: %s", exc)
+            return False
+
+    def coincides(i: int) -> bool:
+        return any(ids[k] != ids[i] and pair(i, k) for k in range(n))
+
+    voids = set()
+    for b in cand:
+        mine = [i for i in range(n) if ids[i] == b]
+        if not any(coincides(i) for i in mine):
+            voids.add(b)
+            continue
+        try:
+            if is_void(b):
+                voids.add(b)
+        except Exception as exc:
+            log.debug("void check of body %s failed: %s", b, exc)
+    out = list(ids)
+    for i in np.argsort(depth, kind="stable"):
+        if ids[i] not in voids:
+            continue
+        parents = [j for j in range(n) if inside[i, j] and depth[j] == depth[i] - 1]
+        if parents:
+            out[i] = out[min(parents, key=lambda j: areas[j])]
+    return out
+
+
+def _part_is_void(part) -> bool:
+    """True for a solid with a negative signed volume (an inward-wound cavity shell)."""
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    from OCP.TopAbs import TopAbs_SOLID
+    if part.ShapeType() != TopAbs_SOLID:
+        return False
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(part, props)
+    return float(props.Mass()) < 0.0
+
+
+def _normalise_loops_by_body(loops: List[np.ndarray], ids: Sequence[int], is_void=None,
+                             coincide_tol: Optional[float] = None
+                             ) -> Tuple[List[np.ndarray], List[int]]:
+    """``_normalise_loops`` body by body: the loops of each body id (in the
+    order of first appearance) are nested on their own, so a hole belongs to
+    an outer of its own body. Returns the loops and the body id per loop.
+    ``ids`` not aligned with ``loops`` -> all loops nested as one body 0.
+    ``is_void`` (``body id -> bool``) first joins void bodies to the body
+    around them (``merge_void_bodies`` with ``coincide_tol``)."""
+    if len(ids) != len(loops):
+        out = _normalise_loops(loops)
+        return out, [0] * len(out)
+    if is_void is not None:
+        ids = merge_void_bodies(loops, ids, is_void, coincide_tol=coincide_tol)
+    order: List[int] = []
+    by: dict = {}
+    for lp, b in zip(loops, ids):
+        if b not in by:
+            by[b] = []
+            order.append(b)
+        by[b].append(lp)
+    out: List[np.ndarray] = []
+    out_ids: List[int] = []
+    for b in order:
+        got = _normalise_loops(by[b])
+        out += got
+        out_ids += [int(b)] * len(got)
+    return out, out_ids
+
+
 # ----------------------------------------------------------------- body
 
 def _half_space_solid(p: np.ndarray, n: np.ndarray, removed: bool = True):
@@ -629,7 +851,8 @@ def _common_one(part, kept_half):
     return com.Shape()
 
 
-def _half_space_cut(shape, point, normal, stats: Optional[dict] = None, bodies=None):
+def _half_space_cut(shape, point, normal, stats: Optional[dict] = None, bodies=None,
+                    keep_whole=None):
     """Keep the material on the -normal side of the plane (the viewer is on +normal).
 
     Each body (``_parts``: solid, free shell, the free faces) is classified
@@ -649,13 +872,21 @@ def _half_space_cut(shape, point, normal, stats: Optional[dict] = None, bodies=N
     or 1e-4 x bbox diagonal) and excess_bodies (kept bodies still past the
     plane by more than that after the Common retry; they are kept, so the
     caller can flag an inexact cut when this is > 0).
+
+    ``keep_whole`` (indices into ``_parts``; fasteners, QA round 2 issue
+    28): such a body that straddles the plane is kept whole instead of cut
+    (ISO: bolts, pins and shafts are not sectioned lengthwise); one entirely
+    on the removed side is still dropped. ``stats["fasteners_unsectioned"]``
+    lists the straddling ones kept whole.
     """
     from OCP.BRep import BRep_Builder
     from OCP.TopoDS import TopoDS_Compound
     p = np.asarray(point, float)
     n = np.asarray(normal, float)
     st = {"kept_whole": 0, "dropped_whole": 0, "cut": 0, "common_retries": 0,
-          "half_space_excess_mm": 0.0, "half_space_excess_tol_mm": 0.0, "excess_bodies": 0}
+          "half_space_excess_mm": 0.0, "half_space_excess_tol_mm": 0.0, "excess_bodies": 0,
+          "fasteners_unsectioned": []}
+    keep_whole = set(keep_whole or ())
     if not _SECTION_PER_BODY:
         out = _cut_one(shape, _half_space_solid(p, n))
         if stats is not None:
@@ -681,6 +912,11 @@ def _half_space_cut(shape, point, normal, stats: Optional[dict] = None, bodies=N
             continue
         if d_lo >= -tol:
             st["dropped_whole"] += 1
+            continue
+        if i in keep_whole and len(bodies.parts) > 1:
+            kept.append(part)                  # a fastener on the plane: not sectioned
+            st["kept_whole"] += 1
+            st["fasteners_unsectioned"].append(int(i))
             continue
         if removed is None:
             removed = _half_space_solid(p, n)
@@ -834,9 +1070,51 @@ def _body_centroids(shape, parts=None) -> List[np.ndarray]:
 
 # ----------------------------------------------------------------- API
 
+_FASTENER_AXIS_COS = 0.5   # |axis . n| below this: the plane cuts the fastener lengthwise
+
+
+def fastener_parts(features: Optional[Sequence[CylFeature]], normal=None,
+                   max_cos: float = _FASTENER_AXIS_COS) -> List[int]:
+    """Solid indices (``_parts`` / ``brep_features._solid_list`` order) of the
+    fasteners named by ``features``: the ``filler_bodies`` of every
+    ``"filled_hole"`` feature (``brep_features.cylinder_features``).
+
+    With a section plane ``normal``, only the fillers of holes whose axis
+    lies in the plane (``|axis . n| < max_cos``: the bolt is cut lengthwise)
+    are returned: ISO 128-50 leaves bolts, pins and shafts unhatched only in
+    a lengthwise cut, a cross-cut bolt is sectioned. A feature without a
+    usable axis counts as lengthwise."""
+    nv = None
+    if normal is not None:
+        nv = np.asarray(normal, float).reshape(3)
+        nn = float(np.linalg.norm(nv))
+        nv = nv / nn if nn > 1e-12 and np.all(np.isfinite(nv)) else None
+    out = set()
+    for f in features or ():
+        if getattr(f, "kind", "") != "filled_hole":
+            continue
+        if nv is not None:
+            try:
+                ax = np.asarray(getattr(f, "axis"), float).reshape(3)
+                an = float(np.linalg.norm(ax))
+                if an > 1e-12 and abs(float(ax @ nv)) / an >= float(max_cos):
+                    continue                  # cut across its axis: sectioned
+            except Exception:
+                pass
+        for b in getattr(f, "filler_bodies", ()) or ():
+            try:
+                if int(b) >= 0:
+                    out.add(int(b))
+            except (TypeError, ValueError):
+                continue
+    return sorted(out)
+
+
 def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
                  depth_extent: float, hidden: bool = True,
-                 time_budget_s: Optional[float] = None) -> SectionView:
+                 time_budget_s: Optional[float] = None,
+                 features: Optional[Sequence[CylFeature]] = None,
+                 keep_whole: Optional[Sequence[int]] = None) -> SectionView:
     """Cut ``shape`` with the plane (``point``, ``normal``) and view it with ``spec``.
 
     ``normal`` must equal ``spec.n`` (ValueError otherwise). A plane that
@@ -864,6 +1142,16 @@ def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
     as its budget with ``hlr_raise_after_s = inf``: an overrun never raises,
     it only cuts the Python clean-up of the body (hidden lines dropped,
     visible segments left unmerged; the pipeline's run deadline).
+
+    QA round 2: ``loop_body`` of the result gives the body (``_parts``
+    index: solids first, in explorer order) of every loop; the loops are
+    nested body by body (issue 3). In an assembly (more than one body) the
+    fasteners named by ``features`` (``fastener_parts(features, normal)``:
+    the ``filler_bodies`` of the ``"filled_hole"`` features whose axis lies
+    in the plane; a bolt cut across its axis is sectioned) and the indices in
+    ``keep_whole`` are not sectioned: no loops, kept whole in the body when
+    the plane runs through them (issue 28); ``stats["fasteners_unsectioned"]``
+    lists those, ``stats["bodies_skipped"]`` counts them on the final plane.
     """
     from .brep_views import project_brep
 
@@ -881,6 +1169,7 @@ def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
     if not (deflection > 0.0 and math.isfinite(deflection)):
         raise ValueError(f"section_brep: deflection must be positive, got {deflection!r}")
 
+    skip = set(fastener_parts(features, normal=n)) | {int(i) for i in (keep_whole or ())}
     step = _NUDGE_FRACTION * abs(float(depth_extent))
     nudged = False
     nudge_mm = 0.0
@@ -890,21 +1179,28 @@ def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
         p = p + nudge_mm * n
         nudged = True
         log.info("section plane lies in %d planar face(s); nudged by %.4g mm", coplanar, nudge_mm)
+    ids: List[int] = []
     try:
         bodies = _Bodies(shape) if _SECTION_PER_BODY else None
-        loops, lstats = _section_loops(shape, p, n, spec, deflection, bodies=bodies)
+        if bodies is None or len(bodies.parts) < 2:
+            skip = set()                      # one body: nothing to leave unsectioned
+        loops, lstats = _section_loops(shape, p, n, spec, deflection, bodies=bodies,
+                                       skip=skip, ids_out=ids)
     except Exception as exc:
         raise RuntimeError(f"section failed: {exc}") from exc
-    loops = _normalise_loops(loops)
+    is_void = (lambda b: _part_is_void(bodies.parts[b])) if bodies is not None else None
+    ctol = 2.0 * deflection + _WIRE_TOL               # two discretisations of one curve
+    loops, ids = _normalise_loops_by_body(loops, ids, is_void, ctol)
     if not loops and not nudged:
         nudge_mm = _nudge_sign(shape, p, n) * step
         p = p + nudge_mm * n
         nudged = True
         try:
-            loops, lstats = _section_loops(shape, p, n, spec, deflection, bodies=bodies)
+            loops, lstats = _section_loops(shape, p, n, spec, deflection, bodies=bodies,
+                                           skip=skip, ids_out=ids)
         except Exception as exc:
             raise RuntimeError(f"section failed after nudge: {exc}") from exc
-        loops = _normalise_loops(loops)
+        loops, ids = _normalise_loops_by_body(loops, ids, is_void, ctol)
         log.info("section plane had no closed loop; nudged by %.4g mm -> %d loop(s)",
                  nudge_mm, len(loops))
 
@@ -922,15 +1218,17 @@ def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
             q = p + d * n
             if _NUDGE_COPLANAR and _coplanar_face_count(shape, q, n):
                 q = q + _nudge_sign(shape, q, n) * step * n
+            cids: List[int] = []
             try:
-                cand, cstats = _section_loops(shape, q, n, spec, deflection, bodies=bodies)
+                cand, cstats = _section_loops(shape, q, n, spec, deflection, bodies=bodies,
+                                              skip=skip, ids_out=cids)
             except Exception as exc:
                 log.debug("section retry at a body failed: %s", exc)
                 continue
-            cand = _normalise_loops(cand)
+            cand, cids = _normalise_loops_by_body(cand, cids, is_void, ctol)
             if cand:
                 retry_mm = float(np.dot(q - p, n))
-                p, loops, lstats, retried = q, cand, cstats, True
+                p, loops, lstats, retried, ids = q, cand, cstats, True, cids
                 log.info("section plane moved %.4g mm to a body centroid -> %d loop(s)",
                          retry_mm, len(loops))
                 break
@@ -941,7 +1239,7 @@ def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
     if loops:
         t1 = time.perf_counter()
         try:
-            kept = _half_space_cut(shape, p, n, stats=hs, bodies=bodies)
+            kept = _half_space_cut(shape, p, n, stats=hs, bodies=bodies, keep_whole=skip)
         except Exception as exc:
             raise RuntimeError(f"section body cut failed: {exc}") from exc
         if time_budget_s is None:
@@ -956,13 +1254,16 @@ def section_brep(shape, point, normal, spec, *, exact: bool, deflection: float,
 
     stats = dict(lstats)
     stats.update(hs)
+    stats.setdefault("fasteners_unsectioned", [])
     stats.update(nudged=nudged, nudge_mm=nudge_mm, coplanar=int(coplanar), loops=len(loops),
                  retried_at_body=retried, retry_mm=retry_mm,
                  seconds=round(time.perf_counter() - t0, 6), seconds_body=round(t_body, 6))
     marker = {"front": "top", "back": "top", "top": "front", "bottom": "front",
               "right": "front", "left": "front"}.get(spec.name, "top")
     return SectionView(spec=spec, plane_point=p, plane_normal=n.copy(), loops=loops, body=body,
-                       marker_view=marker, stats=stats)
+                       marker_view=marker, stats=stats,
+                       loop_body=list(ids) if len(ids) == len(loops) else None)
 
 
-__all__ = ["choose_section_plane_brep", "choose_section_plane_brep_info", "section_brep"]
+__all__ = ["choose_section_plane_brep", "choose_section_plane_brep_info", "section_brep",
+           "fastener_parts"]

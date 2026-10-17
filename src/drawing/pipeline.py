@@ -58,10 +58,21 @@ alternative reading in the detail. After the layout, ``views_tiny``
 (warning) when the sheet scale is the largest standard scale and the view
 geometry covers less than 10 % of the drawing frame (``_views_tiny``).
 
-Mesh ``inverted_solid`` is raised only for a consistently wound mesh
-(``winding_conflicts == 0``); for a badly wound one the census "inverted"
-verdict only describes its dominant piece, so a warning text about the
-inconsistent winding is written instead.
+Mesh ``inverted_solid`` follows the census verdict ``inverted_solid``
+(``mesh_load.inverted_solid_verdict``: inverted with no winding conflict, a
+few, or a negative raw signed sum matching the repaired volume; QA round 2
+issue 8) with the signed raw sum in the detail; for a badly wound mesh the
+census "inverted" verdict only describes its dominant piece, so one warning
+text about the inconsistent winding is written instead. Any winding conflict
+with a repaired volume adds ``winding_repaired`` (info).
+
+Large assemblies (more than ``_ASSEMBLY_MIN_SOLIDS`` solid instances, QA
+round 2 issues 5 and 11): no hidden lines (below), no hole callouts and no
+position dimensions (``dimensions_omitted_assembly``, undimensioned reason
+``assembly`` per radius group) and no auto section
+(``section_skipped_assembly``; an explicit ``--section`` plane is drawn). The
+section is also skipped when its estimated cost (``_SECTION_COST_VIEWS`` x
+the mean view time) exceeds the time left before the write reserve.
 
 The faceted body that is drawn is built from the ORIENTED mesh by
 ``faceted_shape_from_mesh`` (one face per triangle, smooth edges coded C1:
@@ -135,7 +146,8 @@ _DEPTH_MESH_MARGIN = 1.2          # mesh route: mesh_load.choose_depth_sign_mesh
 _BREP_STAGE_FLAGS = ("hlr_poly_used", "section_nudged", "section_open_wires", "section_empty",
                      "holes_not_detected_mesh_route", "facet_edges_suppressed",
                      "hidden_lines_dropped", "section_fallback", "hidden_lines_omitted_assembly",
-                     "section_skipped_budget")
+                     "section_skipped_budget", "section_skipped_assembly",
+                     "section_gaps_bridged")
 
 # F7-perf: large assemblies and the cooperative run deadline
 _ASSEMBLY_MIN_SOLIDS = 20         # more solid instances: no hidden lines unless hidden_lines_force
@@ -147,6 +159,19 @@ _MIN_RESERVE_S = 5.0
 _MIN_VIEW_BUDGET_S = 2.0          # a view never gets less (its visible lines are still drawn)
 _DXF_AUDIT_MAX_ITEMS = 100_000    # sheet items above which the DXF is not re-read for the audit
 _DXF_AUDIT_MIN_REMAINING_S = 10.0  # ... and when less time than this is left before the deadline
+# QA round 2 issue 11: the section's cost is estimated as this many mean view times
+# (measured on the 211-solid RC buggy: section 37.0 s vs a mean view of 10.1 s; on the
+# NIST parts the section costs 0.2-1.5 x a view); skipped when the time left before
+# the write reserve is below the estimate
+_SECTION_COST_VIEWS = 1.0
+# QA round 2 issue 21: section filled solid over more than this share of the cut area
+_SECTION_BLACKENED_SHARE = 0.5
+# ... and an open-mesh bridge chord longer than this share of the section extent: warning
+_BRIDGE_WARN_SHARE = 0.05
+# QA round 2 issue 30: the strip note when the unit is doubtful (two lines at 2.5 mm or
+# more, layout.strip_items; at most 64 characters with a '(' part)
+UNIT_NOTE_ASSUMED = "Dimensions in mm (unit assumed, see report)"
+UNIT_NOTE_SUSPECT = "Dimensions in mm (unit doubtful, see report)"
 
 stage_logger = logging.getLogger("src.drawing.stage")
 
@@ -178,8 +203,11 @@ class _Ctx:
         self.options = options
         self.say = say
         self.stem = rep.stem
-        self.timing: Dict[str, float] = {"load_s": 0.0, "views_s": 0.0, "section_s": 0.0,
-                                         "write_s": 0.0}
+        # write_s is the whole sheet stage; dimensions_s + layout_s + writers_s split it.
+        # features_s: B-rep cylinder feature detection (review R5: it sat in no bucket)
+        self.timing: Dict[str, float] = {"load_s": 0.0, "features_s": 0.0, "views_s": 0.0,
+                                         "section_s": 0.0, "write_s": 0.0, "dimensions_s": 0.0,
+                                         "layout_s": 0.0, "writers_s": 0.0}
         self.views: Dict[str, Any] = {}
         self.section = None
         self.features: List[Any] = []
@@ -189,6 +217,10 @@ class _Ctx:
         self.source: Optional[str] = None
         self.skip_section: Optional[str] = None      # reason, e.g. "not_a_solid"
         self.skip_overall_dims: Optional[str] = None
+        # QA round 2: number of solids (B-rep) or mesh components (planner's n_bodies)
+        # and the large-assembly verdict (no hole dims, no auto section; issues 5, 11)
+        self.n_bodies: Optional[int] = None
+        self.assembly: bool = False
         self.progress_path = progress_path_from_env()
         # cooperative run deadline (F7-perf item D): the sandbox kills the child at
         # timeout_s; the run plans to finish by 0.8 x timeout_s after this point
@@ -268,13 +300,17 @@ def _record_orientation(ctx: _Ctx, o, depth: dict) -> None:
     ctx.rep.data["route"]["orientation"] = d
 
 
-def _depth_sign_brep(ctx: _Ctx, shape, o, faces: Optional[int]):
+def _depth_sign_brep(ctx: _Ctx, shape, o, faces: Optional[int], bbox=None):
     """``(orientation, info)``: keep or turn the part 180 deg about Z (QA issue 14).
 
-    ``brep_features.score_depth_sign`` on the FILE shape with the front
-    viewer's direction mapped back (``o.matrix.T @ VIEWS["front"].n``):
-    ``plus`` = faces facing the current front viewer, ``minus`` = the far
-    side. Turned when ``minus > 1.25 * plus`` and ``minus - plus >= 2``.
+    ``brep_features.choose_depth_sign_brep`` on the FILE shape with the
+    front viewer's direction mapped back (``o.matrix.T @ VIEWS["front"].n``;
+    QA round 2 issue 4): the open-cavity rule (``brep_cavity``) decides when
+    a side holds a clear cavity, else the face rule (``brep_faces``: turned
+    when the far side has more than 1.25 x the faces and at least 2 more);
+    the cavity rule yields to the face rule for an open housing (the deeper
+    side's mean recess above 0.4 of the bbox depth). ``bbox``: the census
+    exact ``(lo, hi)`` in file coordinates (saves the scorer its own box).
     Only for ``orient=auto``.
     """
     import numpy as np
@@ -289,18 +325,27 @@ def _depth_sign_brep(ctx: _Ctx, shape, o, faces: Optional[int]):
         info["depth_reason"] = f"not scored: {faces} faces > {_DEPTH_SIGN_MAX_FACES}"
         return o, info
     try:
-        from .brep_features import score_depth_sign
+        from .brep_features import choose_depth_sign_brep
         n_file = np.asarray(o.matrix, float).T @ np.asarray(VIEWS["front"].n, float)
-        plus, minus = score_depth_sign(shape, n_file)
+        r = choose_depth_sign_brep(shape, n_file, bbox=bbox, ratio=_DEPTH_FLIP_RATIO,
+                                   min_diff=_DEPTH_FLIP_MIN_DIFF)
     except Exception as exc:
         info["depth_reason"] = f"scoring failed: {type(exc).__name__}: {exc}"
         logger.warning("depth sign scoring failed: %s", exc)
         return o, info
-    flip = bool(minus > _DEPTH_FLIP_RATIO * plus and minus - plus >= _DEPTH_FLIP_MIN_DIFF)
-    info["depth_scores"] = {"kept": float(plus), "flipped": float(minus)}
-    info["depth_reason"] = (f"faces facing the front viewer: {plus:.4g} on the kept side, "
-                            f"{minus:.4g} on the far side"
-                            + ("; turned 180 deg about Z" if flip else ""))
+    flip = bool(r.get("flip"))
+    info["depth_method"] = r.get("method") or "brep_faces"
+    info["depth_scores"] = {k: (bool(r.get(src)) if k == "housing" else
+                                (None if r.get(src) is None else float(r.get(src))))
+                            for k, src in (("kept", "score_kept"), ("flipped", "score_flipped"),
+                                           ("cavity_kept", "cavity_kept"),
+                                           ("cavity_flipped", "cavity_flipped"),
+                                           ("faces_kept", "faces_kept"),
+                                           ("faces_flipped", "faces_flipped"),
+                                           ("mean_recess_kept", "mean_recess_kept"),
+                                           ("mean_recess_flipped", "mean_recess_flipped"),
+                                           ("housing", "housing"))}
+    info["depth_reason"] = r.get("reason") or None      # says "turned 180 deg" itself
     if flip:
         o = flip_depth(o)
         info["depth_flipped"] = True
@@ -324,8 +369,12 @@ def _depth_sign_mesh(ctx: _Ctx, mesh, o):
         info["depth_reason"] = f"scoring failed: {type(exc).__name__}: {exc}"
         logger.warning("mesh depth sign scoring failed: %s", exc)
         return o, info
+    info["depth_method"] = r.get("method") or "mesh_feature_edges"
     info["depth_scores"] = {"kept": float(r.get("score_kept") or 0.0),
                             "flipped": float(r.get("score_flipped") or 0.0)}
+    for key in ("cavity_kept", "cavity_flipped", "edges_kept", "edges_flipped"):
+        if r.get(key) is not None:
+            info["depth_scores"][key] = float(r[key])
     info["depth_reason"] = r.get("reason")
     if r.get("flip"):
         o2 = flip_depth(o)
@@ -400,7 +449,20 @@ def _view_entry(name: str, pv, seconds: float) -> dict:
         e["time_budget_s"] = st.get("time_budget_s")
     if st.get("mesh_reused"):
         e["mesh_reused"] = True
+    # QA round 2 (R1 clean-ups): mesh route chain welding / hairpins / dropped loops and
+    # slivers, B-rep route hidden curves under visible ones (issues 19, 25, 18)
+    for key in _VIEW_COUNT_KEYS:
+        v = st.get(key)
+        if v is not None:
+            try:
+                e[key] = int(v)
+            except (TypeError, ValueError):
+                pass
     return e
+
+
+_VIEW_COUNT_KEYS = ("welded_ends", "hairpins_removed", "closed_loops_dropped", "dropped_chains",
+                    "n_sliver_pairs", "hidden_curves_dropped", "hidden_curves_trimmed")
 
 
 def _view_flags(ctx: _Ctx, name: str, pv) -> None:
@@ -443,10 +505,30 @@ def _section_report(ctx: _Ctx, sec, info: Optional[dict] = None) -> None:
          "retried_at_body": bool(st.get("retried_at_body", False))}
     for key in ("kept_length_ratio", "kept_area_ratio", "bridged_gaps", "bridge_max_gap",
                 "bridge_rejected", "excess_bodies", "half_space_excess_mm",
-                "half_space_excess_tol_mm"):
+                "half_space_excess_tol_mm", "fasteners_unsectioned", "bodies_skipped"):
         if key in st:
             d[key] = st.get(key)
     ctx.rep.data["section"] = d
+    n_bridged = int(st.get("bridged_gaps", 0) or 0)
+    if n_bridged > 0:
+        # QA round 2 issue 21: synthetic chords across mesh holes are disclosed; a chord
+        # longer than 5 % of the section extent is a warning
+        gap = float(st.get("bridge_max_gap", 0.0) or 0.0)
+        extent = 0.0
+        try:
+            import numpy as np
+            pts = np.vstack([np.asarray(lp, float).reshape(-1, 2)[:, :2] for lp in sec.loops
+                             if np.size(lp)])
+            extent = float(np.ptp(pts, axis=0).max())
+        except Exception:
+            extent = 0.0
+        share = gap / extent if extent > 0.0 else float("inf")
+        sev = "warning" if share > _BRIDGE_WARN_SHARE else "info"
+        ctx.rep.flag("section_gaps_bridged", sev,
+                     f"{n_bridged} open section gap(s) of the mesh closed by straight chords; "
+                     f"largest {gap:.3g} mm"
+                     + (f" ({100.0 * share:.3g} % of the section extent {extent:.4g} mm)"
+                        if extent > 0.0 else ""))
     if st.get("nudged"):
         ctx.rep.flag("section_nudged", "info", "the plane gave no closed loop (or lay in a "
                      "planar face) and was moved by 1 % of the depth")
@@ -515,11 +597,13 @@ def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
             f"(scale guess {scale:g})")
 
     if features_on:
+        tf = time.perf_counter()
         try:
             ctx.features = cylinder_features(shape)
         except Exception as exc:
             ctx.rep.warn(f"cylinder feature detection failed: {exc}")
             ctx.features = []
+        ctx.timing["features_s"] = ctx.timing.get("features_s", 0.0) + (time.perf_counter() - tf)
         kinds = [f.kind for f in ctx.features]
         ctx.rep.data["geometry"]["features"] = {"holes": kinds.count("hole"),
                                                 "bosses": kinds.count("boss"),
@@ -535,8 +619,10 @@ def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
     # count is not used: Inventor and STEPControl assemblies arrive as ONE root
     # (the 211-solid RC buggy suspension has roots == 1)
     hidden_on = bool(opts.hidden_lines)
-    if hidden_on and not opts.hidden_lines_force and solids is not None \
-            and int(solids) > _ASSEMBLY_MIN_SOLIDS:
+    # QA round 2 issues 5 / 11: the same gate also drops the hole dimensions and the
+    # auto section (_sheet_and_write, below)
+    ctx.assembly = bool(solids is not None and int(solids) > _ASSEMBLY_MIN_SOLIDS)
+    if hidden_on and not opts.hidden_lines_force and ctx.assembly:
         hidden_on = False
         ctx.rep.flag("hidden_lines_omitted_assembly", "info",
                      f"{int(solids)} solids > {_ASSEMBLY_MIN_SOLIDS}"
@@ -595,6 +681,15 @@ def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
 
     if opts.section == "off":
         return
+    if opts.section == "auto" and ctx.assembly:
+        # QA round 2 issue 11: the auto section of a large assembly cost 30-37 s on the
+        # 211-solid RC buggy and came out all black; an explicit plane still draws it
+        ctx.rep.flag("section_skipped_assembly", "info",
+                     f"{int(solids)} solids > {_ASSEMBLY_MIN_SOLIDS}: no automatic section of a "
+                     f"large assembly (--section front|top|right draws one)")
+        ctx.rep.data["section"] = None
+        ctx.section = None
+        return
     ctx.progress("section")
     t1 = time.perf_counter()
     write_reserve = ctx.reserve(_WRITE_RESERVE_FRACTION)
@@ -604,6 +699,18 @@ def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
                      f"{max(ctx.remaining(), 0.0):.1f} s left before the run deadline "
                      f"(0.8 x timeout {opts.timeout_s:g} s) < {write_reserve:.1f} s kept for the "
                      f"sheet: no section view drawn")
+        ctx.rep.data["section"] = None
+        ctx.section = None
+        return
+    # QA round 2 issue 11: the section's own cost, estimated from the mean view time
+    mean_view_s = (ctx.timing["views_s"] - views_base) / max(len(opts.views), 1)
+    estimate = _SECTION_COST_VIEWS * mean_view_s
+    if ctx.remaining() - write_reserve < estimate:
+        ctx.rep.flag("section_skipped_budget", "warning",
+                     f"estimated section cost {estimate:.1f} s ({_SECTION_COST_VIEWS:g} x the mean "
+                     f"view time {mean_view_s:.1f} s) > {max(ctx.remaining() - write_reserve, 0.0):.1f}"
+                     f" s left before the sheet reserve (run deadline 0.8 x timeout "
+                     f"{opts.timeout_s:g} s): no section view drawn")
         ctx.rep.data["section"] = None
         ctx.section = None
         return
@@ -622,10 +729,13 @@ def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
         else:
             spec = _section_spec(normal)
             depth = float(abs(np.dot(hi - lo, np.asarray(normal, float))))
+            # features: the fasteners (filled-hole partners) cut lengthwise stay whole
+            # (QA round 2 issue 28; section_brep picks them from the plane normal)
             sec = section_brep(shape, point, normal, spec, exact=exact, deflection=defl,
                                depth_extent=depth, hidden=False,
                                time_budget_s=max(ctx.remaining() - write_reserve,
-                                                 _MIN_VIEW_BUDGET_S))
+                                                 _MIN_VIEW_BUDGET_S),
+                               features=ctx.features or None)
             sec.marker_view = marker
             _section_report(ctx, sec, info)
             if info.get("reason") == "bbox_centre_fallback":
@@ -662,6 +772,7 @@ def _mesh_stage(ctx: _Ctx, mesh, organic: bool) -> None:
     ctx.features = []
     ctx.views = {}
     ctx.section = None
+    ctx.assembly = False                     # no hole features on this route anyway
     ctx.rep.data["views"] = []
     ctx.rep.data["section"] = None
     ctx.rep.data["geometry"]["features"] = {"holes": None, "bosses": None, "fillets": None}
@@ -807,9 +918,11 @@ def _run_step(ctx: _Ctx) -> None:
     g["extents"] = (hi - lo).tolist()
     _unit_check(ctx, hi - lo, model.source_unit)
 
+    if c.get("solids") is not None:
+        ctx.n_bodies = int(c.get("solids") or 0)
     o = _orientation(ctx, hi - lo)
     shape = model.shape
-    o, depth = _depth_sign_brep(ctx, shape, o, c.get("faces"))
+    o, depth = _depth_sign_brep(ctx, shape, o, c.get("faces"), bbox=(lo.copy(), hi.copy()))
     _record_orientation(ctx, o, depth)
     if not _is_identity(o.matrix):
         try:
@@ -854,6 +967,31 @@ def _run_step_tessellated(ctx: _Ctx, exc) -> None:
     if getattr(exc, "source_unit", "mm") not in ("mm", None):
         rep.flag("unit_not_mm", "warning", f"source length unit {exc.source_unit}; OCCT "
                  f"converted the geometry to mm on read")
+    # QA round 2 issue 24: what the triangles leave out, as on the B-rep route
+    rep.data["route"]["stl_to_step"]["skipped_reason"] = "tessellated_step"
+    bodies = dict(getattr(exc, "bodies", None) or {})
+    dropped = {k: int(v) for k, v in (getattr(exc, "dropped", None) or {}).items()
+               if isinstance(v, (int, float)) and int(v) > 0}
+    bodies["dropped"] = dropped
+    rep.data["geometry"]["bodies"] = bodies
+    n_shells = int(dropped.get("tessellated_shells_outside", 0) or 0)
+    supp = {k: int(dropped.get(k, 0)) for k in ("free_shells", "free_faces", "tessellated_bodies")
+            if dropped.get(k)}
+    if n_shells or supp:
+        parts = [f"{n_shells} tessellated solid(s) / shell(s) outside the drawn part"] \
+            if n_shells else []
+        parts += [f"{n} {k.replace('_', ' ')}" for k, n in supp.items() if not n_shells]
+        rep.flag("supplemental_shells_ignored", "info", ", ".join(parts) + " not drawn")
+    n_ann = int(dropped.get("annotation_occurrences", 0) or 0)
+    n_edges = int(dropped.get("loose_edges", 0) or 0)
+    n_verts = int(dropped.get("loose_vertices", 0) or 0)
+    if n_ann or n_edges or n_verts:
+        rep.flag("loose_curves_ignored", "info",
+                 ", ".join(t for t in (
+                     f"{n_ann} tessellated PMI annotation occurrence(s)" if n_ann else "",
+                     f"{n_edges} loose edge(s)" if n_edges else "",
+                     f"{n_verts} loose vertex(es)" if n_verts else "") if t)
+                 + " not drawn and not part of the bbox")
     census = mesh_census(mesh)
     cls = classify(mesh, opts.classifier_threshold, census=census)
     rep.data["route"]["classifier"] = dict(cls)
@@ -899,22 +1037,35 @@ def _mesh_flags(ctx: _Ctx, census: dict, cls: dict) -> Tuple[bool, bool]:
         rep.flag("mesh_non_manifold", "warning",
                  f"{census.get('nonmanifold_edges')} non-manifold edge(s) (more than two "
                  f"faces on one edge)")
-    if census.get("inverted"):
-        conflicts = int(census.get("winding_conflicts") or 0)
-        if conflicts == 0:
-            rep.flag("inverted_solid", "warning", "the mesh is inside out (negative signed "
-                     f"volume); |volume| {census.get('volume_mm3')} mm3 reported")
-        else:
-            # the "inverted" verdict of a badly wound mesh only says its dominant
-            # piece is wound inward: the defect is the inconsistent winding, not an
-            # inside-out solid (QA corpus 21); report.FLAGS has no winding code
-            def g(v):
-                return "n/a" if v is None else f"{float(v):.6g}"
-            rep.warn(f"face winding is inconsistent ({conflicts} edge(s) whose two faces run it "
-                     f"in the same direction): the volume {g(census.get('volume_mm3'))} mm3 "
-                     f"comes from a winding-repaired copy (raw |signed sum| "
-                     f"{g(census.get('volume_raw_mm3'))} mm3)")
+    def g(v):
+        return "n/a" if v is None else f"{float(v):.6g}"
+
+    conflicts = int(census.get("winding_conflicts") or 0)
+    raw_signed = census.get("volume_raw_signed_mm3")
+    if "inverted_solid" in census:
+        inverted_solid = bool(census.get("inverted_solid"))
+    else:                                    # an older census: the round-1 rule
+        inverted_solid = bool(census.get("inverted")) and conflicts == 0
+    if inverted_solid:
+        # QA round 2 issue 8: mesh_load.inverted_solid_verdict (no conflict, a few, or a
+        # negative raw sum matching the repaired volume: 28's 2 conflicts in 451k edges)
+        rep.flag("inverted_solid", "warning",
+                 f"the mesh is inside out (raw signed volume {g(raw_signed)} mm3, "
+                 f"{conflicts} winding conflict(s)); |volume| {g(census.get('volume_mm3'))} mm3 "
+                 f"reported")
+    elif census.get("inverted") and conflicts > 0:
+        # the "inverted" verdict of a badly wound mesh only says its dominant piece is
+        # wound inward: the defect is the inconsistent winding, not an inside-out solid
+        rep.warn(f"face winding is inconsistent ({conflicts} edge(s) whose two faces run it "
+                 f"in the same direction): the volume {g(census.get('volume_mm3'))} mm3 "
+                 f"comes from a winding-repaired copy (raw signed sum {g(raw_signed)} mm3)")
+    if conflicts > 0 and census.get("volume_repaired"):
+        rep.flag("winding_repaired", "info",
+                 f"{conflicts} winding conflict(s): volume {g(census.get('volume_mm3'))} mm3 "
+                 f"from a winding-repaired copy (raw signed sum {g(raw_signed)} mm3)")
     comps = int(census.get("components") or 0)
+    if comps > 0:
+        ctx.n_bodies = comps
     if comps > 1:
         rep.flag("multiple_bodies", "warning", f"{comps} mesh components (bodies of the vertex "
                  f"graph); drawn as one part")
@@ -940,7 +1091,7 @@ def _scaled_census(census: dict, f: float) -> dict:
             c[key] = [float(v) * f for v in c[key]]
     if c.get("area_mm2") is not None:
         c["area_mm2"] = float(c["area_mm2"]) * f * f
-    for key in ("volume_mm3", "volume_raw_mm3"):
+    for key in ("volume_mm3", "volume_raw_mm3", "volume_raw_signed_mm3"):
         if c.get(key) is not None:
             c[key] = float(c[key]) * f ** 3
     return c
@@ -1143,8 +1294,8 @@ def _run_stl(ctx: _Ctx) -> None:
     _mesh_geometry(ctx, census)
     conflicts = int(census.get("winding_conflicts") or 0)
     for w in mm.warnings:
-        if conflicts and w.startswith("mesh is inside out"):
-            continue                 # inconsistent winding, worded by _mesh_flags instead
+        if conflicts and w.startswith("volume computed on a winding-repaired copy"):
+            continue                 # the winding_repaired flag of _mesh_flags carries it
         rep.warn(w)
     if not opts.stl_unit:
         rep.flag("unit_assumed_mm", "info", "STL carries no unit: read as mm (--stl-unit "
@@ -1222,6 +1373,95 @@ def _run_stl(ctx: _Ctx) -> None:
 
 # ------------------------------------------------------------------ sheet --
 
+def _assembly_hole_groups(features) -> List[dict]:
+    """``undimensioned`` entries ``{kind: hole_group, radius, count, reason}``, one per
+    hole radius (0.01 mm groups), for the holes of a large assembly (issue 5): reason
+    ``assembly`` for the holes, ``filled_by_fastener`` for the holes a fastener of
+    another solid fills (the gate drops both kinds before the planner, which would
+    otherwise list the filled ones; review R5)."""
+    reasons = {"hole": "assembly", "filled_hole": "filled_by_fastener"}
+    groups: Dict[Tuple[str, float], int] = {}
+    for f in features or []:
+        reason = reasons.get(getattr(f, "kind", None))
+        if reason is None:
+            continue
+        try:
+            r = round(float(f.radius), 2)
+        except (TypeError, ValueError):
+            continue
+        groups[(reason, r)] = groups.get((reason, r), 0) + 1
+    order = {"assembly": 0, "filled_by_fastener": 1}
+    return [{"kind": "hole_group", "radius": r, "count": n, "reason": reason, "view": None}
+            for (reason, r), n in sorted(groups.items(), key=lambda kv: (order[kv[0][0]],
+                                                                         kv[0][1]))]
+
+
+def _report_dimensions(rep: Report, plan) -> None:
+    rep.data["dimensions"] = [{"kind": d.kind, "view": d.view, "value_mm": float(d.value),
+                               "text": d.text, "count": int(d.count)} for d in plan.dims]
+    rep.data["undimensioned"] = [dict(u) for u in plan.undimensioned]
+
+
+def _unit_note(rep: Report) -> Optional[str]:
+    """The strip's unit note when the unit is doubtful (QA round 2 issue 30), else None:
+    ``unit_assumed_mm`` or ``unit_suspect`` raised as a warning."""
+    doubtful = {f["code"] for f in rep.data["quality"]["flags"]
+                if f["code"] in ("unit_assumed_mm", "unit_suspect") and f["severity"] == "warning"}
+    if not doubtful:
+        return None
+    src = rep.data["input"].get("source_unit")
+    return UNIT_NOTE_ASSUMED if src == "assumed_mm" else UNIT_NOTE_SUSPECT
+
+
+def _report_section_fill(rep: Report, sl: dict, scale: Optional[float] = None) -> None:
+    """Copy the layout's section fill decision into ``report.section`` (issue 21) and
+    flag ``section_blackened`` when more than half the cut area is filled solid.
+
+    The layout's ``body_thickness`` is 2A/P measured ON THE SHEET: it goes to
+    ``body_thickness_paper_mm``; with the sheet ``scale`` (paper / model) known it is
+    also given in model mm (``body_thickness_model_mm``). Review R5: a part whose
+    thin bodies are thinner than the fill limit in MODEL mm is thin-walled by design
+    (filled at 1:1 too, ISO 128-50): ``thin_walled_by_design`` True and no
+    ``section_blackened`` flag; the flag stays for walls the scale blackened."""
+    from .style import section_fill_below
+    sec = rep.data["section"]
+    sec["hatch_segments"] = int(sl.get("hatch_segments") or 0)
+    sec["hatch_spacing_mm"] = sl.get("hatch_spacing")
+    sec["fill"] = sl.get("fill")
+    sec["filled_regions"] = int(sl.get("filled_regions") or 0)
+    try:
+        frac = float(sl.get("filled_area_fraction") or 0.0)
+    except (TypeError, ValueError):
+        frac = 0.0
+    sec["filled_area_fraction"] = round(frac, 4)
+    for key in ("bodies", "thick_core_bodies"):
+        if sl.get(key) is not None:
+            sec[key] = int(sl.get(key) or 0)
+    thin_by_design = False
+    try:
+        paper = [float(t) for t in (sl.get("body_thickness") or [])]
+    except (TypeError, ValueError):
+        paper = []
+    try:
+        s = float(scale) if scale is not None else None
+    except (TypeError, ValueError):
+        s = None
+    if s is not None and not (math.isfinite(s) and s > 0.0):
+        s = None
+    if paper:
+        sec["body_thickness_paper_mm"] = [round(t, 3) for t in paper[:64]]
+        if s is not None:
+            sec["body_thickness_model_mm"] = [round(t / s, 3) for t in paper[:64]]
+            limit = float(section_fill_below())
+            thin = [t for t in paper if t < limit]
+            thin_by_design = bool(thin) and all(t / s < limit for t in thin)
+            sec["thin_walled_by_design"] = thin_by_design
+    if frac > _SECTION_BLACKENED_SHARE and not thin_by_design:
+        rep.flag("section_blackened", "info",
+                 f"{100.0 * frac:.3g} % of the cut area is filled solid (walls thinner than "
+                 f"the fill limit at this scale; fill {sl.get('fill')})")
+
+
 def _sheet_and_write(ctx: _Ctx) -> None:
     from . import dimensions
     from .layout import compose
@@ -1235,10 +1475,19 @@ def _sheet_and_write(ctx: _Ctx) -> None:
         plan = dimensions.DimensionPlan(dims=[], undimensioned=[
             {"kind": "overall", "reason": ctx.skip_overall_dims, "view": None}])
     else:
+        features, plan_opts, omitted = ctx.features, opts, []
+        if ctx.assembly:
+            # QA round 2 issue 5: no hole callouts or position dims across the parts of a
+            # large assembly (coaxial bores of different solids 0.1 mm apart gave six
+            # position dims for one hub); the omission is disclosed per radius group
+            omitted = _assembly_hole_groups(ctx.features)
+            features = [f for f in ctx.features if f.kind not in ("hole", "filled_hole")]
+            plan_opts = opts.with_overrides(hole_positions=False)
         try:
-            plan = dimensions.plan_dimensions(ctx.views, ctx.features, opts, DEFAULT_STYLE,
+            plan = dimensions.plan_dimensions(ctx.views, features, plan_opts, DEFAULT_STYLE,
                                               ctx.extents, model_bounds=ctx.bounds,
-                                              scale_hint=ctx.scale_guess)
+                                              scale_hint=ctx.scale_guess,
+                                              n_bodies=ctx.n_bodies)
         except Exception as exc:      # spec 3.10: the views exist, so the sheet is still written
             logger.exception("dimension planning failed")
             reason = f"{type(exc).__name__}: {exc}"
@@ -1246,9 +1495,26 @@ def _sheet_and_write(ctx: _Ctx) -> None:
             rep.flag("dimensions_failed", "warning",
                      f"drawing written without dimensions: {reason}")
             plan = dimensions.DimensionPlan(dims=[], undimensioned=[])
-    rep.data["dimensions"] = [{"kind": d.kind, "view": d.view, "value_mm": float(d.value),
-                               "text": d.text, "count": int(d.count)} for d in plan.dims]
-    rep.data["undimensioned"] = [dict(u) for u in plan.undimensioned]
+        if ctx.assembly:
+            plan.undimensioned = list(omitted) + list(plan.undimensioned)
+            n_holes = sum(int(u.get("count") or 0) for u in omitted)
+            n_filled = sum(int(u.get("count") or 0) for u in omitted
+                           if u.get("reason") == "filled_by_fastener")
+            filled_txt = (f"; {n_filled} filled by a fastener, reason filled_by_fastener"
+                          if n_filled else "")
+            rep.flag("dimensions_omitted_assembly", "info",
+                     f"{ctx.n_bodies} solids > {_ASSEMBLY_MIN_SOLIDS}: no hole callouts and no "
+                     f"position dimensions ({n_holes} hole feature(s) in {len(omitted)} radius "
+                     f"group(s), undimensioned reason assembly{filled_txt})")
+        hidden_only = int((getattr(plan, "stats", None) or {}).get("hidden_only") or 0)
+        if hidden_only > 0:
+            # R3: callouts are placed on visible circles only (QA round 2 issue 27)
+            rep.flag("dimension_hidden_only", "info",
+                     f"{hidden_only} hole feature(s) seen only as hidden circles in their axial "
+                     f"view: no callout (see undimensioned)")
+    t_dims = time.perf_counter()
+    ctx.timing["dimensions_s"] = ctx.timing.get("dimensions_s", 0.0) + (t_dims - t0)
+    _report_dimensions(rep, plan)
     capped = [u for u in plan.undimensioned if u.get("reason") == "cap"]
     if capped:
         rep.flag("dimensions_capped", "warning",
@@ -1259,7 +1525,14 @@ def _sheet_and_write(ctx: _Ctx) -> None:
             "input_file": os.path.basename(ctx.input_path),
             "source_note": SOURCE_NOTES.get(ctx.source or "", ""),
             "supplementary_title": SOURCE_NOTES.get(ctx.source or "", "")}
+    unit_note = _unit_note(rep)
+    if unit_note:
+        meta["unit_note"] = unit_note
     lay = compose(ctx.views, ctx.section, plan, opts, DEFAULT_STYLE, meta)
+    # the layout may drop position dims to keep the scale (undimensioned reason
+    # layout_space, flag layout_dims_dropped): the report lists what the sheet shows
+    if getattr(lay, "plan", None) is not None and lay.plan is not plan:
+        _report_dimensions(rep, lay.plan)
     # compose already forwards plan.flags (dimension_extent_mismatch): one loop only
     for code, severity, detail in lay.flags:
         rep.flag(code, severity, detail)
@@ -1277,10 +1550,15 @@ def _sheet_and_write(ctx: _Ctx) -> None:
                          "views_placed": sorted(lay.placements)}
     if isinstance(m.get("text_collisions"), dict):
         rep.data["sheet"]["text_collisions"] = dict(m["text_collisions"])
+    if unit_note:
+        rep.data["sheet"]["unit_note"] = unit_note
+    if m.get("scale_candidates"):
+        rep.data["sheet"]["scale_candidates"] = [list(c) for c in m["scale_candidates"]]
     if rep.data.get("section") is not None:
-        sl = m.get("section_layout") or {}
-        rep.data["section"]["hatch_segments"] = int(sl.get("hatch_segments") or 0)
-        rep.data["section"]["hatch_spacing_mm"] = sl.get("hatch_spacing")
+        _report_section_fill(rep, m.get("section_layout") or {},
+                             scale=getattr(lay, "scale", None))
+    t_lay = time.perf_counter()
+    ctx.timing["layout_s"] = ctx.timing.get("layout_s", 0.0) + (t_lay - t_dims)
 
     from . import writers
     ctx.progress("write")
@@ -1315,12 +1593,23 @@ def _sheet_and_write(ctx: _Ctx) -> None:
             continue
         rep.data["outputs"][fmt] = path
         written += 1
+        if isinstance(info, dict) and info.get("dash_adapted") is not None:
+            # R1 (QA round 2 issue 2): hidden elements whose dash pattern was fitted to
+            # their length (DXF: entities with their own ltscale)
+            try:
+                rep.data.setdefault("writers", {}).setdefault("dash_adapted", {})[fmt] = \
+                    int(info["dash_adapted"])
+            except (TypeError, ValueError):
+                pass
         if fmt == "dxf" and isinstance(info, dict):
             rep.data.setdefault("writers", {})["dxf_audited"] = bool(info.get("audited"))
         if fmt == "dxf" and (info.get("audit_errors") or info.get("audit_fixes")):
             rep.warn(f"dxf audit after re-read: {info.get('audit_errors')} error(s), "
                      f"{info.get('audit_fixes')} fix(es)")
-    ctx.timing["write_s"] += time.perf_counter() - t0
+    t_end = time.perf_counter()
+    # write_s stays the whole sheet stage (dimensions + layout + writers; review R5)
+    ctx.timing["writers_s"] = ctx.timing.get("writers_s", 0.0) + (t_end - t_lay)
+    ctx.timing["write_s"] += t_end - t0
     if written == 0:
         raise _Failure("no output file could be written")
 

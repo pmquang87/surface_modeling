@@ -147,8 +147,75 @@ def _bridges(ends: np.ndarray, tol: float) -> np.ndarray:
     return np.asarray(out, dtype=float).reshape(-1, 2, 3)
 
 
+def face_components(mesh) -> np.ndarray:
+    """Body (component) label per face: components of the vertex graph, so
+    faces joined through any shared vertex or edge (non-manifold ones
+    included) are one body, as ``mesh_load.mesh_topology``'s ``body_label``
+    (QA round 2 issue 3: ``SectionView.loop_body``). Labels are numbered in
+    the order of the first face of each body."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if len(faces) == 0:
+        return np.zeros(0, dtype=np.int64)
+    nv = max(int(len(mesh.vertices)), int(faces.max()) + 1)
+    a = np.concatenate([faces[:, 0], faces[:, 1]])
+    b = np.concatenate([faces[:, 1], faces[:, 2]])
+    g = coo_matrix((np.ones(len(a), dtype=np.int8), (a, b)), shape=(nv, nv))
+    _, vlab = connected_components(g, directed=False)
+    lab = np.asarray(vlab, dtype=np.int64)[faces[:, 0]]
+    _, first, inv = np.unique(lab, return_index=True, return_inverse=True)
+    rank = np.empty(len(first), dtype=np.int64)
+    rank[np.argsort(first, kind="stable")] = np.arange(len(first))
+    return rank[np.asarray(inv).ravel()]
+
+
+def component_volumes(mesh, face_body: np.ndarray) -> np.ndarray:
+    """Signed volume per component (``face_components`` labels): the face
+    sum of each component; an inward-wound cavity shell is negative."""
+    tri = np.asarray(mesh.triangles, dtype=float)
+    fv = np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])) / 6.0
+    n = int(face_body.max()) + 1 if len(face_body) else 0
+    return np.bincount(face_body, weights=fv, minlength=n)
+
+
+def _merge_void_bodies(loops: list, ids: list, comp_volume=None) -> list:
+    """The inner shell of a hollow mesh (an internal void) is a separate
+    component of the vertex graph, but its cut loop is a hole of the outer
+    body; as its own body the layout would nest it alone and fill it.
+    ``brep_sections.merge_void_bodies`` joins it to the body around it when
+    all its loops are holes and its signed volume (``comp_volume``, from
+    ``component_volumes``) is negative; without volumes nothing is joined."""
+    from .brep_sections import merge_void_bodies
+
+    if comp_volume is None:
+        return list(ids)
+    vols = np.asarray(comp_volume, dtype=float)
+    return merge_void_bodies(loops, ids,
+                             lambda b: 0 <= int(b) < len(vols) and float(vols[int(b)]) < 0.0)
+
+
+def _loop_bodies(closed3: list, segs: np.ndarray, seg_faces: np.ndarray,
+                 face_body: np.ndarray) -> list:
+    """Body label of each closed 3D chain: the body of the face of the cut
+    segment whose end point is nearest the chain's first point."""
+    from scipy.spatial import cKDTree
+
+    if not closed3 or len(segs) == 0:
+        return [0] * len(closed3)
+    tree = cKDTree(segs.reshape(-1, 3))
+    out = []
+    for L in closed3:
+        _, k = tree.query(np.asarray(L, float)[0])
+        f = int(seg_faces[int(k) // 2])
+        out.append(int(face_body[f]) if 0 <= f < len(face_body) else 0)
+    return out
+
+
 def _loops_at(mesh, point: np.ndarray, normal: np.ndarray, spec, weld: float,
-              bridge_tol: float = 0.0):
+              bridge_tol: float = 0.0, face_body: Optional[np.ndarray] = None,
+              comp_volume: Optional[np.ndarray] = None):
     """(loops, open chains dropped, segment count, info) of one plane.
 
     When chains stay open and ``bridge_tol > 0``, chain end points closer
@@ -156,16 +223,27 @@ def _loops_at(mesh, point: np.ndarray, normal: np.ndarray, spec, weld: float,
     are chained again (QA issue 33: an open mesh lost its main contour).
     ``info``: ``bridged_gaps``, ``bridge_max_gap``, ``segments_bbox_area``
     (view-plane bbox of every cut segment, the reference of the kept-area
-    ratio).
+    ratio), ``loop_body`` (body label per loop from ``face_body``, the
+    ``face_components`` labels, void shells joined to their container with
+    ``comp_volume``; None without ``face_body``).
     """
     from trimesh.intersections import mesh_plane
 
     info = {"bridged_gaps": 0, "bridge_max_gap": 0.0, "segments_bbox_area": 0.0,
             "segments_length": 0.0, "bridge_rejected": False,
-            "open_chain_mean_segments": None, "bridge_share": None}
-    segs = np.asarray(mesh_plane(mesh, plane_normal=normal, plane_origin=point), dtype=float)
+            "open_chain_mean_segments": None, "bridge_share": None, "loop_body": None}
+    seg_faces = None
+    if face_body is not None:
+        raw, seg_faces = mesh_plane(mesh, plane_normal=normal, plane_origin=point,
+                                    return_faces=True)
+        segs = np.asarray(raw, dtype=float)
+        seg_faces = np.asarray(seg_faces, dtype=np.int64).ravel()
+    else:
+        segs = np.asarray(mesh_plane(mesh, plane_normal=normal, plane_origin=point), dtype=float)
     n_segs = int(len(segs))
     if n_segs == 0:
+        if face_body is not None:
+            info["loop_body"] = []
         return [], 0, 0, info
     segs = segs.reshape(-1, 2, 3)
     info["segments_length"] = float(np.linalg.norm(segs[:, 1] - segs[:, 0], axis=1).sum())
@@ -202,10 +280,18 @@ def _loops_at(mesh, point: np.ndarray, normal: np.ndarray, spec, weld: float,
         except Exception as exc:  # bridging is an improvement, never a failure
             log.debug("section bridging failed: %s: %s", type(exc).__name__, exc)
     loops = []
+    kept3 = []
     for L in closed:
         xy = np.ascontiguousarray(spec.to_view(L)[:, :2])
         if len(xy) >= 3 and abs(polygon_area(xy)) > 0.0:
             loops.append(xy)
+            kept3.append(L)
+    if face_body is not None and seg_faces is not None and len(seg_faces) == n_segs:
+        try:
+            info["loop_body"] = _merge_void_bodies(
+                loops, _loop_bodies(kept3, segs, seg_faces, face_body), comp_volume)
+        except Exception as exc:  # body ids are an extra, never a failure
+            log.debug("section loop bodies failed: %s: %s", type(exc).__name__, exc)
     return loops, int(n_open), n_segs, info
 
 
@@ -296,8 +382,16 @@ def section_mesh(mesh, point, normal, spec, *, raster_px: int, feature_angle_deg
         except Exception as exc:  # pragma: no cover - defensive
             log.debug("section_mesh: median edge length failed: %s", exc)
     stats["bridge_tol"] = float(bridge_tol)
+    face_body, comp_volume = None, None
+    try:
+        face_body = face_components(mesh)
+        if len(face_body) and int(face_body.max()) > 0:
+            comp_volume = component_volumes(mesh, face_body)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("section_mesh: face components failed: %s", exc)
 
-    loops, n_open, n_segs, info = _loops_at(mesh, p, n, spec, weld, bridge_tol)
+    loops, n_open, n_segs, info = _loops_at(mesh, p, n, spec, weld, bridge_tol, face_body,
+                                            comp_volume)
     if not loops:
         extent = float(depth_extent)
         if not extent > 0.0:
@@ -309,7 +403,8 @@ def section_mesh(mesh, point, normal, spec, *, raster_px: int, feature_angle_deg
         p = p + sign * shift * v
         stats["nudged"] = True
         stats["plane_shift"] = float(sign * shift)
-        loops, n_open, n_segs, info = _loops_at(mesh, p, n, spec, weld, bridge_tol)
+        loops, n_open, n_segs, info = _loops_at(mesh, p, n, spec, weld, bridge_tol, face_body,
+                                                comp_volume)
         log.info("section_mesh: no closed loop, plane nudged by %.6g -> %d loops", sign * shift, len(loops))
     stats["open_wires_dropped"] = int(n_open)
     stats["n_segments"] = int(n_segs)
@@ -342,8 +437,10 @@ def section_mesh(mesh, point, normal, spec, *, raster_px: int, feature_angle_deg
         body = None
 
     stats["seconds"] = time.perf_counter() - t_start
+    lb = info.get("loop_body")
+    lb = list(lb) if lb is not None and len(lb) == len(loops) else None
     return SectionView(spec=spec, plane_point=p, plane_normal=v.copy(), loops=loops, body=body,
-                       label="A", marker_view=_marker_for_normal(n), stats=stats)
+                       label="A", marker_view=_marker_for_normal(n), stats=stats, loop_body=lb)
 
 
-__all__ = ["choose_section_plane_mesh", "section_mesh"]
+__all__ = ["choose_section_plane_mesh", "section_mesh", "face_components"]

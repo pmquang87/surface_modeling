@@ -430,34 +430,49 @@ except the date field; DXF is compared after masking handles and the date.
 {
   "schema": "surface_modeling.drawing.report/1",
   "ok": true, "exit_code": 0, "error": null,
-  "input": {"path": "...", "detected_format": "step|stl_binary|stl_ascii", "extension": ".stp",
-            "size_bytes": 0, "sha256": "...", "triangles_declared": null,
-            "source_unit": "mm|inch|unknown"},
-  "route": {"pipeline": "brep|mesh", "source": "step|stl_faceted_step|stl_nurbs_step|stl_mesh",
-            "classifier": {"verdict": "prismatic|organic|n/a", "planar_big": 0.0, "sharp_turn": 0.0,
-                           "threshold": 0.10},
+  "input": {"path": "...",
+            "detected_format": "step|stl_binary|stl_ascii|stl_binary_truncated|unknown",
+            "extension": ".stp", "size_bytes": 0, "sha256": "...", "triangles_declared": null,
+            "source_unit": "mm|inch|m|cm|...|unknown (STEP); mm|cm|m|in|assumed_mm (STL)",
+            "unit_factor": 1.0},
+  "route": {"pipeline": "brep|mesh",
+            "source": "step|stl_faceted_step|stl_nurbs_step|stl_mesh|step_tessellated_mesh",
+            "classifier": {"verdict": "prismatic|organic|not_solid|n/a", "planar_big": 0.0,
+                           "sharp_turn": 0.0, "threshold": 0.10},
             "stl_to_step": {"attempted": false, "mode": "auto|faceted|nurbs|off", "ok": null,
-                             "seconds": null, "skipped_reason": null, "error": null, "audit": {}},
+                             "seconds": null,
+                             "skipped_reason": "null|organic|not_solid|too_many_triangles|off|tessellated_step",
+                             "error": null, "audit": {}},
             "fallbacks": [{"from": "brep", "to": "mesh", "reason": "..."}],
-            "orientation": {"permutation": [0, 1, 2], "flips": [1, 1, 1], "mode": "auto"}},
+            "orientation": {"permutation": [0, 1, 2], "flips": [1, 1, 1], "mode": "auto",
+                            "depth_flipped": false,
+                            "depth_method": "brep_cavity|brep_faces|mesh_cavity|mesh_feature_edges",
+                            "depth_scores": {}, "depth_reason": "..."}},
   "geometry": {"bbox_min": [0,0,0], "bbox_max": [0,0,0], "extents": [0,0,0], "volume_mm3": 0.0,
                "area_mm2": 0.0, "solids": 0, "shells": 0, "faces": 0, "edges": 0,
                "face_types": {"Plane": 0, "Cylinder": 0}, "brepcheck_valid": true, "free_edges": 0,
                "closed": true, "triangles": 0, "watertight": true, "components": 1,
-               "features": {"holes": 0, "bosses": 0, "fillets": 0}},
+               "features": {"holes": 0, "bosses": 0, "fillets": 0},
+               "bodies": {"drawn": "solids", "dropped": {"loose_edges": 0}}},
   "views": [{"name": "front", "algorithm": "hlr_exact|hlr_poly|depth_buffer", "visible": 0,
-             "hidden": 0, "seconds": 0.0}],
+             "hidden": 0, "seconds": 0.0, "hidden_curves_dropped": 0, "welded_ends": 0}],
   "dimensions": [{"kind": "linear|diameter", "view": "front", "value_mm": 0.0, "text": "Ø6.5", "count": 1}],
-  "undimensioned": [{"kind": "hole_group", "radius": 0.0, "count": 0, "reason": "cap"}],
+  "undimensioned": [{"kind": "hole_group", "radius": 0.0, "count": 0,
+                     "reason": "cap|no_axial_view|not_supported|hidden_only|filled_by_fastener|assembly|layout_space|not_a_solid"}],
   "section": {"label": "A", "plane_point": [0,0,0], "plane_normal": [0,1,0], "loops": 0,
-              "open_wires_dropped": 0, "hatch_segments": 0, "nudged": false},
+              "open_wires_dropped": 0, "hatch_segments": 0, "nudged": false,
+              "fill": "hatch|solid|mixed", "filled_regions": 0, "filled_area_fraction": 0.0,
+              "body_thickness_paper_mm": [0.0], "body_thickness_model_mm": [0.0],
+              "thin_walled_by_design": false, "bridged_gaps": 0},
   "sheet": {"size": "A3", "orientation": "landscape", "scale": "1:2", "projection": "first_angle",
-            "iso5457": true},
+            "iso5457": true, "unit_note": null},
   "outputs": {"pdf": "...", "svg": "...", "dxf": "...", "step": null, "report": "..."},
-  "quality": {"level": "full|reduced|minimal",
+  "writers": {"dxf_audited": true, "dash_adapted": {"pdf": 0, "svg": 0, "dxf": 0}},
+  "quality": {"level": "full|reduced|minimal|none",
               "flags": [{"code": "...", "severity": "info|warning", "detail": "..."}]},
-  "warnings": [], "timing": {"total_s": 0.0, "load_s": 0.0, "views_s": 0.0, "section_s": 0.0,
-                             "write_s": 0.0},
+  "warnings": [], "timing": {"total_s": 0.0, "load_s": 0.0, "features_s": 0.0, "views_s": 0.0,
+                             "section_s": 0.0, "write_s": 0.0, "dimensions_s": 0.0,
+                             "layout_s": 0.0, "writers_s": 0.0},
   "sandbox": {"enabled": true, "isolation": "job_object|psutil_tree|posix_rlimit|none",
               "timeout_s": 180, "memory_limit_mb": 2048, "cpu_limit_s": 360, "peak_rss_mb": 0.0,
               "peak_commit_mb": 0.0, "wall_s": 0.0, "cpu_s": 0.0, "timed_out": false,
@@ -468,17 +483,49 @@ except the date field; DXF is compared after masking handles and the date.
 }
 ```
 
+Timing (added in QA round 2): `write_s` is the whole sheet stage and equals
+`dimensions_s` + `layout_s` + `writers_s`; `features_s` is the B-rep
+cylinder feature detection, which sat in no bucket before. Section:
+`body_thickness_paper_mm` is the per-body mean wall `2A/P` measured on the
+sheet (paper mm), `body_thickness_model_mm` the same divided by the sheet
+scale; `thin_walled_by_design` is True when every filled body is under the
+fill limit in model mm (filled at 1:1 too), and then `section_blackened` is
+not raised. For a large assembly the holes go to `undimensioned` as
+`hole_group` reason `assembly`, the holes a fastener fills as `hole_group`
+reason `filled_by_fastener`.
+
 Quality level: `full` = B-rep route with hidden lines, a section and at least
 the overall dimensions; `reduced` = mesh route, or a B-rep route that lost
-hidden lines or the section or used the poly HLR; `minimal` = views only.
-`warning` flags set exit code 2 (drawing written, look at it):
-`mesh_not_watertight`, `multiple_bodies`, `brepcheck_invalid`, `open_shell`,
-`inverted_solid`, `fallback_to_mesh`, `hlr_timeout`, `section_empty`,
-`section_open_wires`, `views_overflow`, `dimensions_capped`, `unit_not_mm`,
-`sheet_not_iso5457`, `approval_blank`. `info` flags:
-`holes_not_detected_mesh_route`, `organic_classified`, `too_many_triangles`,
-`extension_mismatch`, `facet_edges_suppressed`, `hlr_poly_used`,
-`section_nudged`, `degenerate_faces_removed`.
+hidden lines or the section or used the poly HLR; `minimal` = views only (or
+`not_a_solid`); `none` = the run failed and no drawing exists (added in the
+implementation). `report.FLAGS` is the single source of the codes and their
+severities (`docs/drawing_module.md` carries the generated table with a
+one-line meaning each). `warning` flags set exit code 2 (drawing written,
+look at it): `mesh_not_watertight`, `multiple_bodies`, `brepcheck_invalid`,
+`open_shell`, `inverted_solid`, `fallback_to_mesh`, `hlr_timeout`,
+`section_empty`, `section_open_wires`, `views_overflow`, `dimensions_capped`,
+`unit_not_mm`, `sheet_not_iso5457`, `view_failed`, `section_failed`,
+`writer_failed`, `dimensions_failed`, `faceted_audit_mismatch`,
+`dimension_extent_mismatch`, `views_tiny`, `step_tessellated_only`,
+`hidden_lines_dropped`, `not_a_solid`, `mesh_non_manifold`,
+`layout_text_collision`, `section_skipped_budget`, and the sandbox breaches
+`sandbox_timeout`, `sandbox_memory_exceeded`, `sandbox_cpu_exceeded`,
+`sandbox_output_exceeded`, `sandbox_killed` (the run failed; exit 1). `info`
+flags: `holes_not_detected_mesh_route`, `organic_classified`,
+`too_many_triangles`, `extension_mismatch`, `facet_edges_suppressed`,
+`hlr_poly_used`, `section_nudged`, `degenerate_faces_removed`,
+`approval_blank` (listed as a warning in the first version of this spec; the
+approval field of an auto-generated drawing is always blank, so a warning
+would make every run exit 2), `loose_curves_ignored`,
+`supplemental_shells_ignored`, `supplemental_geometry_ignored`,
+`loose_curves_drawn`, `unit_assumed_mm`, `unit_suspect`, `section_fallback`,
+`interior_silhouettes_omitted`, `hidden_lines_omitted_assembly`,
+`layout_text_moved`, `layout_dims_dropped`, `dimensions_omitted_assembly`,
+`section_skipped_assembly`, `section_blackened`, `section_gaps_bridged`,
+`winding_repaired`, `dimension_hidden_only`. Of these, `unit_assumed_mm`,
+`unit_suspect` and `section_gaps_bridged` may be raised to warning by the run
+(`report.ESCALATABLE_FLAGS`: an implausible size, a bridge chord over 5 % of
+the section extent).
 
 ### 3.9 Sandbox worker (sandbox.py)
 

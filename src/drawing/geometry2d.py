@@ -44,6 +44,13 @@ Conventions and the measured facts they rely on (probe reports
   hold exact duplicates (a fillet arc 270..360 twice) -> ``dedupe_primitives``;
   fillet views produce collinear chains such as 0..5 and 5..55 on one line
   -> ``merge_collinear``.
+* QA round 2: hidden Polylines/Arcs/Circles on visible edges ->
+  ``subtract_covered_curves`` (issue 18); an Arc on a same-style Circle is
+  a duplicate in ``dedupe_primitives`` (issue 18); dashed chains of three
+  or more points are one Polyline in ``chain_to_primitives`` (issue 9);
+  mesh chains: ``weld_chain_ends`` (gap joining), ``simplify_chain``
+  (Douglas-Peucker + hairpins) and a separate closed-loop length threshold
+  in ``chain_to_primitives`` (issues 19, 25).
 
 The functions that touch ``model.py`` primitives import them lazily so this
 module has no import-time dependency on the rest of the package.
@@ -1173,8 +1180,10 @@ def dedupe_primitives(prims: list, tol: float) -> list:
     Duplicates have the same type and style and coincide within ``tol``:
     Segments in either direction; Circles by centre and radius; Arcs by
     centre, radius, start angle (mod 360) and sweep; Polylines point by point
-    forward or reversed with the same ``closed`` flag. Any other item (Text,
-    Polygon, HatchLines) is passed through untouched.
+    forward or reversed with the same ``closed`` flag. An Arc whose centre
+    and radius match a Circle of the same style is covered by it and dropped
+    as well (QA round 2 issue 18). Any other item (Text, Polygon,
+    HatchLines) is passed through untouched.
     """
     from scipy.spatial import cKDTree
 
@@ -1237,6 +1246,21 @@ def dedupe_primitives(prims: list, tol: float) -> list:
         for local, root in enumerate(roots):
             if root != local:                 # root is the smallest index of its component
                 drop.add(idxs[local])
+    # QA round 2 issue 18: an Arc lying on a Circle of the same style (centre and
+    # radius within tol) is covered by it - HLR repeats a hidden blind-hole circle
+    # as the Circle plus the two seam halves (05, 07)
+    circ = [i for i in groups[Circle] if i not in drop]
+    arcs = [i for i in groups[Arc] if i not in drop]
+    if circ and arcs:
+        ckeys = np.array([key(prims[i]) for i in circ], dtype=np.float64)
+        tree = cKDTree(ckeys)
+        for i in arcs:
+            a = prims[i]
+            for j in tree.query_ball_point(key(a), r):
+                c = prims[circ[j]]
+                if c.style == a.style and abs(float(c.radius) - float(a.radius)) <= tol:
+                    drop.add(i)
+                    break
     if drop:
         log.debug("dedupe_primitives: dropped %d duplicates", len(drop))
     return [p for i, p in enumerate(prims) if i not in drop]
@@ -1300,6 +1324,107 @@ def drop_covered_curves(hidden: list, visible: list, tol: float) -> list:
     if n_drop:
         log.debug("drop_covered_curves: dropped %d hidden curves lying on visible ones", n_drop)
     return out
+
+
+def _arcs_from_pieces(pieces: np.ndarray, arc, tol: float) -> list:
+    """Arcs on ``arc``'s circle that follow the chained chord pieces (CCW start -> end)."""
+    from .model import Arc, Circle
+
+    c = np.array([float(arc.center[0]), float(arc.center[1])])
+    r = float(arc.radius)
+    opened, closed = chain_paths(pieces, tol)
+    out: list = []
+    for _ in closed:
+        out.append(Circle((float(c[0]), float(c[1])), r, arc.style))
+    for pts in opened:
+        ang = np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0])
+        d = np.diff(ang)
+        d = (d + math.pi) % (2.0 * math.pi) - math.pi
+        total = float(d.sum())
+        if abs(total) < 1e-12:
+            continue
+        a0, a1 = math.degrees(float(ang[0])) % 360.0, math.degrees(float(ang[-1])) % 360.0
+        if total < 0.0:
+            a0, a1 = a1, a0
+        out.append(Arc((float(c[0]), float(c[1])), r, a0, a1, arc.style))
+    return out
+
+
+def subtract_covered_curves(curves: list, cover: np.ndarray, tol: float, *, deflection: float,
+                            min_len: Optional[float] = None,
+                            deadline: Optional[float] = None) -> Tuple[list, dict]:
+    """Remove the parts of hidden Polylines / Arcs / Circles that lie on visible edges.
+
+    QA round 2 issue 18: ``subtract_covered`` handles hidden Segments only and
+    ``drop_covered_curves`` only curves on visible curves of the same centre
+    and radius, so hidden Polylines (discretised B-splines and ellipses: the
+    far intersection curve of a cross-drilled hole, the far bore ring seen
+    obliquely) were never compared with the visible geometry (06: 21.8 % of
+    the hidden length overprinted, 04: 82.6 %).
+
+    Each curve is flattened at ``deflection`` and passed through
+    ``subtract_covered(..., tol, loose=True, min_len=min_len)`` against
+    ``cover`` (visible segments (k, 2, 2), curves already flattened by the
+    caller; only the cover segments near the curve are used). A curve
+    nothing was cut from is returned as the same object; a fully covered one
+    is dropped; a partly covered Polyline is re-chained with
+    ``chain_to_primitives`` (one Polyline per remaining run, or a Segment
+    when straight) and a partly covered Arc/Circle becomes Arcs on the same
+    circle. Other items pass through. Order: untouched items keep their
+    place, replacements take the place of their curve.
+
+    Returns (items, {"dropped": n, "trimmed": n}).
+    """
+    from .model import Arc, Circle, Polyline
+
+    tol = float(tol)
+    floor = tol if min_len is None else max(float(min_len), 0.0)
+    stats = {"dropped": 0, "trimmed": 0}
+    curves = list(curves)
+    cov = _as_segments(cover)
+    if len(cov) == 0 or not any(isinstance(p, (Polyline, Arc, Circle)) for p in curves):
+        return curves, stats
+    clo = np.minimum(cov[:, 0], cov[:, 1])
+    chi = np.maximum(cov[:, 0], cov[:, 1])
+    out: list = []
+    for k, p in enumerate(curves):
+        if not isinstance(p, (Polyline, Arc, Circle)):
+            out.append(p)
+            continue
+        if k % 64 == 0:
+            _check_deadline(deadline, "subtract_covered_curves")
+        try:
+            segs = primitives_to_segments([p], deflection)
+        except (TypeError, ValueError):
+            out.append(p)
+            continue
+        if len(segs) == 0:
+            out.append(p)
+            continue
+        lo = segs.reshape(-1, 2).min(axis=0) - tol
+        hi = segs.reshape(-1, 2).max(axis=0) + tol
+        near = np.all(chi >= lo, axis=1) & np.all(clo <= hi, axis=1)
+        if not near.any():
+            out.append(p)
+            continue
+        L0 = float(np.linalg.norm(segs[:, 1] - segs[:, 0], axis=1).sum())
+        rem = subtract_covered(segs, cov[near], tol, loose=True, deadline=deadline, min_len=floor)
+        Lr = float(np.linalg.norm(rem[:, 1] - rem[:, 0], axis=1).sum()) if len(rem) else 0.0
+        if L0 - Lr <= max(floor, 1e-9 * L0):
+            out.append(p)
+            continue
+        if len(rem) == 0:
+            stats["dropped"] += 1
+            continue
+        stats["trimmed"] += 1
+        if isinstance(p, Polyline):
+            out.extend(chain_to_primitives(rem, p.style, max(floor, 1e-12)))
+        else:
+            out.extend(_arcs_from_pieces(rem, p, max(floor, 1e-12)))
+    if stats["dropped"] or stats["trimmed"]:
+        log.debug("subtract_covered_curves: %d curves dropped, %d trimmed", stats["dropped"],
+                  stats["trimmed"])
+    return out, stats
 
 
 def _circle_steps(radius: float, sweep_rad: float, deflection: float, min_full: int = 8) -> int:
@@ -1376,38 +1501,75 @@ def primitives_to_segments(prims: list, deflection: float) -> np.ndarray:
 
 
 def chain_to_primitives(segments: np.ndarray, style, tol: float, *, short_len: float = 0.0,
-                        min_chain_len: float = 0.0, deadline: Optional[float] = None) -> list:
+                        min_chain_len: float = 0.0, deadline: Optional[float] = None,
+                        polyline_all: Optional[bool] = None,
+                        min_closed_len: Optional[float] = None,
+                        simplify_tol: Optional[float] = None,
+                        hairpin_len: Optional[float] = None,
+                        stats: Optional[dict] = None) -> list:
     """Chain segments with ``chain_paths`` and emit drawing primitives (QA issue 6).
 
-    Hidden edges written one element per short chord never show the dash
-    pattern (the dash restarts on every element), so a chain that contains
-    at least two edges shorter than ``short_len`` (callers pass one dash
-    length on paper, in model units) becomes ONE ``Polyline`` (``closed``
-    for cycles). Other chains are emitted as separate ``Segment`` objects
-    (box edges and other long lines keep their exact one-element-per-edge
-    form; a single short edge between long ones cannot break the pattern of
-    its neighbours); a two-point chain is always a ``Segment``. Chains (open or closed) whose total length is below
-    ``min_chain_len`` are dropped (mesh noise, QA issues 13 and 24).
+    Dashed edges written one element per chord never show the dash pattern
+    properly (the dash restarts on every element). With ``polyline_all``
+    (default: True for the dashed styles HIDDEN, CENTER and CUTTING) every
+    chain of three or more points becomes ONE ``Polyline`` (``closed`` for
+    cycles). QA round 2 issue 9: round 1 did this only for chains with at
+    least two edges shorter than ``short_len``, and mesh chains with chords
+    of 4-5 mm on paper came out as one Segment per chord (a centre-line
+    look; 208 of 548 hub pieces on the wheel printed solid). Without
+    ``polyline_all`` (solid styles) the round-1 rule stays: a chain with at
+    least two edges shorter than ``short_len`` (one dash period on paper,
+    in model units) is a Polyline, other chains are one Segment per edge
+    (box outlines keep their exact one-element-per-edge form). Always: a
+    two-point chain and an open chain whose points all lie within ``tol``
+    of its end-to-end chord are one ``Segment``. Chains (open or closed)
+    whose total length is below ``min_chain_len`` are dropped (mesh noise,
+    QA issues 13 and 24); closed chains use ``min_closed_len`` instead when
+    given (QA round 2 issue 25: small through-holes are short closed loops
+    on the iso view and must survive the open-chain noise filter).
+    ``simplify_tol`` (optional) simplifies every chain with
+    ``simplify_chain`` (Douglas-Peucker at that tolerance, then hairpin
+    vertices with an interior angle below 20 degrees and an adjacent edge
+    shorter than ``hairpin_len`` removed; QA round 2 issue 19) before it is
+    measured and emitted. ``stats`` (a dict, optional) receives
+    ``open_dropped``, ``closed_dropped`` and ``hairpins_removed``.
     ``style`` is the ``LineStyle`` of every output primitive.
     """
-    from .model import Polyline, Segment
+    from .model import LineStyle, Polyline, Segment
 
     segs = _as_segments(segments)
     if len(segs) == 0:
         return []
+    if polyline_all is None:
+        try:
+            all_poly = LineStyle(style) in (LineStyle.HIDDEN, LineStyle.CENTER, LineStyle.CUTTING)
+        except ValueError:
+            all_poly = False
+    else:
+        all_poly = bool(polyline_all)
     opened, closed = chain_paths(segs, tol, deadline=deadline)
     out: list = []
     n_drop = 0
+    n_open_drop = n_closed_drop = n_hair = 0
+    min_closed = float(min_chain_len) if min_closed_len is None else float(min_closed_len)
     for pts, is_closed in [(p, False) for p in opened] + [(p, True) for p in closed]:
+        if simplify_tol is not None and float(simplify_tol) > 0.0:
+            pts, nh = simplify_chain(pts, is_closed, float(simplify_tol),
+                                     max_len=float("inf") if hairpin_len is None else float(hairpin_len))
+            n_hair += nh
         ring = np.vstack([pts, pts[:1]]) if is_closed else pts
         edge_len = np.linalg.norm(np.diff(ring, axis=0), axis=1)
-        if float(edge_len.sum()) < min_chain_len:
+        if float(edge_len.sum()) < (min_closed if is_closed else min_chain_len):
             n_drop += 1
+            if is_closed:
+                n_closed_drop += 1
+            else:
+                n_open_drop += 1
             continue
-        if len(pts) == 2 and not is_closed:
+        if not is_closed and (len(pts) == 2 or is_straight(pts, tol)):
             out.append(Segment((float(pts[0, 0]), float(pts[0, 1])),
-                               (float(pts[1, 0]), float(pts[1, 1])), style))
-        elif int(np.count_nonzero(edge_len < short_len)) < 2:
+                               (float(pts[-1, 0]), float(pts[-1, 1])), style))
+        elif not all_poly and int(np.count_nonzero(edge_len < short_len)) < 2:
             out.extend(Segment((float(a[0]), float(a[1])), (float(b[0]), float(b[1])), style)
                        for a, b in zip(ring[:-1], ring[1:]))
         else:
@@ -1415,7 +1577,141 @@ def chain_to_primitives(segments: np.ndarray, style, tol: float, *, short_len: f
                                 style=style))
     if n_drop:
         log.debug("chain_to_primitives: dropped %d chains shorter than %.4g", n_drop, min_chain_len)
+    if stats is not None:
+        stats["open_dropped"] = stats.get("open_dropped", 0) + n_open_drop
+        stats["closed_dropped"] = stats.get("closed_dropped", 0) + n_closed_drop
+        stats["hairpins_removed"] = stats.get("hairpins_removed", 0) + n_hair
     return out
+
+
+_HAIRPIN_DEG = 20.0
+
+
+def simplify_chain(points: np.ndarray, closed: bool, tol: float, *,
+                   max_angle_deg: float = _HAIRPIN_DEG,
+                   max_len: float = float("inf")) -> Tuple[np.ndarray, int]:
+    """Douglas-Peucker at ``tol`` plus hairpin removal for one chain (QA round 2 issue 19).
+
+    ``points`` (n, 2) without a repeated end point for a closed chain. After
+    ``simplify_polyline``, every vertex whose interior angle (between the
+    edges to its two neighbours) is below ``max_angle_deg`` and whose
+    shorter adjacent edge is shorter than ``max_len`` is removed (the
+    zig-zag spikes that raster-visibility breaks leave on mesh chains),
+    until none is left; an open chain keeps its two end points, a closed
+    one at least 3 points. Returns (points, number of hairpin vertices
+    removed).
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if closed and len(pts) >= 3:
+        simp = simplify_polyline(np.vstack([pts, pts[:1]]), tol)[:-1]
+        if len(simp) >= 3:
+            pts = simp
+    elif len(pts) > 2:
+        pts = simplify_polyline(pts, tol)
+    cos_max = math.cos(math.radians(float(max_angle_deg)))
+    removed = 0
+    while True:
+        n = len(pts)
+        if (closed and n <= 3) or (not closed and n <= 2):
+            break
+        if closed:
+            prev, nxt = np.roll(pts, 1, axis=0), np.roll(pts, -1, axis=0)
+            idx = np.arange(n)
+        else:
+            prev, nxt = pts[:-2], pts[2:]
+            idx = np.arange(1, n - 1)
+        a = prev - pts[idx]
+        b = nxt - pts[idx]
+        la = np.linalg.norm(a, axis=1)
+        lb = np.linalg.norm(b, axis=1)
+        ok = (la > 0) & (lb > 0)
+        cosang = np.full(len(idx), -1.0)
+        cosang[ok] = np.einsum("ij,ij->i", a[ok], b[ok]) / (la[ok] * lb[ok])
+        hair = (cosang > cos_max) & (np.minimum(la, lb) < max_len)
+        if not hair.any():
+            break
+        # the sharpest hairpin of every run of neighbouring ones goes first, then re-check
+        cand = idx[hair]
+        order = cand[np.argsort(-cosang[hair], kind="stable")]
+        drop, blocked = [], set()
+        for v in order.tolist():
+            if v in blocked:
+                continue
+            drop.append(v)
+            blocked.update(((v - 1) % n, v, (v + 1) % n))
+        keep = np.ones(n, dtype=bool)
+        keep[drop] = False
+        if closed and int(keep.sum()) < 3:
+            break
+        pts = pts[keep]
+        removed += len(drop)
+    return pts, removed
+
+
+def weld_chain_ends(segments: np.ndarray, tol: float, weld_tol: float, *,
+                    prune_spurs: bool = True, stats: Optional[dict] = None
+                    ) -> Tuple[np.ndarray, int]:
+    """Join dangling chain ends lying within ``weld_tol`` of each other (QA round 2 issue 19).
+
+    Raster visibility breaks leave gaps of a few tenths of a millimetre on
+    paper between the pieces of one curve, so the min-chain filter sees
+    short pieces. Nodes are found at the geometric ``tol``. With
+    ``prune_spurs`` a segment shorter than ``weld_tol`` that hangs off a
+    junction (one end of degree 1, the other of degree >= 3) is removed
+    first: such spurs (end-on edges of a jittered mesh projected to a few
+    microns) split the curve they touch into separate chains. Then only
+    degree-1 nodes (chain ends) are welded, pairwise and greedily closest
+    first, each end at most once, both moved to their midpoint, never the
+    two ends of one segment. Interior nodes never move, so a finely sampled
+    curve whose chords are shorter than ``weld_tol`` is not collapsed (a
+    plain weld at ``weld_tol`` merges it into one node). Returns (segments
+    without zero-length ones, number of welded end pairs); ``stats`` (dict)
+    gets ``welded_ends`` and ``spurs_pruned``.
+    """
+    from scipy.spatial import cKDTree
+
+    segs = _as_segments(segments)
+    tol, weld_tol = float(tol), float(weld_tol)
+    if stats is not None:
+        stats.setdefault("welded_ends", 0)
+        stats.setdefault("spurs_pruned", 0)
+    if len(segs) < 2 or not weld_tol > tol:
+        return segs.copy(), 0
+    node, xy = _weld_endpoints(segs, tol)
+    keep = node[:, 0] != node[:, 1]
+    node = node[keep]
+    deg = np.bincount(node.ravel(), minlength=len(xy))
+    if prune_spurs and len(node):
+        length = np.linalg.norm(xy[node[:, 0]] - xy[node[:, 1]], axis=1)
+        d0, d1 = deg[node[:, 0]], deg[node[:, 1]]
+        spur = (length < weld_tol) & (((d0 == 1) & (d1 >= 3)) | ((d1 == 1) & (d0 >= 3)))
+        if spur.any():
+            if stats is not None:
+                stats["spurs_pruned"] += int(spur.sum())
+            node = node[~spur]
+            deg = np.bincount(node.ravel(), minlength=len(xy))
+    ends = np.flatnonzero(deg == 1)
+    n = 0
+    new_xy = xy
+    if len(ends) >= 2:
+        pairs = cKDTree(xy[ends]).query_pairs(weld_tol, output_type="ndarray")
+        if len(pairs):
+            own = {(min(a, b), max(a, b)) for a, b in node.tolist()}
+            d = np.linalg.norm(xy[ends[pairs[:, 0]]] - xy[ends[pairs[:, 1]]], axis=1)
+            used = np.zeros(len(xy), dtype=bool)
+            new_xy = xy.copy()
+            for k in np.argsort(d, kind="stable").tolist():
+                i, j = int(ends[pairs[k, 0]]), int(ends[pairs[k, 1]])
+                if used[i] or used[j] or (min(i, j), max(i, j)) in own:
+                    continue
+                used[i] = used[j] = True
+                new_xy[i] = new_xy[j] = 0.5 * (xy[i] + xy[j])
+                n += 1
+    if stats is not None:
+        stats["welded_ends"] += n
+    if n == 0 and len(node) == int(np.count_nonzero(keep)) and bool(keep.all()):
+        return segs.copy(), 0
+    return new_xy[node].reshape(-1, 2, 2), n
 
 
 def _prim_ends_and_length(p):
@@ -1506,6 +1802,7 @@ def drop_isolated_fragments(prims: list, min_len: float, touch_tol: float, defle
 __all__: Sequence[str] = (
     "simplify_polyline", "is_straight", "polygon_area", "point_in_polygon", "nest_loops",
     "hatch_lines", "chain_segments", "chain_paths", "merge_collinear", "premerge_collinear",
-    "subtract_covered", "dedupe_primitives", "drop_covered_curves", "primitives_to_segments",
-    "chain_to_primitives", "drop_isolated_fragments",
+    "subtract_covered", "subtract_covered_curves", "dedupe_primitives", "drop_covered_curves",
+    "primitives_to_segments",
+    "chain_to_primitives", "drop_isolated_fragments", "simplify_chain", "weld_chain_ends",
 )

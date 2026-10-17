@@ -410,10 +410,13 @@ def mesh_census(mesh) -> dict:
     nested voids (point-in-solid test). It does not change when the mesh is
     translated. ``volume_repaired`` says whether a rewind or a flip
     happened; ``volume_raw_mm3`` keeps ``abs`` of the raw signed face sum
-    (= ``abs(mesh.volume)``). ``volume_unbalanced_pieces``: pieces that are
+    (= ``abs(mesh.volume)``), ``volume_raw_signed_mm3`` the sum with its sign
+    (QA round 2 issue 8). ``volume_unbalanced_pieces``: pieces that are
     still not closed after the rewind (their volume is approximate).
     ``inverted``: the dominant piece is inside out. None when the mesh has
-    boundary edges.
+    boundary edges. ``inverted_solid``: the stricter verdict the
+    ``inverted_solid`` flag should follow (``inverted_solid_verdict``): the
+    mesh as a whole is inside out, not merely badly wound.
     """
     n_faces = int(len(mesh.faces))
     out: dict = {"triangles": n_faces, "vertices": int(len(mesh.vertices))}
@@ -422,7 +425,8 @@ def mesh_census(mesh) -> dict:
                    manifold_components=0, closed_components=0, open_components=0,
                    volume_mm3=None, inverted=False, volume_repaired=False,
                    volume_approximate=False, volume_pieces=0, volume_unbalanced_pieces=0,
-                   volume_raw_mm3=None, volume_source=None,
+                   volume_raw_mm3=None, volume_raw_signed_mm3=None, inverted_solid=False,
+                   volume_source=None,
                    area_mm2=0.0, bbox_min=None, bbox_max=None, extents=None,
                    euler=0, degenerate_faces=0, duplicate_faces=0, boundary_edges=0,
                    nonmanifold_edges=0, winding_conflicts=0)
@@ -444,7 +448,7 @@ def mesh_census(mesh) -> dict:
     out["nonmanifold_edges"] = int((counts > 2).sum())
     out["winding_conflicts"] = int(len(topo["conflict_face"]))
 
-    vol_abs, inverted, repaired, raw = None, False, False, None
+    vol_abs, inverted, repaired, raw, raw_signed = None, False, False, None, None
     n_pieces, n_unbalanced = 0, 0
     if n_boundary == 0:
         # raw from the face sum, not mesh.volume: trimesh's mass properties
@@ -467,8 +471,10 @@ def mesh_census(mesh) -> dict:
     out["volume_pieces"] = n_pieces
     out["volume_unbalanced_pieces"] = n_unbalanced
     out["volume_raw_mm3"] = raw
+    out["volume_raw_signed_mm3"] = raw_signed
     out["volume_source"] = (None if vol_abs is None else
                             ("winding_repaired" if repaired else "signed"))
+    out["inverted_solid"] = inverted_solid_verdict(out, int(topo["n_edges_unique"]))
     out["area_mm2"] = float(mesh.area)
     bounds = np.asarray(mesh.bounds, dtype=float)
     out["bbox_min"] = [float(v) for v in bounds[0]]
@@ -478,6 +484,39 @@ def mesh_census(mesh) -> dict:
     out["degenerate_faces"] = int((~mesh.nondegenerate_faces(height=1e-8)).sum())
     out["duplicate_faces"] = int(n_faces - int(np.asarray(mesh.unique_faces()).sum()))
     return out
+
+
+INVERTED_RAW_REL = 0.01           # |raw signed sum| within 1 % of the repaired volume
+INVERTED_CONFLICT_SHARE = 1e-4    # "a few" winding conflicts: <= max(2, 1e-4 x edges)
+
+
+def inverted_solid_verdict(census: dict, n_edges: "int | None" = None) -> bool:
+    """True when a closed mesh is inside out as a whole (QA round 2 issue 8).
+
+    Needs ``census["inverted"]`` (the dominant piece is wound inward) and one
+    of: no winding conflict; only a few (``winding_conflicts <= max(2,
+    1e-4 x n_edges)``, e.g. at the non-manifold edges of a topology-optimised
+    bracket: 2 conflicts in about 451k edges); or a negative raw signed
+    volume within 1 % of the repaired volume (the conflicts do not change
+    the volume: the faces wound against the rest are a negligible share).
+    A badly wound mesh (a whole body or face wound against the rest, e.g. a
+    box with one face flipped back: raw -5333 vs 8000) stays False: its
+    defect is the winding, not an inside-out solid. ``n_edges`` (unique
+    edges) defaults to 1.5 x triangles.
+    """
+    if not census.get("inverted"):
+        return False
+    conflicts = int(census.get("winding_conflicts") or 0)
+    if conflicts == 0:
+        return True
+    if n_edges is None:
+        n_edges = int(1.5 * int(census.get("triangles") or 0))
+    if conflicts <= max(2.0, INVERTED_CONFLICT_SHARE * float(n_edges)):
+        return True
+    raw, vol = census.get("volume_raw_signed_mm3"), census.get("volume_mm3")
+    if raw is None or vol is None or not float(vol) > 0.0:
+        return False
+    return float(raw) < 0.0 and abs(abs(float(raw)) - float(vol)) <= INVERTED_RAW_REL * float(vol)
 
 
 def mesh_volume_repaired(mesh) -> "tuple":
@@ -672,30 +711,120 @@ def score_depth_sign_mesh(mesh, n, feature_angle_deg: float = SHARP_TURN_DEG) ->
     return float(length[facing].sum())
 
 
-def choose_depth_sign_mesh(mesh, matrix, margin: float = 1.2) -> dict:
+def cavity_depth_sign_mesh(mesh, n) -> dict:
+    """Open-cavity volume a viewer on each side of ``n`` looks into (QA round 2 issue 4).
+
+    Per triangle facing ``+n`` (``normal . n > 0``): projected area
+    (``area x cos``) times its recess below the bounding plane on that side
+    (``h_hi - centroid . n``); the same against ``h_lo`` for the triangles
+    facing ``-n``. For a part without undercuts this is the volume between
+    the part and its bounding box on that side: a pocket or a tray opening
+    dominates, a shallow engraved logo with a long feature-edge length does
+    not (the feature-edge score kept NIST FTC 08's underside: 5935 vs 5351).
+    The plain projected area cannot decide (equal on both sides of a closed
+    mesh); the recess weight can.
+
+    Returns ``{"cavity_plus", "cavity_minus", "bbox_volume", "h_lo", "h_hi",
+    "proj_plus", "proj_minus"}`` (mm3, mm, mm2: the projected areas facing
+    each side). ``n`` points toward the viewer in mesh coordinates. A mesh
+    without faces gives zeros.
+    """
+    v = np.asarray(n, dtype=float).reshape(3)
+    v = v / max(float(np.linalg.norm(v)), 1e-300)
+    out = {"cavity_plus": 0.0, "cavity_minus": 0.0, "bbox_volume": 0.0, "h_lo": None,
+           "h_hi": None, "proj_plus": 0.0, "proj_minus": 0.0}
+    if len(mesh.faces) == 0:
+        return out
+    tri = np.asarray(mesh.triangles, dtype=float)
+    cr = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    proj = 0.5 * (cr @ v)                                  # signed projected area
+    h = tri.mean(axis=1) @ v
+    bounds = np.asarray(mesh.bounds, dtype=float)
+    corners = np.array([[x, y, z] for x in bounds[:, 0] for y in bounds[:, 1]
+                        for z in bounds[:, 2]])
+    hc = corners @ v
+    h_lo, h_hi = float(hc.min()), float(hc.max())
+    up, down = proj > 0.0, proj < 0.0
+    out["proj_plus"] = float(proj[up].sum())
+    out["proj_minus"] = float(-proj[down].sum())
+    out["cavity_plus"] = float((proj[up] * np.maximum(h_hi - h[up], 0.0)).sum())
+    out["cavity_minus"] = float((-proj[down] * np.maximum(h[down] - h_lo, 0.0)).sum())
+    out["bbox_volume"] = float(np.prod(np.maximum(bounds[1] - bounds[0], 0.0)))
+    out["h_lo"], out["h_hi"] = h_lo, h_hi
+    return out
+
+
+DEPTH_CAVITY_SHARE = 0.02         # cavity decides when a side's cavity >= 2 % of the bbox volume
+DEPTH_CAVITY_RATIO = 1.25         # ... and one side has 25 % more than the other
+DEPTH_CAVITY_MAX_IMBALANCE = 0.02  # ... and the projected areas of both sides agree to 2 %
+
+
+def choose_depth_sign_mesh(mesh, matrix, margin: float = 1.2,
+                           cavity_share: float = DEPTH_CAVITY_SHARE,
+                           cavity_ratio: float = DEPTH_CAVITY_RATIO) -> dict:
     """Keep or flip the front view's depth sign for a mesh drawn with ``matrix``.
 
     ``matrix`` is the orientation (``v' = matrix @ v``) from
     ``projection.auto_orientation``; the front viewer stands at -Y of the
     drawing. Flipping = rotating 180 deg about the drawing Z axis
     (``diag(-1, -1, 1) @ matrix``, det stays +1), which moves the viewer to
-    the other side. Flips only when the other side scores more than
-    ``margin`` x the current side (symmetric parts keep the permutation).
+    the other side.
 
-    Returns ``{"flip", "matrix" (3x3 list to use), "score_kept",
-    "score_flipped", "reason"}``.
+    Two rules (QA round 2 issue 4): the open-cavity volume
+    (``cavity_depth_sign_mesh``) decides when the larger side holds at least
+    ``cavity_share`` of the bbox volume and one side exceeds the other by
+    ``cavity_ratio`` (``method == "mesh_cavity"``), provided the mesh is
+    trustworthy for it: the projected areas facing the two sides agree to
+    ``DEPTH_CAVITY_MAX_IMBALANCE`` (equal for a closed, consistently wound
+    surface; a triangle soup or a broken tessellation is not) and the
+    cavity does not exceed the bbox volume. Otherwise the
+    feature-edge length (``score_depth_sign_mesh``) decides: flip only when
+    the other side scores more than ``margin`` x the current side
+    (``method == "mesh_feature_edges"``; symmetric parts keep the
+    permutation).
+
+    Returns ``{"flip", "matrix" (3x3 list to use), "method", "score_kept",
+    "score_flipped" (the deciding rule's scores), "edges_kept",
+    "edges_flipped", "cavity_kept", "cavity_flipped", "bbox_volume",
+    "reason"}``.
     """
     m = np.asarray(matrix, dtype=float).reshape(3, 3)
     front = np.array([0.0, -1.0, 0.0])                    # projection.VIEWS["front"].n
     n_mesh = m.T @ front
     s_keep = score_depth_sign_mesh(mesh, n_mesh)
     s_flip = score_depth_sign_mesh(mesh, -n_mesh)
-    flip = bool(s_flip > float(margin) * s_keep and s_flip > 0.0)
+    cav = cavity_depth_sign_mesh(mesh, n_mesh)
+    c_keep, c_flip, vol = cav["cavity_plus"], cav["cavity_minus"], cav["bbox_volume"]
+    share = max(c_keep, c_flip) / vol if vol > 0 else 0.0
+    cav_txt = (f"open cavity {c_keep:.4g} mm3 kept side, {c_flip:.4g} mm3 other side "
+               f"({100.0 * share:.3g} % of the bbox volume)")
+    r = float(cavity_ratio)
+    pp, pm = float(cav.get("proj_plus") or 0.0), float(cav.get("proj_minus") or 0.0)
+    imbalance = abs(pp - pm) / max(pp, pm, 1e-300)
+    # a closed, consistently wound surface projects the same area to both sides
+    # (divergence theorem): a triangle soup (QA 22: 12-21 %, cavity 2 x the bbox)
+    # or a badly wound / broken mesh (QA 21: 32 %, 25: 4.7 %) is not trusted
+    reliable = imbalance <= DEPTH_CAVITY_MAX_IMBALANCE and share <= 1.0
+    if not reliable:
+        cav_txt += f"; not used: projected areas differ by {100.0 * imbalance:.3g} %"
+    if reliable and vol > 0 and share >= float(cavity_share) and \
+            (c_flip > r * c_keep or c_keep > r * c_flip):
+        method = "mesh_cavity"
+        flip = bool(c_flip > r * c_keep)
+        sk, sf = c_keep, c_flip
+        reason = cav_txt
+    else:
+        method = "mesh_feature_edges"
+        flip = bool(s_flip > float(margin) * s_keep and s_flip > 0.0)
+        sk, sf = s_keep, s_flip
+        reason = (f"feature edges facing the front viewer: {s_keep:.6g} kept side, "
+                  f"{s_flip:.6g} other side ({cav_txt})")
     out_m = (np.diag([-1.0, -1.0, 1.0]) @ m) if flip else m
-    reason = (f"feature edges facing the front viewer: {s_keep:.6g} kept side, "
-              f"{s_flip:.6g} other side" + ("; flipped (180 deg about Z)" if flip else ""))
-    return {"flip": flip, "matrix": out_m.tolist(), "score_kept": s_keep,
-            "score_flipped": s_flip, "reason": reason}
+    reason += "; flipped (180 deg about Z)" if flip else ""
+    return {"flip": flip, "matrix": out_m.tolist(), "method": method, "score_kept": sk,
+            "score_flipped": sf, "edges_kept": s_keep, "edges_flipped": s_flip,
+            "cavity_kept": c_keep, "cavity_flipped": c_flip, "bbox_volume": vol,
+            "reason": reason}
 
 
 def transform_mesh(mesh, matrix):
@@ -727,11 +856,15 @@ def load_mesh_model(path: str, threshold: float = 0.10) -> MeshModel:
         # covers the non-manifold count too: trimesh's is_watertight is False
         # for a non-manifold edge even with 0 boundary edges
         warnings.append(f"mesh is not watertight: {watertight_detail(census)}")
-    if census["inverted"]:
+    if census.get("inverted_solid"):             # not for a merely badly wound mesh
         warnings.append("mesh is inside out (negative volume); the absolute volume is reported")
     if census["volume_repaired"]:
-        warnings.append(f"volume computed on a winding-repaired copy ({census['volume_mm3']:.6g}; "
-                        f"raw signed sum {census['volume_raw_mm3']:.6g})")
+        # the one winding warning (QA round 2 issue 8): the raw sum keeps its sign
+        raw = census.get("volume_raw_signed_mm3")
+        raw_txt = "n/a" if raw is None else f"{float(raw):.6g}"
+        warnings.append(f"volume computed on a winding-repaired copy ({census['volume_mm3']:.6g} "
+                        f"mm3; raw signed sum {raw_txt} mm3; "
+                        f"{int(census.get('winding_conflicts') or 0)} winding conflict(s))")
     if classifier.get("verdict") == "not_solid":
         warnings.append(f"mesh is not a solid: {classifier.get('not_solid_reason')}")
     if census["degenerate_faces"]:
@@ -746,4 +879,4 @@ def load_mesh_model(path: str, threshold: float = 0.10) -> MeshModel:
 __all__ = ["MeshLoadError", "MeshModel", "load_stl_checked", "mesh_census", "classify",
            "transform_mesh", "load_mesh_model", "mesh_topology", "mesh_volume_repaired",
            "watertight_detail", "not_solid_reason", "unit_plausibility",
-           "score_depth_sign_mesh", "choose_depth_sign_mesh"]
+           "score_depth_sign_mesh", "choose_depth_sign_mesh", "cavity_depth_sign_mesh"]

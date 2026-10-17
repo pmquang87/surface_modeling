@@ -265,10 +265,10 @@ def test_dxf_readback_audit_clean_and_header(dxf_out):
     assert doc.header["$INSUNITS"] == 4
     assert doc.header["$MEASUREMENT"] == 1
     assert doc.header["$LWDISPLAY"] == 1
-    assert doc.layers.get("HIDDEN").dxf.linetype.upper() == "DASHED"
+    assert doc.layers.get("HIDDEN").dxf.linetype.upper() == "HIDDEN_ISO"   # QA2 issue 22
     assert doc.layers.get("HIDDEN").dxf.lineweight == 25
     assert doc.layers.get("VISIBLE").dxf.lineweight == 50
-    assert doc.layers.get("CENTER").dxf.linetype.upper() == "CENTER"
+    assert doc.layers.get("CENTER").dxf.linetype.upper() == "CENTER_ISO"
     assert res["bytes"] == os.path.getsize(path)
     assert res["audit_errors"] == 0 and res["audit_fixes"] == 0
 
@@ -914,3 +914,177 @@ def test_dxf_stabilise_leaves_marker_looking_text_alone(tmp_path):
     markers = re.findall(r"^\d+\.\d+\.\d+\S* @ \d{4}-\d\d-\d\dT\S*$", raw, re.M)
     assert len(markers) == 3                                    # 2 ezdxf markers + the text
     assert sum(1 for m in markers if "@ 2026-01-02T00:00:00+00:00" in m) == 2
+
+
+# ----------------------------------------------- QA round 2: dashes, joins, DXF linetypes
+
+from src.drawing.style import DEFAULT_STYLE, SheetStyle  # noqa: E402
+
+
+def _dash_pieces(length, pattern, closed):
+    """(dashes, gaps) that a dash ``pattern`` starting at phase 0 shows over ``length``.
+
+    Pieces shorter than 0.05 mm are not counted. An open element's trailing gap is
+    invisible (nothing follows it); on a closed curve a final dash runs into the
+    first one and the two count once.
+    """
+    pattern = [float(v) for v in pattern]
+    assert sum(pattern) > 0
+    pieces, pos, i = [], 0.0, 0
+    while pos < length - 1e-9:
+        v = pattern[i % len(pattern)]
+        seg = min(v, length - pos)
+        if seg > 1e-9:
+            pieces.append((i % 2 == 0, seg))
+        pos += v
+        i += 1
+    if not closed:
+        while pieces and not pieces[-1][0]:
+            pieces.pop()
+    elif len(pieces) > 1 and pieces[0][0] and pieces[-1][0]:
+        pieces.pop()
+    dashes = sum(1 for d, ln in pieces if d and ln >= 0.05)
+    gaps = sum(1 for d, ln in pieces if not d and ln >= 0.05)
+    return dashes, gaps
+
+
+def _short_hidden_sheet():
+    t = np.linspace(0.0, 1.0, 6)
+    short_pl = np.column_stack([300.0 + 4.0 * t, 100.0 + 0.5 * np.sin(3 * t)])
+    items = [Segment((50.0, 50.0), (52.0, 50.0), LineStyle.HIDDEN),          # 2 mm
+             Circle((100.0, 100.0), 1.0, LineStyle.HIDDEN),                   # 6.28 mm closed
+             Segment((50.0, 200.0), (100.0, 200.0), LineStyle.HIDDEN),        # 50 mm
+             Arc((200.0, 100.0), 1.0, 0.0, 90.0, LineStyle.HIDDEN),           # 1.57 mm
+             Polyline(short_pl, False, LineStyle.HIDDEN)]                     # ~4.1 mm open
+    lengths = [2.0, 2.0 * np.pi, 50.0, 0.5 * np.pi,
+               float(np.linalg.norm(np.diff(short_pl, axis=0), axis=1).sum())]
+    closed = [False, True, False, False, False]
+    return Sheet("A3", 420.0, 297.0, items=items, meta={"scale": 1.0}), lengths, closed
+
+
+def _check_short_patterns(patterns, lengths, closed):
+    std = tuple(DEFAULT_STYLE.dash_hidden)
+    # precondition: the stock pattern shows a solid stroke on the short elements
+    assert _dash_pieces(lengths[0], std, False)[0] < 2
+    assert _dash_pieces(lengths[1], std, True)[1] < 4
+    assert _dash_pieces(lengths[3], std, False)[0] < 2
+    for k in (0, 3, 4):
+        assert _dash_pieces(lengths[k], patterns[k], False)[0] >= 2, (k, patterns[k])
+    assert _dash_pieces(lengths[1], patterns[1], True)[1] >= 4, patterns[1]
+    assert tuple(patterns[2]) == pytest.approx(std, abs=1e-3)               # long line unchanged
+
+
+def test_svg_short_hidden_elements_get_adapted_dashes(tmp_path):
+    """QA2 issue 2: every short hidden element shows >= 2 dashes, a closed one >= 4 gaps."""
+    sheet, lengths, closed = _short_hidden_sheet()
+    res = write_svg(sheet, str(tmp_path / "h.svg"))
+    root = ET.parse(str(tmp_path / "h.svg")).getroot()
+    g = [e for e in root if e.tag == SVG_NS + "g"][0]
+    drawn = list(g)
+    assert len(drawn) == 5
+    patterns = [[float(v) for v in e.get("stroke-dasharray").split()] for e in drawn]
+    _check_short_patterns(patterns, lengths, closed)
+    assert drawn[2].get("stroke-dasharray") == "3 0.75"
+    assert res["dash_adapted"] == 4
+
+
+def test_pdf_short_hidden_elements_get_adapted_dashes(tmp_path):
+    sheet, lengths, closed = _short_hidden_sheet()
+    res = write_pdf(sheet, str(tmp_path / "h.pdf"), compress=False)
+    data = (tmp_path / "h.pdf").read_bytes()
+    ops = _pdf_content(data, _pdf_objects(data)).decode("latin-1").split("\n")
+    patterns, cur = [], None
+    for op in ops:
+        m = re.search(r"\[([^\]]*)\] 0 d", op)
+        if m:
+            cur = [float(v) / MM for v in m.group(1).split()]
+        if op.endswith(" S"):
+            patterns.append(cur)
+    assert len(patterns) == 5
+    _check_short_patterns(patterns, lengths, closed)
+    assert res["dash_adapted"] == 4
+
+
+@needs_ezdxf
+def test_dxf_short_hidden_elements_entity_ltscale(tmp_path):
+    """DXF: stock HIDDEN_ISO linetype, short entities scaled by their own ltscale; the
+    hidden circle stays ONE CIRCLE on layer HIDDEN."""
+    import ezdxf
+    sheet, lengths, closed = _short_hidden_sheet()
+    res = write_dxf(sheet, str(tmp_path / "h.dxf"))
+    assert res["audit_errors"] == 0 and res["audit_fixes"] == 0
+    doc = ezdxf.readfile(str(tmp_path / "h.dxf"))
+    ents = list(doc.modelspace())
+    assert [e.dxftype() for e in ents] == ["LINE", "CIRCLE", "LINE", "ARC", "LWPOLYLINE"]
+    assert all(e.dxf.layer == "HIDDEN" for e in ents)
+    base = doc.linetypes.get(doc.layers.get("HIDDEN").dxf.linetype).simplified_line_pattern()
+    g = float(doc.header.get("$LTSCALE", 1.0))
+    patterns = [[v * g * float(e.dxf.get("ltscale", 1.0)) for v in base] for e in ents]
+    _check_short_patterns(patterns, lengths, closed)
+    assert res["dash_adapted"] == 4
+
+
+def test_line_props_adapts_hidden_only():
+    from src.drawing.writers import line_props
+    w, d = line_props(LineStyle.HIDDEN, DEFAULT_STYLE, length=2.0)
+    assert _dash_pieces(2.0, d, False)[0] >= 2
+    assert line_props(LineStyle.HIDDEN) == (DEFAULT_STYLE.narrow, tuple(DEFAULT_STYLE.dash_hidden))
+    assert line_props(LineStyle.VISIBLE, length=2.0) == (DEFAULT_STYLE.wide, None)
+    assert line_props(LineStyle.CENTER, length=2.0)[1] == tuple(DEFAULT_STYLE.dash_center)
+    # a closed curve whose length is a whole number of periods keeps the pattern
+    w, d = line_props(LineStyle.HIDDEN, length=7.5 * 4, closed=True)
+    assert d == pytest.approx(DEFAULT_STYLE.dash_hidden)
+
+
+def _hairpin_sheet():
+    a = np.radians(10.0)
+    pts = np.array([[100.0 + 40.0 * np.cos(a), 100.0 + 40.0 * np.sin(a)], [100.0, 100.0],
+                    [140.0, 100.0]])
+    return Sheet("A3", 420.0, 297.0, items=[Polyline(pts, False, LineStyle.VISIBLE)],
+                 meta={"scale": 1.0})
+
+
+def test_svg_round_line_joins(tmp_path):
+    """QA2 issue 20: no miter spikes at acute polyline vertices."""
+    write_svg(_hairpin_sheet(), str(tmp_path / "j.svg"))
+    root = ET.parse(str(tmp_path / "j.svg")).getroot()
+    g = [e for e in root if e.tag == SVG_NS + "g"][0]
+    assert g.get("stroke-linejoin") == "round"
+
+
+def test_pdf_round_line_joins(tmp_path):
+    write_pdf(_hairpin_sheet(), str(tmp_path / "j.pdf"), compress=False)
+    data = (tmp_path / "j.pdf").read_bytes()
+    ops = _pdf_content(data, _pdf_objects(data)).decode("latin-1").split("\n")
+    first_stroke = next(i for i, o in enumerate(ops) if o.endswith(" S"))
+    joins = [m.group(1) for o in ops[:first_stroke] for m in re.finditer(r"(\d) j\b", o)]
+    assert joins and joins[-1] == "1"
+
+
+def _iso_pattern(dash):
+    return tuple(float(v) for v in dash)
+
+
+@needs_ezdxf
+@pytest.mark.parametrize("style", [DEFAULT_STYLE,
+                                   SheetStyle(dash_hidden=(4.0, 1.0),
+                                              dash_center=(8.0, 1.0, 0.5, 1.0),
+                                              dash_cutting=(10.0, 2.0, 0.5, 2.0))])
+def test_dxf_iso_linetypes_from_sheet_style(tmp_path, style):
+    """QA2 issue 22: HIDDEN/CENTER/CUTTING layers use custom ISO linetypes built from
+    the SheetStyle dashes at $LTSCALE 1 (stock DASHED/CENTER differ: 1.27/0.635 and
+    31.75/6.35/6.35/6.35 at scale 1)."""
+    import ezdxf
+    res = write_dxf(make_sheet(), str(tmp_path / "lt.dxf"), style)
+    assert res["audit_errors"] == 0 and res["audit_fixes"] == 0
+    doc = ezdxf.readfile(str(tmp_path / "lt.dxf"))
+    assert float(doc.header["$LTSCALE"]) == pytest.approx(1.0)
+    for layer, name, dash in (("HIDDEN", "HIDDEN_ISO", style.dash_hidden),
+                              ("CENTER", "CENTER_ISO", style.dash_center),
+                              ("CUTTING", "CUTTING_ISO", style.dash_cutting)):
+        assert doc.layers.get(layer).dxf.linetype.upper() == name
+        pat = doc.linetypes.get(name).simplified_line_pattern()
+        assert tuple(pat) == pytest.approx(_iso_pattern(dash), abs=1e-6)
+    # no-op guard: the stock DASHED pattern is not the ISO hidden pattern
+    stock = doc.linetypes.get("DASHED").simplified_line_pattern()
+    assert tuple(stock) != pytest.approx(_iso_pattern(style.dash_hidden), abs=1e-6)

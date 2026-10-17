@@ -460,7 +460,9 @@ def test_poly_hidden_circle_is_one_polyline(monkeypatch):
     # the visible outline (4 long edges) stays 4 Segments
     assert len(_segs(pv.visible)) == 4 and len(pv.visible) == 4
     # negative control: without chaining every chord is its own Segment
-    monkeypatch.setattr(bv, "_DASH_PERIOD_PAPER_MM", 0.0)
+    orig = bv.chain_to_primitives
+    monkeypatch.setattr(bv, "chain_to_primitives",
+                        lambda *a, **k: orig(*a, **dict(k, short_len=0.0, polyline_all=False)))
     pv0 = bv.project_brep(_blind_hole_from_below(), VIEWS["top"], exact=False, deflection=0.05)
     assert len(_segs(pv0.hidden)) >= 16
 
@@ -1105,3 +1107,241 @@ def test_f7_max_hidden_edges_skips_the_hidden_conversion(monkeypatch):
     same = bv.project_brep(_box_hole(), VIEWS["front"], exact=True, deflection=0.02,
                            max_hidden_edges=n)
     assert len(same.hidden) == len(ref.hidden)
+
+
+# ------------------------------------------------- QA round 2 issues 3 and 28
+
+def test_section_loops_carry_their_body_id():
+    """Issue 3: ``loop_body`` is aligned with ``loops`` and names the solid
+    (``_parts`` index) of every loop: the plate's two pieces share one id,
+    the bolt and the nut have their own; a single solid gives one id."""
+    import src.drawing.brep_sections as bs
+    from src.drawing.geometry2d import polygon_area
+    asm = _assembly()                         # parts: plate 0, bolt 1, other 2, nut 3
+    p, n = np.array([50.0, 10.0, 5.0]), np.array([0.0, -1.0, 0.0])
+    sv = bs.section_brep(asm, p, n, VIEWS["front"], exact=True, deflection=0.02,
+                         depth_extent=50.0, hidden=False)
+    assert _areas(sv.loops) == pytest.approx([64.0, 200.0, 450.0, 450.0], abs=1e-6)  # precondition
+    assert sv.loop_body is not None and len(sv.loop_body) == len(sv.loops)
+    by_area = {round(abs(polygon_area(lp)), 6): b for lp, b in zip(sv.loops, sv.loop_body)}
+    assert by_area[450.0] == 0 and by_area[200.0] == 1 and by_area[64.0] == 3
+    assert sorted(sv.loop_body) == [0, 0, 1, 3]
+    one = bs.section_brep(_plate(), np.array([50.0, 30.0, 7.5]), np.array([0.0, -1.0, 0.0]),
+                          VIEWS["front"], exact=True, deflection=0.02, depth_extent=60.0)
+    assert one.loops and one.loop_body == [0] * len(one.loops)
+
+
+def test_section_leaves_fasteners_unsectioned(monkeypatch):
+    """Issue 28: the bolt that fills the plate's hole (``filler_bodies`` of
+    the filled hole) gets no section loop and stays whole in the body; the
+    plate and the nut are still cut. Without ``features`` the bolt is cut
+    (round-1 behaviour)."""
+    import src.drawing.brep_sections as bs
+    from src.drawing.brep_features import cylinder_features
+    asm = _assembly()
+    feats = cylinder_features(asm)
+    filled = [f for f in feats if f.kind == "filled_hole"]
+    assert len(filled) == 1 and filled[0].filler_bodies == (1,)          # precondition
+    assert bs.fastener_parts(feats) == [1]
+    p, n = np.array([50.0, 10.0, 5.0]), np.array([0.0, -1.0, 0.0])
+    kept_shapes = []
+    orig = bs._half_space_cut
+
+    def spy(*a, **k):
+        out = orig(*a, **k)
+        kept_shapes.append(out)
+        return out
+    monkeypatch.setattr(bs, "_half_space_cut", spy)
+    sv = bs.section_brep(asm, p, n, VIEWS["front"], exact=True, deflection=0.02,
+                         depth_extent=50.0, hidden=False, features=feats)
+    assert _areas(sv.loops) == pytest.approx([64.0, 450.0, 450.0], abs=1e-6)   # no bolt loop
+    assert 1 not in sv.loop_body
+    assert sv.stats["fasteners_unsectioned"] == [1] and sv.stats["bodies_skipped"] == 1
+    ymins = sorted(_solid_ymins(kept_shapes[-1]))
+    assert ymins == pytest.approx([5.0, 10.0, 10.0], abs=1e-6)          # the bolt whole (y 5..15)
+    # control: no features -> the bolt is sectioned as before
+    sv0 = bs.section_brep(asm, p, n, VIEWS["front"], exact=True, deflection=0.02,
+                          depth_extent=50.0, hidden=False)
+    assert _areas(sv0.loops) == pytest.approx([64.0, 200.0, 450.0, 450.0], abs=1e-6)
+    assert sv0.stats["fasteners_unsectioned"] == []
+    # explicit keep_whole does the same; a single solid is always sectioned
+    sv1 = bs.section_brep(asm, p, n, VIEWS["front"], exact=True, deflection=0.02,
+                          depth_extent=50.0, hidden=False, keep_whole=[1])
+    assert len(sv1.loops) == 3
+    solo = bs.section_brep(_plate(), np.array([50.0, 30.0, 7.5]), np.array([0.0, -1.0, 0.0]),
+                           VIEWS["front"], exact=True, deflection=0.02, depth_extent=60.0,
+                           keep_whole=[0])
+    assert solo.loops and solo.stats["fasteners_unsectioned"] == []
+
+
+# ======================================== QA round 2 issue 18: hidden overprint
+
+def _overprinted(pv, tol=0.05, defl=0.01):
+    """Per hidden primitive: fraction of its length within tol of the visible lines."""
+    from scipy.spatial import cKDTree
+    from src.drawing.geometry2d import primitives_to_segments
+
+    def samples(segs, step):
+        out = []
+        for a, b in segs:
+            n = max(2, int(np.linalg.norm(b - a) / step) + 1)
+            t = np.linspace(0.0, 1.0, n)[:, None]
+            out.append(a + t * (b - a))
+        return np.vstack(out)
+
+    vis = primitives_to_segments(pv.visible, defl)
+    tree = cKDTree(samples(vis, tol / 4.0))
+    fr = []
+    for h in pv.hidden:
+        d, _ = tree.query(samples(primitives_to_segments([h], defl), 0.01))
+        fr.append(float(np.mean(d <= tol)))
+    return fr
+
+
+def _cross_drilled():
+    """R20 shaft along X with a R5 hole along Z: the far intersection curve projects
+    onto the near (visible) one in the bottom view and on its edge-on copy elsewhere."""
+    return _cut(_cyl((-40, 0, 0), (1, 0, 0), 20.0, 80.0), _cyl((0, 0, -30), (0, 0, 1), 5.0, 60.0))
+
+
+def test_clean_drops_hidden_polyline_lying_on_visible_polyline():
+    import src.drawing.brep_views as bv
+    from src.drawing.model import LineStyle
+    t = np.linspace(0.0, 2.0 * np.pi, 65)[:-1]
+    ell = np.stack([20.0 * np.cos(t), 10.0 * np.sin(t)], 1)
+    vis = [Polyline(ell, True, LineStyle.VISIBLE)]
+    hid = [Polyline(ell + [0.0, 0.01], True, LineStyle.HIDDEN)]
+    # precondition: at the geometric tolerance the copy survives
+    v0, h0 = bv._clean(list(vis), list(hid), 1e-4)
+    assert len(h0) == 1
+    info = {}
+    v1, h1 = bv._clean(list(vis), list(hid), 1e-4, curve_tol=0.05, deflection=0.01, info=info)
+    assert h1 == [] and len(v1) == 1
+    assert info["hidden_curves_dropped"] == 1
+
+
+def test_clean_hidden_circle_plus_seam_arcs_is_one_circle():
+    import src.drawing.brep_views as bv
+    from src.drawing.model import LineStyle
+    c = (10.0, 5.0)
+    hid = [Arc(c, 1.0, 270.0, 90.0, LineStyle.HIDDEN), Circle(c, 1.0, LineStyle.HIDDEN),
+           Arc(c, 1.0, 90.0, 270.0, LineStyle.HIDDEN)]
+    vis = [Segment((0.0, 0.0), (30.0, 0.0), LineStyle.VISIBLE)]
+    _, h = bv._clean(vis, hid, 1e-4)
+    assert len(h) == 1 and isinstance(h[0], Circle)
+
+
+def test_cross_drilled_far_curves_not_drawn_hidden_over_visible(monkeypatch):
+    """No HIDDEN primitive lies within 0.05 mm (paper scale 1) of the VISIBLE lines over
+    more than 90 % of its length; without the curve subtraction several do."""
+    import src.drawing.brep_views as bv
+    shape = _cross_drilled()
+    views = ("front", "right", "bottom")
+
+    def worst(flags):
+        monkeypatch.setattr(bv, "_SUBTRACT_HIDDEN_CURVES", flags)
+        monkeypatch.setattr(bv, "_EXACT_SEGMENTS_LOOSE", flags)
+        out, dropped = [], 0
+        for v in views:
+            pv = bv.project_brep(shape, VIEWS[v], exact=True, deflection=0.05, paper_scale=1.0)
+            out += _overprinted(pv)
+            dropped += pv.stats.get("hidden_curves_dropped", 0)
+        return out, dropped
+
+    before, _ = worst(False)
+    assert sum(f > 0.9 for f in before) >= 4                           # precondition
+    after, dropped = worst(True)
+    assert after and max(after) <= 0.9, sorted(after)[-5:]
+    assert dropped >= 4
+
+
+def test_section_body_inside_another_body_joins_it_but_a_fitted_bolt_does_not():
+    """A cavity healed into a solid of its own (the faceted STL route: box
+    48000 + cavity block 2000 mm3) lies in the material of the outer solid:
+    its loop joins the outer body (else the layout fills the void). A bolt
+    seen across its axis has a loop equal to the plate's hole: it keeps its
+    own body."""
+    import src.drawing.brep_sections as bs
+    outer = _box(-30, -20, -10, 60, 40, 20)
+    block = _box(-10, 5, -5, 20, 10, 10)
+    sv = bs.section_brep(_compound(outer, block), np.array([0.0, 10.0, 0.0]),
+                         np.array([0.0, -1.0, 0.0]), VIEWS["front"], exact=True,
+                         deflection=0.02, depth_extent=40.0)
+    assert _areas(sv.loops) == pytest.approx([200.0, 1200.0])          # precondition
+    assert sv.loop_body == [0, 0]
+    asm = _assembly()
+    top = bs.section_brep(asm, np.array([50.0, 10.0, 5.0]), np.array([0.0, 0.0, 1.0]),
+                          VIEWS["top"], exact=True, deflection=0.02, depth_extent=20.0)
+    circles = [b for lp, b in zip(top.loops, top.loop_body)
+               if abs(abs(_areas([lp])[0]) - math.pi * 25.0) < 0.5]
+    assert len(circles) == 2 and sorted(circles) == [0, 1], top.loop_body
+    # the merge itself: without the plate's coincident hole loop the bolt would
+    # sit in the plate's material and join it
+    keep = [i for i, (lp, b) in enumerate(zip(top.loops, top.loop_body))
+            if not (b == 0 and abs(_areas([lp])[0] - math.pi * 25.0) < 0.5)]
+    ids = [top.loop_body[i] for i in keep]
+    assert 1 in ids                                                     # precondition
+    merged = bs.merge_void_bodies([top.loops[i] for i in keep], ids, lambda b: False)
+    assert 1 not in merged and merged.count(0) == ids.count(0) + ids.count(1)
+
+
+def _plate_bolt(xdir=None, r_bolt=5.0):
+    """Plate 100x20x10 with an r5 hole at (50, 10) and a bolt (z -5..15) in it;
+    ``xdir`` sets the bolt cylinder's reference direction (its seam)."""
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+    plate = _cut(_box(0, 0, 0, 100, 20, 10), _cyl((50, 10, -5), (0, 0, 1), 5.0, 30.0))
+    ax = (gp_Ax2(gp_Pnt(50, 10, -5), gp_Dir(0, 0, 1)) if xdir is None else
+          gp_Ax2(gp_Pnt(50, 10, -5), gp_Dir(0, 0, 1), gp_Dir(*xdir)))
+    return _compound(plate, BRepPrimAPI_MakeCylinder(ax, r_bolt, 20.0).Shape())
+
+
+def test_section_cuts_a_fastener_crossed_by_the_plane():
+    """Review of issue 28: ISO 128-50 leaves a bolt unhatched only when it is
+    cut lengthwise. A plane across the bolt axis sections it (its loop is
+    drawn with its own body id); a plane along the axis still keeps it whole."""
+    import src.drawing.brep_sections as bs
+    from src.drawing.brep_features import cylinder_features
+    asm = _assembly()
+    feats = cylinder_features(asm)
+    assert bs.fastener_parts(feats) == [1]                              # precondition
+    z, y = np.array([0.0, 0.0, 1.0]), np.array([0.0, -1.0, 0.0])
+    assert bs.fastener_parts(feats, normal=z) == []
+    assert bs.fastener_parts(feats, normal=y) == [1]
+    top = bs.section_brep(asm, np.array([50.0, 10.0, 5.0]), z, VIEWS["top"], exact=True,
+                          deflection=0.02, depth_extent=20.0, hidden=False, features=feats)
+    circles = [b for lp, b in zip(top.loops, top.loop_body)
+               if abs(_areas([lp])[0] - math.pi * 25.0) < 0.5]
+    assert sorted(circles) == [0, 1], top.loop_body
+    assert top.stats["fasteners_unsectioned"] == [] and top.stats["bodies_skipped"] == 0
+    front = bs.section_brep(asm, np.array([50.0, 10.0, 5.0]), y, VIEWS["front"], exact=True,
+                            deflection=0.02, depth_extent=50.0, hidden=False, features=feats)
+    assert 1 not in front.loop_body and front.stats["fasteners_unsectioned"] == [1]
+
+
+def test_fitted_bolt_with_another_seam_keeps_its_body():
+    """Review of issue 3: a bolt modelled with its seam 37 deg from the hole's
+    seam has an equal-area loop whose polygon differs from the hole's by up to
+    the sagitta; it must still count as coincident (not a void joined to the
+    plate, which would draw the bolt area white)."""
+    import src.drawing.brep_sections as bs
+    a = math.radians(37.0)
+    for xdir in (None, (math.cos(a), math.sin(a), 0.0)):
+        sv = bs.section_brep(_plate_bolt(xdir), np.array([50.0, 10.0, 5.0]),
+                             np.array([0.0, 0.0, 1.0]), VIEWS["top"], exact=True,
+                             deflection=0.02, depth_extent=20.0, hidden=False)
+        circ = [(lp, b) for lp, b in zip(sv.loops, sv.loop_body)
+                if abs(_areas([lp])[0] - math.pi * 25.0) < 0.5]
+        assert len(circ) == 2
+        if xdir is not None:                 # precondition: the polygons really differ
+            boxes = [np.concatenate([lp.min(axis=0), lp.max(axis=0)]) for lp, _ in circ]
+            assert float(np.max(np.abs(boxes[0] - boxes[1]))) > 1e-4
+        assert sorted(b for _, b in circ) == [0, 1], sv.loop_body
+    # the unit itself: a void block inside a plate still joins it
+    t = np.linspace(0.0, 2.0 * np.pi, 49)[:-1]
+    rect = np.array([[0.0, 0.0], [100.0, 0.0], [100.0, 20.0], [0.0, 20.0]])
+    hole = np.stack([50 + 5 * np.cos(t), 10 + 5 * np.sin(t)], 1)[::-1]
+    bolt = np.stack([50 + 5 * np.cos(t + 0.06), 10 + 5 * np.sin(t + 0.06)], 1)
+    block = np.array([[10.0, 5.0], [20.0, 5.0], [20.0, 15.0], [10.0, 15.0]])
+    assert bs.merge_void_bodies([rect, hole, bolt], [0, 0, 1], lambda b: False) == [0, 0, 1]
+    assert bs.merge_void_bodies([rect, hole, block], [0, 0, 2], lambda b: False) == [0, 0, 0]

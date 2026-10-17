@@ -111,7 +111,9 @@ def build_parser() -> _Parser:
                    help="comma list of pdf,svg,dxf (default all three)")
     p.add_argument("--views", type=_csv(VIEW_NAMES), default=None,
                    help="comma list of views (default front,top,right,iso)")
-    p.add_argument("--section", choices=SECTIONS, default=None, help="section A-A plane (default auto)")
+    p.add_argument("--section", choices=SECTIONS, default=None,
+                   help="section A-A plane (default auto: through the largest hole axis; none "
+                        "for large assemblies, where front/top/right still draw one)")
     p.add_argument("--sheet", choices=SHEET_CHOICES, default=None, help="sheet size (default A3)")
     p.add_argument("--projection", choices=PROJECTIONS, default=None,
                    help="first (ISO, default) or third angle")

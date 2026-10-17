@@ -1350,3 +1350,311 @@ def test_bounded_exact_bbox_equals_add_optimal_on_curved_parts():
         assert ref is not None and np.array_equal(got, ref)
     # precondition of the point of it: the loose box of the NURBS cylinder is NOT exact
     assert float(np.max(np.abs(loose_bbox(nurbs) - exact_bbox(nurbs)))) > 1.0
+
+
+# ---------------------------------------------------------------------------
+# QA round 2 issue 4: the depth sign follows the open cavity, not the face count
+# ---------------------------------------------------------------------------
+
+def _pocket_block():
+    """Block 150 (X) x 30 (Y, depth) x 75 (Z). A 100 x 15 x 50 pocket opens to
+    -Y; the +Y face carries eight r1.5 x 2 blind holes and ten 4 x 1 x 4
+    notches, so the +Y side has many more (small) facing faces."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+    shape = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 150.0, 30.0, 75.0).Shape()
+    pocket = BRepPrimAPI_MakeBox(gp_Pnt(25, -1, 12.5), 100.0, 16.0, 50.0).Shape()
+    shape = BRepAlgoAPI_Cut(shape, pocket).Shape()
+    for i in range(8):
+        tool = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(15 + 17 * i, 32, 6), gp_Dir(0, -1, 0)),
+                                        1.5, 4.0).Shape()
+        shape = BRepAlgoAPI_Cut(shape, tool).Shape()
+    for i in range(10):
+        notch = BRepPrimAPI_MakeBox(gp_Pnt(10 + 13 * i, 29, 66), 4.0, 2.0, 4.0).Shape()
+        shape = BRepAlgoAPI_Cut(shape, notch).Shape()
+    return shape
+
+
+@needs_ocp
+def test_depth_sign_keeps_the_pocket_toward_the_viewer():
+    """Round 2 issue 4 (NIST FTC 10 was turned to its back by the face count:
+    105.5 vs 24.5). The cavity term (projected area x recess) makes the deep
+    pocket floor dominate the shallow holes and notches."""
+    from src.drawing.brep_features import choose_depth_sign_brep, depth_sign_details
+    shape = _pocket_block()
+    n = (0.0, -1.0, 0.0)                     # front viewer at -Y looks into the pocket
+    d = depth_sign_details(shape, n)
+    # precondition: the round-1 face rule turns the part away from its pocket
+    assert d["faces_plus"] == 2 and d["faces_minus"] == 19, d
+    assert d["score_minus"] > 1.25 * d["score_plus"] and d["score_minus"] - d["score_plus"] >= 2
+    # the cavity: pocket floor 100 x 50 x 15 deep on +n; holes 8 x pi 1.5^2 x 2 and
+    # notches 10 x 16 x 1 on -n
+    assert d["cavity_plus"] == pytest.approx(5000.0 * 15.0, rel=1e-6)
+    assert d["cavity_minus"] == pytest.approx(8 * math.pi * 1.5 ** 2 * 2.0 + 160.0, rel=1e-3)
+    assert d["bbox_volume"] == pytest.approx(150.0 * 30.0 * 75.0, rel=1e-6)
+    r = choose_depth_sign_brep(shape, n)
+    assert r["flip"] is False and r["method"] == "brep_cavity", r
+    assert r["score_kept"] > r["score_flipped"] and r["faces_flipped"] > r["faces_kept"]
+    # the viewer on the other side is turned toward the pocket (an always-keep rule fails)
+    r2 = choose_depth_sign_brep(shape, (0.0, 1.0, 0.0))
+    assert r2["flip"] is True and r2["method"] == "brep_cavity"
+    # the exact bbox passed in gives the same answer without its own box
+    r3 = choose_depth_sign_brep(shape, n, bbox=((0, 0, 0), (150, 30, 75)))
+    assert r3["cavity_kept"] == pytest.approx(r["cavity_kept"], rel=1e-9)
+    # an inverted solid gives the same cavity
+    d_inv = depth_sign_details(shape.Reversed(), n)
+    assert d_inv["cavity_plus"] == pytest.approx(d["cavity_plus"], rel=1e-9)
+
+
+@needs_ocp
+def test_depth_sign_without_a_cavity_falls_back_to_the_face_rule():
+    """The bossed slab of round 1 has its boss tops as the only recess-free
+    features: the slab face lies 5 mm below the boss tops, so the cavity rule
+    agrees with the face rule; a through-holed plate has no cavity and no
+    preferred side (no flip either way)."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+    from src.drawing.brep_features import choose_depth_sign_brep
+    n = (0.0, -1.0, 0.0)
+    assert choose_depth_sign_brep(_bossed_slab(+1), n)["flip"] is True
+    assert choose_depth_sign_brep(_bossed_slab(-1), n)["flip"] is False
+    holed = BRepAlgoAPI_Cut(_box(50, 50, 10), BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(25, 25, -1), gp_Dir(0, 0, 1)), 5.0, 12.0).Shape()).Shape()
+    for nz in (1.0, -1.0):
+        r = choose_depth_sign_brep(holed, (0.0, 0.0, nz))
+        assert r["flip"] is False and r["method"] == "brep_faces"
+        assert r["cavity_kept"] == pytest.approx(0.0, abs=1e-6)
+    r = choose_depth_sign_brep(None, n)
+    assert r["flip"] is False
+
+
+# ---------------------------------------------------------------------------
+# QA round 2 issue 24: the tessellated route says what it leaves out
+# ---------------------------------------------------------------------------
+
+_TESS_EXTRA = (
+    "#30=COORDINATES_LIST('',2,((0.0,0.0,0.0),(1.0,0.0,0.0)));\n"
+    "#31=TESSELLATED_CURVE_SET('',#30,((1,2)));\n"
+    "#32=TESSELLATED_GEOMETRIC_SET('flatness',(#31));\n"
+    "#34=PRESENTATION_STYLE_ASSIGNMENT(());\n"
+    "#35=TESSELLATED_ANNOTATION_OCCURRENCE('Flatness.1',(#34),#32);\n"
+    "#40=TRIANGULATED_FACE('',#20,8,(),$,(1,2,3,4,5,6,7,8),((1,2,3)));\n"
+    "#41=TESSELLATED_SHELL('supp',(#40),$);\n"
+    "#42=CONSTRUCTIVE_GEOMETRY_REPRESENTATION('supplemental geometry',(#41),#14);\n")
+
+
+def _tess_step_text_with_extras():
+    return _tess_step_text().replace("ENDSEC;\nEND-ISO", _TESS_EXTRA + "ENDSEC;\nEND-ISO")
+
+
+@needs_ocp
+def test_tessellated_error_counts_dropped_shells_and_annotations(tmp_path, monkeypatch):
+    from src.drawing import brep_load
+    from src.drawing.brep_load import TessellatedOnlyError, load_step, step_entity_census
+    plain = tmp_path / "tess.stp"
+    plain.write_text(_tess_step_text(), encoding="ascii")
+    with pytest.raises(TessellatedOnlyError) as ei:
+        load_step(str(plain))
+    assert ei.value.dropped == {}                           # control: nothing left out
+    p = tmp_path / "tess_extra.stp"
+    p.write_text(_tess_step_text_with_extras(), encoding="ascii")
+    assert step_entity_census(str(p)) == {"tessellated_solids": 1, "tessellated_shells": 1,
+                                          "annotation_occurrences": 1}
+    with pytest.raises(TessellatedOnlyError) as ei:
+        load_step(str(p))
+    err = ei.value
+    assert err.triangles == 12 and err.mesh.is_watertight     # the part mesh is unchanged
+    assert err.dropped.get("tessellated_shells_outside") == 1, err.dropped
+    assert err.dropped.get("annotation_occurrences") == 1
+    # the streamed scan counts records cut by a chunk boundary once
+    for chunk in (37, 600, 1000):
+        monkeypatch.setattr(brep_load, "_SNIFF_CHUNK", chunk)
+        assert step_entity_census(str(p)) == {"tessellated_solids": 1,
+                                              "tessellated_shells": 1,
+                                              "annotation_occurrences": 1}, chunk
+    assert step_entity_census(str(tmp_path / "missing.stp"))["annotation_occurrences"] == 0
+
+
+# ---------------------------------------------------------------------------
+# QA round 2 issue 16: toroidal edge rounds are features of kind "round"
+# ---------------------------------------------------------------------------
+
+def _rounded_disc(r=20.0, h=30.0, rr=3.0):
+    """Cylinder r x h on z = 0 with its top circular edge rounded by rr (a
+    convex torus face, minor rr, major r - rr, centre z = h - rr)."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopExp import TopExp
+    from OCP.TopoDS import TopoDS
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+    cyl = BRepPrimAPI_MakeCylinder(r, h).Shape()
+    mk = BRepFilletAPI_MakeFillet(cyl)
+    edges = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(cyl, TopAbs_EDGE, edges)
+    n = 0
+    for i in range(1, edges.Extent() + 1):
+        e = TopoDS.Edge_s(edges.FindKey(i))
+        c = BRep_Tool.Curve_s(e, 0.0, 1.0)
+        if c is not None and abs(c.Value(0.0).Z() - h) < 1e-9 and \
+                abs(c.Value(0.3).Z() - h) < 1e-9:
+            mk.Add(rr, e)
+            n += 1
+    assert n == 1                                         # precondition: the top circle
+    return mk.Shape()
+
+
+def _boss_with_foot_fillet(rr=2.0):
+    """Plate 60 x 60 x 10 with an r10 x 15 boss on top, its foot edge filleted
+    by rr (a concave torus face)."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+    from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+    from OCP.GeomAbs import GeomAbs_Circle
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopExp import TopExp
+    from OCP.TopoDS import TopoDS
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+    shape = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 60.0, 10.0).Shape()
+    boss = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(30, 30, 10), gp_Dir(0, 0, 1)), 10.0, 15.0).Shape()
+    shape = BRepAlgoAPI_Fuse(shape, boss).Shape()
+    mk = BRepFilletAPI_MakeFillet(shape)
+    edges = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(shape, TopAbs_EDGE, edges)
+    n = 0
+    for i in range(1, edges.Extent() + 1):
+        e = TopoDS.Edge_s(edges.FindKey(i))
+        ad = BRepAdaptor_Curve(e)
+        if ad.GetType() == GeomAbs_Circle and abs(ad.Value(ad.FirstParameter()).Z() - 10.0) < 1e-9:
+            mk.Add(rr, e)
+            n += 1
+    assert n >= 1                                         # precondition: the foot circle
+    return mk.Shape()
+
+
+@needs_ocp
+def test_toroidal_edge_rounds_are_round_features(monkeypatch):
+    from src.drawing import brep_features
+    from src.drawing.brep_features import cylinder_features
+    disc = _rounded_disc()
+    assert _count(disc, _ta("FACE")) == 4                 # precondition: side, top, bottom, torus
+    feats = cylinder_features(disc)
+    rounds = [f for f in feats if f.kind == "round"]
+    assert len(rounds) == 1, [(f.kind, f.radius) for f in feats]
+    r = rounds[0]
+    assert r.radius == pytest.approx(3.0, abs=1e-9) and r.major_radius == pytest.approx(17.0)
+    assert np.allclose(r.center, [0, 0, 27.0], atol=1e-9) and abs(abs(r.axis[2]) - 1) < 1e-9
+    assert r.full_circle and r.bodies == (0,)
+    assert [f.kind for f in feats] == ["boss", "round"]   # sorted after the cylinders
+    foot = [f for f in cylinder_features(_boss_with_foot_fillet()) if f.kind == "round"]
+    assert len(foot) == 1 and foot[0].radius == pytest.approx(2.0, abs=1e-9)
+    assert foot[0].major_radius == pytest.approx(12.0)
+    # negative control: without the torus pass the round is invisible (round 1)
+    monkeypatch.setattr(brep_features, "_detect_rounds", False)
+    assert [f.kind for f in cylinder_features(disc)] == ["boss"]
+
+
+# ---------------------------------------------------------------------------
+# QA round 2 issue 28: fasteners of an assembly are named for the section
+# ---------------------------------------------------------------------------
+
+def _plate_with_spigot_part():
+    """Plate 100x20x10 with an r5 hole at (50,10); a second part, a 60 x 60 x
+    10 block under it with an r5 spigot through the hole (not a fastener)."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+    plate = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 100.0, 20.0, 10.0).Shape()
+    plate = BRepAlgoAPI_Cut(plate, BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(50, 10, -5), gp_Dir(0, 0, 1)), 5.0, 20.0).Shape()).Shape()
+    block = BRepPrimAPI_MakeBox(gp_Pnt(20, -20, -10), 60.0, 60.0, 10.0).Shape()
+    block = BRepAlgoAPI_Fuse(block, BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(50, 10, 0), gp_Dir(0, 0, 1)), 5.0, 10.0).Shape()).Shape()
+    return _compound([plate, block])
+
+
+@needs_ocp
+def test_filled_hole_names_the_fastener_solid():
+    from src.drawing.brep_features import cylinder_features
+    _, asm = _plate_with_fastener()
+    filled = [f for f in cylinder_features(asm) if f.kind == "filled_hole"]
+    assert len(filled) == 1 and filled[0].bodies == (0,)
+    assert filled[0].filler_bodies == (1,)                # the pin (solid 1) is a fastener
+    # a spigot of a big block fills the hole too, but the block is no fastener
+    spig = [f for f in cylinder_features(_plate_with_spigot_part()) if f.kind == "filled_hole"]
+    assert len(spig) == 1                                 # precondition: still a filled hole
+    assert spig[0].filler_bodies == ()
+
+
+# ---------------------------------------------------------------------------
+# QA round 2 review of issue 4: an open housing is drawn from its exterior
+# ---------------------------------------------------------------------------
+
+def _open_housing():
+    """Box 100 x 100 x 100 with a 90 x 95 x 90 interior open to +Y (walls 5)."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.gp import gp_Pnt
+    box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 100.0, 100.0, 100.0).Shape()
+    inner = BRepPrimAPI_MakeBox(gp_Pnt(5, 5, 5), 90.0, 100.0, 90.0).Shape()
+    return BRepAlgoAPI_Cut(box, inner).Shape()
+
+
+@needs_ocp
+def test_depth_sign_open_housing_keeps_its_exterior():
+    """Review of issue 4 (NIST CTC 02 turned into its open housing by the
+    cavity rule, while the NIST reference shows the closed exterior). A
+    housing interior is deep (area-weighted mean recess 0.77 of the bbox
+    depth here, 0.50 on CTC 02) where a pocket is not (0.22 on the pocket
+    block, 0.31 on FTC 10): above ``DEPTH_CAVITY_MAX_MEAN_RECESS`` the face
+    rule decides, which keeps the native side of a plain housing."""
+    from src.drawing.brep_features import choose_depth_sign_brep, depth_sign_details
+    shape = _open_housing()
+    n = (0.0, -1.0, 0.0)                     # the viewer at -Y sees the closed side
+    d = depth_sign_details(shape, n)
+    # precondition: the open side's cavity dominates (the bare cavity rule turns it)
+    assert d["cavity_minus"] == pytest.approx(8100.0 * 95.0, rel=1e-6)
+    assert d["cavity_plus"] == pytest.approx(0.0, abs=1e-6)
+    assert d["mean_recess_minus"] == pytest.approx(8100.0 * 95.0 / (10000.0 * 100.0), rel=1e-6)
+    bare = choose_depth_sign_brep(shape, n, max_mean_recess=None)
+    assert bare["flip"] is True and bare["method"] == "brep_cavity"
+    r = choose_depth_sign_brep(shape, n)
+    assert r["flip"] is False and r["method"] == "brep_faces", r
+    assert "housing" in r["reason"]
+    # the same housing seen from its open side stays as it is
+    assert choose_depth_sign_brep(shape, (0.0, 1.0, 0.0))["flip"] is False
+    # a pocket (mean recess 0.22) is still decided by the cavity rule
+    blk = _pocket_block()
+    db = depth_sign_details(blk, (0.0, -1.0, 0.0))
+    assert db["mean_recess_plus"] == pytest.approx(75000.0 / (11250.0 * 30.0), rel=1e-3)
+    rb = choose_depth_sign_brep(blk, (0.0, 1.0, 0.0))
+    assert rb["flip"] is True and rb["method"] == "brep_cavity"
+
+
+@needs_ocp
+def test_score_depth_sign_does_not_pay_for_the_bbox(monkeypatch):
+    """Review of issue 4: ``score_depth_sign`` throws the cavity away, so it
+    must not compute the exact bbox (0.25 s on NIST FTC 10); the scores are
+    unchanged."""
+    import src.drawing.brep_features as bf
+    shape = _pocket_block()
+    n = (0.0, -1.0, 0.0)
+    ref = bf.score_depth_sign(shape, n)
+    calls = []
+    real = bf._extent_along
+
+    def spy(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+    monkeypatch.setattr(bf, "_extent_along", spy)
+    bf.depth_sign_details(shape, n)
+    assert calls                                          # precondition: the spy is live
+    calls.clear()
+    assert bf.score_depth_sign(shape, n) == pytest.approx(ref)
+    assert calls == []

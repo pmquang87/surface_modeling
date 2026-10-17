@@ -14,7 +14,10 @@ One page, one FlateDecode content stream, base-14 Helvetica with
 * text is cp1252 bytes with ``\\ ( )`` escaped; ``Ø ± °`` encode, U+2300 does
   not and is mapped to ``Ø`` (``clean_text``); other characters outside
   cp1252 become ``?`` (logged);
-* arcs are cubic Béziers of <= 90 degrees with k = 4/3·tan(span/4).
+* arcs are cubic Béziers of <= 90 degrees with k = 4/3·tan(span/4);
+* butt caps and ROUND joins (``0 J 1 j``; the default miter join drew spikes
+  at hairpin vertices, QA round 2 issue 20); a hidden element's dash array
+  is fitted to its own length (``item_line_props``, QA round 2 issue 2).
 
 Text size convention: the PDF font size equals ``Text.height`` (the probe's
 convention, which the layout's width estimate assumes). Vertical centring
@@ -34,7 +37,7 @@ import numpy as np
 
 from ..model import (Arc, Circle, HatchLines, LineStyle, Polygon, Polyline, Segment, Sheet, Text)
 from ..style import DEFAULT_STYLE, SheetStyle
-from . import arc_span, clean_text, fmt, line_props, valid_item
+from . import arc_span, clean_text, fmt, item_line_props, line_props, valid_item
 from .svg import polyline_points
 
 log = logging.getLogger(__name__)
@@ -157,7 +160,9 @@ class PdfWriter:
 
     # output ------------------------------------------------------------
     def to_bytes(self) -> Tuple[bytes, int]:
-        content = "\n".join(["0 0 0 RG 0 0 0 rg 0 J 0 j"] + self.ops).encode("latin-1")
+        # 0 J butt caps; 1 j ROUND joins: the default miter join (limit 10) drew spikes
+        # of several mm at hairpin vertices of mesh polylines (QA round 2 issue 20)
+        content = "\n".join(["0 0 0 RG 0 0 0 rg 0 J 1 j"] + self.ops).encode("latin-1")
         if self.compress:
             content = zlib.compress(content, 6)
             head = f"<< /Length {len(content)} /Filter /FlateDecode >>"
@@ -187,16 +192,21 @@ class PdfWriter:
         return bytes(out), len(objs)
 
 
-def _draw_item(pw: PdfWriter, item, sheet_style: SheetStyle) -> None:
+def _draw_item(pw: PdfWriter, item, sheet_style: SheetStyle) -> bool:
+    """Draw one item; True when its hidden dash pattern was fitted to its length."""
     if isinstance(item, Text):
         pw.text(float(item.position[0]), float(item.position[1]), item.text, float(item.height),
                 float(item.rotation_deg), item.anchor, item.valign)
-        return
-    width, dash = line_props(item.style, sheet_style)
+        return False
+    adapted = False
+    if isinstance(item, (Polygon, HatchLines)):
+        width, dash = line_props(item.style, sheet_style)
+    else:
+        width, dash, adapted = item_line_props(item, sheet_style)
     if isinstance(item, Polygon):
         pw.set_style(width, None)
         pw.filled_polygon(np.asarray(item.points, dtype=np.float64).reshape(-1, 2).tolist())
-        return
+        return False
     pw.set_style(width, dash)
     if isinstance(item, Segment):
         pw.line(item.a, item.b)
@@ -210,24 +220,28 @@ def _draw_item(pw: PdfWriter, item, sheet_style: SheetStyle) -> None:
                float(item.start_deg), arc_span(item.start_deg, item.end_deg))
     elif isinstance(item, HatchLines):
         pw.segments(np.asarray(item.segments, dtype=np.float64).reshape(-1, 2, 2).tolist())
+    return adapted
 
 
 def write_pdf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE,
               compress: bool = True) -> dict:
     """Write ``sheet`` as a one-page vector PDF.
 
-    Returns ``{"bytes": n, "objects": n, "skipped": n}``.
+    Returns ``{"bytes": n, "objects": n, "skipped": n, "dash_adapted": n}``;
+    ``dash_adapted`` counts the hidden elements whose dash pattern was fitted
+    to their length (``writers.adapt_dash``, QA round 2 issue 2).
     """
     pw = PdfWriter(sheet.width, sheet.height, compress=compress)
     skipped = 0
+    adapted = 0
     for item in sheet.items:
         if not valid_item(item):
             skipped += 1
             continue
-        _draw_item(pw, item, sheet_style)
+        adapted += int(bool(_draw_item(pw, item, sheet_style)))
     if skipped:
         log.warning("pdf: skipped %d degenerate or non-finite items", skipped)
     data, n_obj = pw.to_bytes()
     with open(path, "wb") as fh:
         fh.write(data)
-    return {"bytes": len(data), "objects": n_obj, "skipped": skipped}
+    return {"bytes": len(data), "objects": n_obj, "skipped": skipped, "dash_adapted": adapted}

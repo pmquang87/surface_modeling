@@ -539,7 +539,9 @@ def test_project_mesh_hidden_circle_is_one_polyline(monkeypatch):
     assert np.allclose(rad, 10.0, atol=3 * pv.stats["px"])
     assert len(_segments(pv.visible)) == 4                 # plate outline stays 4 Segments
     # negative control: without chaining the circle is dozens of chord Segments
-    monkeypatch.setattr(mesh_views, "_DASH_PERIOD_PAPER_MM", 0.0)
+    orig = mesh_views.chain_to_primitives
+    monkeypatch.setattr(mesh_views, "chain_to_primitives",
+                        lambda *a, **k: orig(*a, **dict(k, short_len=0.0, polyline_all=False)))
     pv0 = project_mesh(_plate_over_cylinder(), VIEWS["top"], raster_px=1024, feature_angle_deg=30.0,
                        organic=False)
     assert len(_segments(pv0.hidden)) >= 40
@@ -707,10 +709,23 @@ def test_section_mesh_box_centre_one_loop_in_view_coords():
     assert sv.marker_view == "top"
 
 
+def _explode(prims):
+    """Polylines as their edge Segments (hidden chains are Polylines, QA round 2 issue 9)."""
+    out = []
+    for p in prims:
+        if isinstance(p, Polyline):
+            pts = np.asarray(p.points, float).reshape(-1, 2)
+            ring = np.vstack([pts, pts[:1]]) if p.closed else pts
+            out += [Segment(tuple(a), tuple(b), p.style) for a, b in zip(ring[:-1], ring[1:])]
+        else:
+            out.append(p)
+    return out
+
+
 def _cavity_wall_segments(prims, px):
     tol = 0.5 * px
     out = []
-    for s in _segments(prims):
+    for s in _segments(_explode(prims)):
         for x in (-10.0, 10.0):
             if _on_vertical_line(s, x, tol):
                 lo, hi = _yrange(s)
@@ -1271,3 +1286,332 @@ def test_project_mesh_fine_torus_keeps_hidden_runs_shorter_than_the_outline_cove
     assert np.abs(pts[:, 0]).max() < 10.0       # inside the hole's span |x| < 7 + 3
     loops = [p for p in pv.visible if isinstance(p, Polyline) and p.closed]
     assert len(loops) == 1 and len(pv.visible) == 1
+
+
+# ------------------------------- QA round 2 issue 4: depth sign by open cavity
+
+def _pocketed_plate() -> trimesh.Trimesh:
+    """Plate 100 (X) x 12 (Y, depth) x 60 (Z): a 70 x 6 x 30 pocket opens to
+    -Y, 36 shallow 5 x 2 x 5 notches on +Y (many feature edges, little
+    cavity). Voxels of 1 x 1 x 1 scaled by (5, 2, 5)."""
+    occ = np.ones((20, 6, 12), dtype=bool)
+    occ[3:17, 0:3, 3:9] = False                       # pocket from the -Y face
+    for i in range(1, 19, 2):
+        for k in (1, 4, 7, 10):
+            occ[i, 5, k] = False                      # notches in the +Y layer
+    m = _voxel_mesh(occ, 1.0)
+    t = np.diag([5.0, 2.0, 5.0, 1.0])
+    m.apply_transform(t)
+    return m
+
+
+def test_depth_sign_mesh_keeps_the_pocket_toward_the_viewer():
+    """Round 2 issue 4 (NIST FTC 08: the engraved logo under the tray gave
+    5935 vs 5351 mm of feature edges and kept the underside)."""
+    from src.drawing.mesh_load import (cavity_depth_sign_mesh, choose_depth_sign_mesh,
+                                       score_depth_sign_mesh)
+    plate = _pocketed_plate()
+    assert plate.is_watertight and plate.volume > 0                       # precondition
+    front, back = np.array([0.0, -1.0, 0.0]), np.array([0.0, 1.0, 0.0])
+    # precondition: the feature-edge rule prefers the notched +Y side (> 1.2 x)
+    e_front, e_back = score_depth_sign_mesh(plate, front), score_depth_sign_mesh(plate, back)
+    assert e_back > 1.2 * e_front, (e_front, e_back)
+    c = cavity_depth_sign_mesh(plate, front)
+    assert c["cavity_plus"] == pytest.approx(70.0 * 30.0 * 6.0, rel=1e-9)  # the pocket
+    assert c["cavity_minus"] == pytest.approx(36 * 25.0 * 2.0, rel=1e-9)   # the notches
+    assert c["bbox_volume"] == pytest.approx(100.0 * 12.0 * 60.0)
+    r = choose_depth_sign_mesh(plate, np.eye(3))
+    assert r["flip"] is False and r["method"] == "mesh_cavity", r
+    assert r["edges_flipped"] > r["edges_kept"]
+    # the same plate turned 180 deg about Z: the pocket faces away -> flip
+    turned = plate.copy()
+    turned.apply_transform(np.diag([-1.0, -1.0, 1.0, 1.0]))
+    r2 = choose_depth_sign_mesh(turned, np.eye(3))
+    assert r2["flip"] is True and r2["method"] == "mesh_cavity"
+    assert np.allclose(r2["matrix"], np.diag([-1.0, -1.0, 1.0]))
+    # a plain box has no cavity: the feature-edge rule keeps it
+    rb = choose_depth_sign_mesh(_box(), np.eye(3))
+    assert rb["flip"] is False and rb["method"] == "mesh_feature_edges"
+    assert rb["cavity_kept"] == pytest.approx(0.0, abs=1e-9)
+    # an unreliable mesh (the pocket floor missing: open, projected areas 6000 vs
+    # 3900) is not decided by the cavity (QA corpus 22, a triangle soup: 195 %)
+    fn = plate.face_normals
+    ctr = plate.triangles_center
+    floor = (fn @ front > 0.99) & (np.abs(ctr[:, 1] - 6.0) < 1e-9)
+    assert int(floor.sum()) == 2 * 14 * 6                                 # precondition
+    holed = trimesh.Trimesh(plate.vertices, plate.faces[~floor], process=False)
+    ch = cavity_depth_sign_mesh(holed, front)
+    assert abs(ch["proj_plus"] - ch["proj_minus"]) > 0.3 * ch["proj_minus"]  # precondition
+    rh = choose_depth_sign_mesh(holed, np.eye(3))
+    assert rh["method"] == "mesh_feature_edges" and "not used" in rh["reason"]
+
+
+# ------------------- QA round 2 issue 8: inside-out mesh with a few conflicts
+
+def _inverted_sphere_one_face_back() -> trimesh.Trimesh:
+    """Icosphere (5120 faces, r 10) wound inside out except one face: 3 winding
+    conflicts, the raw signed volume 0.04 % off the repaired one."""
+    s = trimesh.creation.icosphere(subdivisions=4, radius=10.0)
+    f = s.faces[:, ::-1].copy()
+    f[0] = f[0, ::-1]
+    return trimesh.Trimesh(s.vertices.copy(), f, process=False)
+
+
+def test_census_inverted_solid_with_a_few_conflicts(tmp_path):
+    from src.drawing.mesh_load import inverted_solid_verdict
+    m = _inverted_sphere_one_face_back()
+    c = mesh_census(m)
+    # precondition: closed, conflicts present, more than the count rule allows
+    assert c["boundary_edges"] == 0 and c["winding_conflicts"] == 3
+    assert c["winding_conflicts"] > max(2, 1e-4 * 1.5 * c["triangles"])
+    assert c["inverted"] is True and c["volume_repaired"] is True
+    raw = c["volume_raw_signed_mm3"]
+    assert raw < 0.0 and abs(abs(raw) - c["volume_mm3"]) < 0.01 * c["volume_mm3"]
+    assert c["volume_raw_mm3"] == pytest.approx(abs(raw))          # unsigned key kept
+    assert c["inverted_solid"] is True          # the round-1 rule (conflicts == 0) said no
+    p = tmp_path / "inv.stl"
+    m.export(str(p))
+    mm = load_mesh_model(str(p))
+    rep = [w for w in mm.warnings if "winding-repaired" in w]
+    assert len(rep) == 1 and f"{raw:.6g}" in rep[0] and "-" in rep[0], mm.warnings
+    assert "3 winding conflict(s)" in rep[0]
+    assert sum("inside out" in w for w in mm.warnings) == 1
+    # control: a correctly wound sphere
+    ok = mesh_census(trimesh.creation.icosphere(subdivisions=4, radius=10.0))
+    assert ok["inverted"] is False and ok["inverted_solid"] is False
+    assert ok["volume_raw_signed_mm3"] > 0.0
+    # control: a badly wound box (one face of six flipped back) is not inside out
+    b = trimesh.creation.box(extents=(40, 20, 10))
+    f = b.faces[:, ::-1].copy()
+    f[:2] = f[:2, ::-1]
+    bad = mesh_census(trimesh.Trimesh(b.vertices, f, process=False))
+    assert bad["inverted"] is True and bad["winding_conflicts"] == 4       # precondition
+    assert bad["volume_raw_signed_mm3"] == pytest.approx(-8000.0 + 2 * 800.0 * 5.0 / 3.0)
+    assert bad["inverted_solid"] is False
+    q = tmp_path / "bad.stl"
+    trimesh.Trimesh(b.vertices, f, process=False).export(str(q))
+    mb = load_mesh_model(str(q))
+    assert not any("inside out" in w for w in mb.warnings)
+    assert sum("winding-repaired" in w for w in mb.warnings) == 1
+    # the count rule: 2 conflicts in 451k edges (the QA bracket) is inside out
+    assert inverted_solid_verdict({"inverted": True, "winding_conflicts": 2}, 451_000) is True
+    assert inverted_solid_verdict({"inverted": True, "winding_conflicts": 50,
+                                   "volume_raw_signed_mm3": 10.0, "volume_mm3": 10.0},
+                                  451_000) is False
+    assert inverted_solid_verdict({"inverted": False, "winding_conflicts": 0}) is False
+
+
+# ------------------------------- QA round 2 issue 3: section loop body ids
+
+def _section_front(mesh, y=10.0):
+    return section_mesh(mesh, np.array([0.0, y, 0.0]), np.array([0.0, -1.0, 0.0]), VIEWS["front"],
+                        raster_px=128, feature_angle_deg=30.0, organic=False, depth_extent=40.0)
+
+
+def test_section_mesh_loop_body_per_component():
+    from src.drawing.mesh_sections import face_components
+    two = trimesh.util.concatenate([_box((20.0, 20.0, 20.0), (-20.0, 0.0, 0.0)),
+                                    _box((10.0, 20.0, 10.0), (20.0, 0.0, 0.0))])
+    assert int(face_components(two).max()) + 1 == 2                     # precondition
+    sv = _section_front(two, y=0.0)
+    assert len(sv.loops) == 2 and sv.loop_body is not None and len(sv.loop_body) == 2
+    by_x = {round(float(L[:, 0].mean())): b for L, b in zip(sv.loops, sv.loop_body)}
+    assert by_x[-20] != by_x[20]
+    assert sorted(sv.loop_body) == [0, 1]
+    # a pin in a clearance hole of a tube (an island) keeps its own body
+    tube = trimesh.creation.annulus(r_min=6.0, r_max=10.0, height=20.0)
+    pin = trimesh.creation.cylinder(radius=4.0, height=30.0)
+    rot = trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0])
+    asm = trimesh.util.concatenate([tube, pin])
+    asm.apply_transform(rot)                                             # axes along Y
+    sv2 = _section_front(asm, y=0.0)
+    assert len(sv2.loops) == 3 and len(set(sv2.loop_body)) == 2
+
+
+def test_section_mesh_void_shell_joins_its_outer_body(monkeypatch):
+    """The cavity of a hollow box is a separate component of the vertex graph
+    but its cut loop is a hole of the outer body: one body id (else the
+    layout nests it alone and fills the void)."""
+    from src.drawing import mesh_sections
+    from src.drawing.mesh_sections import component_volumes, face_components
+    hb = _hollow_box()
+    lab = face_components(hb)
+    assert int(lab.max()) + 1 == 2                                      # precondition: 2 shells
+    vols = component_volumes(hb, lab)
+    assert sorted(np.round(vols, 6)) == [-2000.0, 48000.0]              # the cavity is inward
+    sv = _section_front(hb, y=10.0)
+    assert len(sv.loops) == 2 and sv.loop_body is not None
+    assert sv.loop_body[0] == sv.loop_body[1]
+    inner = int(np.argmin([abs(polygon_area(L)) for L in sv.loops]))
+    # loops side by side keep their bodies; an exact-fit pin (its loop coincides
+    # with the hole of the plate) keeps its body; a body inside the material
+    # of another (healed cavity, interference) joins it
+    apart = [sv.loops[0], sv.loops[1] + 100.0]
+    assert mesh_sections._merge_void_bodies(apart, [0, 1], [10.0, -1.0]) == [0, 1]
+    ids = [0, 0]
+    ids[inner] = 1
+    assert mesh_sections._merge_void_bodies(sv.loops, ids, [10.0, -5.0]) == [0, 0]
+    assert mesh_sections._merge_void_bodies(sv.loops, ids, [10.0, 5.0]) == [0, 0]
+    pin = [sv.loops[0], sv.loops[inner], sv.loops[inner][::-1].copy()]
+    assert mesh_sections._merge_void_bodies(pin, [0, 0, 1], [10.0, 5.0]) == [0, 0, 1]
+    # negative control: without the merge the cavity is a body of its own
+    monkeypatch.setattr(mesh_sections, "_merge_void_bodies", lambda loops, ids, vol=None: list(ids))
+    raw = _section_front(hb, y=10.0)
+    assert len(set(raw.loop_body)) == 2
+
+
+# =========================================== QA round 2 (task R1): issues 19 and 25
+
+def _plate_with_small_hole() -> trimesh.Trimesh:
+    """60 x 10 x 40 plate (y -5..5) with a 4 mm through hole along Y at x = z = 0."""
+    plate = trimesh.creation.box(extents=(60.0, 10.0, 40.0))
+    hole = trimesh.creation.cylinder(radius=2.0, height=30.0, sections=48)
+    hole.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2.0, [1, 0, 0]))
+    try:
+        m = plate.difference(hole)
+    except Exception as exc:  # pragma: no cover - boolean backend missing
+        pytest.skip(f"trimesh boolean not available: {exc}")
+    if m is None or len(m.faces) == 0:  # pragma: no cover
+        pytest.skip("trimesh boolean returned nothing")
+    return m
+
+
+def _loops_near(prims, centre, radius):
+    out = []
+    for p in prims:
+        if isinstance(p, Polyline) and p.closed:
+            if np.linalg.norm(np.asarray(p.points).mean(axis=0) - centre) < radius:
+                out.append(p)
+    return out
+
+
+def test_iso_keeps_a_small_through_hole_loop(monkeypatch):
+    """Issue 25: on the organic iso view the near mouth of a 4 mm hole is a closed loop of
+    about 2.5 mm on paper (scale 1:4) and fell under the 3 mm open-chain filter."""
+    from src.drawing import mesh_views
+    m = _plate_with_small_hole()
+    spec = VIEWS["iso"]
+    centre = spec.to_view(np.array([[0.0, -5.0, 0.0]]))[0, :2]       # near mouth (y = -5)
+    pv = project_mesh(m, spec, raster_px=1024, feature_angle_deg=30.0, organic=True,
+                      paper_scale=0.25)
+    loops = _loops_near(pv.visible, centre, 1.0)
+    assert len(loops) == 1
+    per = np.linalg.norm(np.diff(np.vstack([loops[0].points, loops[0].points[:1]]), axis=0),
+                         axis=1).sum()
+    assert 0.25 * per < 3.0                                       # precondition: below 3 mm
+    # negative control: with the open-chain threshold for loops the hole disappears
+    monkeypatch.setattr(mesh_views, "_ORGANIC_MIN_LOOP_PAPER_MM", 3.0)
+    pv0 = project_mesh(m, spec, raster_px=1024, feature_angle_deg=30.0, organic=True,
+                       paper_scale=0.25)
+    assert _loops_near(pv0.visible, centre, 1.0) == []
+    assert pv0.stats["closed_loops_dropped"] > pv.stats["closed_loops_dropped"]
+
+
+def _box_with_sliver() -> trimesh.Trimesh:
+    """20 x 10 x 20 box whose front face (y = -5) holds a sliver triangle along its
+    diagonal: a vertex 1e-5 beside the diagonal midpoint and 1e-4 out of the plane."""
+    box = trimesh.creation.box(extents=(20.0, 10.0, 20.0))
+    V = np.array(box.vertices, dtype=float)
+    F = np.array(box.faces, dtype=np.int64)
+    front = [i for i, f in enumerate(F) if np.allclose(V[f, 1], -5.0)]
+    assert len(front) == 2
+    t0, t1 = F[front[0]], F[front[1]]
+    shared = [v for v in t0 if v in t1]                           # the diagonal
+    p0, p2 = shared
+    p1 = [v for v in t0 if v not in shared][0]
+    mid = 0.5 * (V[p0] + V[p2])
+    diag = (V[p2] - V[p0]) / np.linalg.norm(V[p2] - V[p0])
+    perp = np.cross(diag, [0.0, -1.0, 0.0])
+    toward_p1 = np.sign(np.dot(V[p1] - mid, perp)) * perp
+    v_new = mid + 1e-5 * toward_p1 + np.array([0.0, -1e-4, 0.0])
+    V = np.vstack([V, v_new])
+    k = len(V) - 1
+    keep = [f for i, f in enumerate(F) if i != front[0]]
+    # t0 = (p0, p1, p2) split into (p0, p1, k), (k, p1, p2) and the sliver (p0, k, p2):
+    # each is t0 with one vertex replaced by k, so it keeps t0's winding
+    new = [[k if v == missing else v for v in t0] for missing in (p2, p0, p1)]
+    return trimesh.Trimesh(V, np.vstack([np.array(keep), np.array(new)]), process=False)
+
+
+def test_sliver_triangle_adds_no_edge_inside_the_box(monkeypatch):
+    """Issue 19: a near-degenerate triangle has no reliable normal; its dihedral with
+    the face it lies in is spurious and drew a sharp edge across the front face."""
+    from src.drawing import mesh_views
+    m = _box_with_sliver()
+    assert m.is_watertight
+
+    def inside(pv):
+        out = []
+        for p in pv.visible + pv.hidden:
+            pts = np.asarray(p.points if isinstance(p, Polyline) else [p.a, p.b], float)
+            mid = 0.5 * (pts[:-1] + pts[1:]) if len(pts) > 1 else pts
+            if np.any((np.abs(mid[:, 0]) < 9.9) & (np.abs(mid[:, 1]) < 9.9)):
+                out.append(p)
+        return out
+
+    monkeypatch.setattr(mesh_views, "_SLIVER_REL", 0.0)               # precondition
+    pv0 = project_mesh(m, VIEWS["front"], raster_px=512, feature_angle_deg=30.0, organic=False)
+    assert inside(pv0)
+    monkeypatch.setattr(mesh_views, "_SLIVER_REL", 1e-5)
+    pv = project_mesh(m, VIEWS["front"], raster_px=512, feature_angle_deg=30.0, organic=False)
+    assert inside(pv) == []
+    assert pv.stats["n_sliver_pairs"] == 3
+    assert len(_segments(pv.visible)) == 4                          # the outline only
+
+
+def test_fine_cylinder_faces_are_not_slivers():
+    """The triage's inradius / longest-edge < 0.02 test would flag every side face of a
+    256-section cylinder (ratio 0.004); the altitude test flags none."""
+    from src.drawing.mesh_views import _degenerate_faces
+    cyl = trimesh.creation.cylinder(radius=10.0, height=30.0, sections=256)
+    v = cyl.vertices[cyl.faces]
+    e = np.linalg.norm(v[:, [1, 2, 0]] - v, axis=2)
+    ratio = (2.0 * cyl.area_faces / e.sum(axis=1)) / e.max(axis=1)
+    assert np.count_nonzero(ratio < 0.02) >= 512                  # all 512 side faces
+    assert not _degenerate_faces(cyl).any()
+
+
+def test_weld_joins_raster_broken_rim_pieces(monkeypatch):
+    """Issue 19: a jittered fine cylinder's rim breaks into pieces a chord or two apart;
+    welding dangling ends within 0.3 mm on paper joins them before the chain filter."""
+    from src.drawing import mesh_views
+    from src.drawing.geometry2d import chain_paths, primitives_to_segments
+    cyl = trimesh.creation.cylinder(radius=10.0, height=30.0, sections=256)
+    rng = np.random.default_rng(0)
+    cyl.vertices = cyl.vertices + rng.normal(0.0, 0.2 * 20.0 / 1024, cyl.vertices.shape)
+
+    def chains(pv):
+        o, c = chain_paths(primitives_to_segments(pv.visible, 0.01), 1e-6)
+        return len(o) + len(c)
+
+    monkeypatch.setattr(mesh_views, "_WELD_PAPER_MM", 0.0)
+    pv0 = project_mesh(cyl, VIEWS["top"], raster_px=1024, feature_angle_deg=30.0, organic=False,
+                       paper_scale=1.0)
+    monkeypatch.setattr(mesh_views, "_WELD_PAPER_MM", 0.3)
+    pv = project_mesh(cyl, VIEWS["top"], raster_px=1024, feature_angle_deg=30.0, organic=False,
+                      paper_scale=1.0)
+    assert pv0.stats["welded_ends"] == 0 and pv.stats["welded_ends"] >= 5
+    assert chains(pv) <= chains(pv0) - 5
+
+
+def test_section_mesh_fitted_pin_with_other_tessellation_keeps_its_body():
+    """Review of issue 3: an exact-fit pin tessellated differently from its
+    hole (48 vs 64 sections, turned 0.05 rad) has a cut loop that differs
+    from the hole's by up to the sagitta. It coincides with the hole (the
+    tolerance follows the polygons' own sagitta), so it keeps its body
+    instead of joining the tube as a void, which would draw it white."""
+    tube = trimesh.creation.annulus(r_min=5.0, r_max=10.0, height=20.0, sections=64)
+    pin = trimesh.creation.cylinder(radius=5.0, height=30.0, sections=48)
+    pin.apply_transform(trimesh.transformations.rotation_matrix(0.05, [0, 0, 1]))
+    asm = trimesh.util.concatenate([tube, pin])
+    asm.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
+    sv = _section_front(asm, y=0.0)
+    assert len(sv.loops) == 3 and sv.loop_body is not None
+    circ = sorted(((abs(polygon_area(L)), L, b) for L, b in zip(sv.loops, sv.loop_body)),
+                  key=lambda t: t[0])[:2]
+    # precondition: the hole and the pin loops are different polygons of r5
+    boxes = [np.concatenate([L.min(axis=0), L.max(axis=0)]) for _, L, _ in circ]
+    assert float(np.max(np.abs(boxes[0] - boxes[1]))) > 1e-3
+    assert all(abs(a - np.pi * 25.0) < 0.5 for a, _, _ in circ)
+    assert circ[0][2] != circ[1][2], sv.loop_body              # pin and tube: two bodies
+    assert len(set(sv.loop_body)) == 2

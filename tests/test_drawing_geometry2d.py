@@ -488,9 +488,15 @@ def test_dedupe_primitives_keeps_distinct():
              Polyline(np.array([[2, 0], [1, 1], [0, 0]], float)),
              Text((0, 0), "A", 3.5), Text((0, 0), "A", 3.5)]
     out = g2.dedupe_primitives(prims, 1e-6)
-    # arcs: 0..90 and 360..450 are the same arc; circles: one duplicate;
-    # segments differ by style; polylines reversed duplicate; Text untouched
-    assert len(out) == 2 + 2 + 2 + 1 + 2
+    # arcs: 0..90 and 360..450 are the same arc, and since QA round 2 issue 18 every
+    # arc lying on the same-style Circle(c, 3) is covered by it (0 arcs left);
+    # circles: one duplicate; segments differ by style; polylines reversed
+    # duplicate; Text untouched
+    assert len(out) == 0 + 2 + 2 + 1 + 2
+    assert not any(isinstance(p, Arc) for p in out)
+    # without the covering circle the two distinct arcs stay
+    arcs_only = g2.dedupe_primitives(prims[:3], 1e-6)
+    assert len(arcs_only) == 2
 
 
 # ----------------------------------------------------- primitives_to_segments
@@ -750,8 +756,12 @@ def test_chain_to_primitives_polyline_for_short_chords_segments_for_long_edges()
                                  short_len=3.75)
     polys = [p for p in out if isinstance(p, Polyline)]
     segs = [p for p in out if isinstance(p, Segment)]
-    assert len(polys) == 1 and len(polys[0].points) == 49 and not polys[0].closed
-    assert len(segs) == 5                                 # 4 box edges + the stub
+    # QA round 2 issue 9: the box loop (4 long edges) is ONE closed Polyline too
+    arcs = [p for p in polys if not p.closed]
+    boxes = [p for p in polys if p.closed]
+    assert len(arcs) == 1 and len(arcs[0].points) == 49
+    assert len(boxes) == 1 and len(boxes[0].points) == 4
+    assert len(segs) == 1                                 # the stub (2-point chain)
     assert all(p.style == LineStyle.HIDDEN for p in out)
     # min_chain_len drops the stub only
     out2 = g2.chain_to_primitives(np.concatenate([chords, box, stub]), LineStyle.HIDDEN, 1e-6,
@@ -916,3 +926,166 @@ def test_subtract_covered_min_len_is_separate_from_the_cover_tolerance():
     left = g2.subtract_covered(hid, vis2, tol, min_len=1e-3)
     assert len(left) == 1 and _seg_lengths(left)[0] == pytest.approx(0.2, abs=1e-9)
     assert len(g2.subtract_covered(hid, vis2, tol)) == 0                     # old default
+
+
+# ------------------------------------------- QA round 2 issue 9: chains -> Polylines
+
+def test_chain_to_primitives_long_chord_chain_is_one_polyline():
+    """A circle sampled by 30 chords of 4.2 mm (all longer than one 3.75 mm dash
+    period) was written as 30 Segments, so the dash restarted on every chord."""
+    t = np.linspace(0.0, 2.0 * np.pi, 31)[:-1]
+    pts = np.stack([20.0 * np.cos(t), 20.0 * np.sin(t)], 1)
+    ring = np.stack([pts, np.roll(pts, -1, axis=0)], 1)
+    chord = float(_seg_lengths(ring).min())
+    assert chord > 3.75                                   # precondition: no short chord
+    out = g2.chain_to_primitives(ring, LineStyle.HIDDEN, 1e-6, short_len=3.75)
+    assert len(out) == 1 and isinstance(out[0], Polyline) and out[0].closed
+    assert len(out[0].points) == 30
+    # an L-shaped 3-point chain of two 50 mm edges is one open Polyline
+    L = np.array([[[0.0, 0.0], [50.0, 0.0]], [[50.0, 0.0], [50.0, 50.0]]])
+    out = g2.chain_to_primitives(L, LineStyle.HIDDEN, 1e-6, short_len=3.75)
+    assert len(out) == 1 and isinstance(out[0], Polyline) and not out[0].closed
+    assert len(out[0].points) == 3
+    # an exactly straight 3-point chain is one Segment from end to end
+    st = np.array([[[0.0, 0.0], [10.0, 0.0]], [[10.0, 0.0], [30.0, 0.0]]])
+    out = g2.chain_to_primitives(st, LineStyle.VISIBLE, 1e-6, short_len=3.75)
+    assert len(out) == 1 and isinstance(out[0], Segment)
+    assert sorted([out[0].a[0], out[0].b[0]]) == pytest.approx([0.0, 30.0])
+    assert out[0].style == LineStyle.VISIBLE
+    # solid styles keep the round-1 rule: a visible long-chord ring stays 30 Segments,
+    # unless polyline_all is asked for explicitly
+    out = g2.chain_to_primitives(ring, LineStyle.VISIBLE, 1e-6, short_len=3.75)
+    assert len(out) == 30 and all(isinstance(p, Segment) for p in out)
+    out = g2.chain_to_primitives(ring, LineStyle.VISIBLE, 1e-6, short_len=3.75, polyline_all=True)
+    assert len(out) == 1 and isinstance(out[0], Polyline)
+
+
+# ---------------------------------- QA round 2 issue 18: hidden curves on visible ones
+
+def test_dedupe_drops_hidden_arcs_covered_by_a_hidden_circle():
+    """05/07: a hidden Circle plus two hidden semicircle Arcs on it all survived."""
+    c = (135.0, 39.5)
+    circ = Circle(c, 1.0, LineStyle.HIDDEN)
+    a1 = Arc(c, 1.0, 270.0, 90.0, LineStyle.HIDDEN)
+    a2 = Arc(c, 1.0, 90.0, 270.0, LineStyle.HIDDEN)
+    vis_arc = Arc(c, 1.0, 0.0, 90.0, LineStyle.VISIBLE)
+    out = g2.dedupe_primitives([a1, circ, a2, vis_arc], 1e-6)
+    assert out == [circ, vis_arc]                      # other style: kept
+    # an arc of another radius or centre is kept
+    off = Arc((135.0, 41.0), 1.0, 0.0, 90.0, LineStyle.HIDDEN)
+    big = Arc(c, 1.5, 0.0, 90.0, LineStyle.HIDDEN)
+    assert g2.dedupe_primitives([circ, off, big], 1e-6) == [circ, off, big]
+
+
+def _ellipse(a, b, n=64, closed=True):
+    t = np.linspace(0.0, 2.0 * np.pi, n + 1)
+    t = t[:-1] if closed else t
+    return np.stack([a * np.cos(t), b * np.sin(t)], 1)
+
+
+def test_subtract_covered_curves_drops_trims_and_keeps():
+    vis = Polyline(_ellipse(20.0, 10.0), True, LineStyle.VISIBLE)
+    cover = g2.primitives_to_segments([vis], 0.01)
+    on = Polyline(_ellipse(20.0, 10.0) + [0.0, 0.01], True, LineStyle.HIDDEN)
+    arc_on = Arc((40.0, 0.0), 5.0, 0.0, 180.0, LineStyle.HIDDEN)
+    vis_circle = Polyline(_ellipse(5.0, 5.0, 48) + [40.0, 0.0], True, LineStyle.VISIBLE)
+    cover = np.concatenate([cover, g2.primitives_to_segments([vis_circle], 0.01)])
+    # half of this hidden arc lies on a visible half circle polyline
+    half = Arc((0.0, 60.0), 5.0, 0.0, 180.0, LineStyle.HIDDEN)
+    t = np.linspace(0.0, 0.5 * np.pi, 25)
+    cover = np.concatenate([cover, g2.primitives_to_segments(
+        [Polyline(np.stack([5.0 * np.cos(t), 60.0 + 5.0 * np.sin(t)], 1), False)], 0.01)])
+    free = Polyline(np.array([[100.0, 0.0], [110.0, 5.0], [120.0, 0.0]]), False, LineStyle.HIDDEN)
+    # a hidden open polyline: the upper half of the ellipse, then a bent tail off it
+    upper = _ellipse(20.0, 10.0, 64, closed=False)[:33] + [0.0, 0.01]
+    tail = Polyline(np.vstack([upper, [[-30.0, -10.0], [-30.0, -25.0]]]), False, LineStyle.HIDDEN)
+    curves = [on, arc_on, half, free, tail]
+    # precondition: at the geometric tolerance nothing is covered
+    kept0, st0 = g2.subtract_covered_curves(curves, cover, 1e-4, deflection=0.01)
+    assert len(kept0) == 5 and st0["dropped"] == 0 and st0["trimmed"] == 0
+    kept, st = g2.subtract_covered_curves(curves, cover, 0.05, deflection=0.01, min_len=1e-4)
+    ids = [id(k) for k in kept]
+    assert id(on) not in ids and id(arc_on) not in ids and id(tail) not in ids
+    assert id(free) in ids                              # untouched object kept as is
+    assert st["dropped"] == 2 and st["trimmed"] == 2
+    rest = [p for p in kept if isinstance(p, Polyline) and p is not free]
+    assert len(rest) == 1 and len(rest[0].points) == 3 and rest[0].style == LineStyle.HIDDEN
+    ends = rest[0].points[[0, -1]]
+    if ends[0][1] < ends[1][1]:                         # chain direction is arbitrary
+        ends = ends[::-1]
+    assert ends[1] == pytest.approx([-30.0, -25.0])
+    assert np.linalg.norm(ends[0] - [-20.0, 0.0]) < 0.1
+    arcs = [p for p in kept if isinstance(p, Arc)]
+    assert len(arcs) == 1 and arcs[0].style == LineStyle.HIDDEN
+    assert arcs[0].start_deg % 360.0 == pytest.approx(90.0, abs=1.0)
+    assert arcs[0].end_deg % 360.0 == pytest.approx(180.0, abs=1e-6)
+    assert arcs[0].radius == pytest.approx(5.0) and arcs[0].center == pytest.approx((0.0, 60.0))
+
+
+# ------------------------------- QA round 2 issues 19 / 25: mesh chain clean-up helpers
+
+def _ring_segments(pts):
+    return np.stack([pts, np.roll(pts, -1, axis=0)], 1)
+
+
+def test_chain_to_primitives_closed_loops_get_their_own_threshold():
+    t = np.linspace(0.0, 2.0 * np.pi, 25)[:-1]
+    small = np.stack([0.4 * np.cos(t), 0.4 * np.sin(t)], 1)            # perimeter 2.5
+    ring = _ring_segments(small)
+    stub = np.array([[[10.0, 0.0], [11.0, 0.5]], [[11.0, 0.5], [12.0, 0.0]]])   # open, 2.2
+    segs = np.concatenate([ring, stub])
+    st = {}
+    old = g2.chain_to_primitives(segs, LineStyle.VISIBLE, 1e-6, short_len=3.75, min_chain_len=3.0,
+                                 stats=st)
+    assert old == [] and st == {"open_dropped": 1, "closed_dropped": 1, "hairpins_removed": 0}
+    st = {}
+    out = g2.chain_to_primitives(segs, LineStyle.VISIBLE, 1e-6, short_len=3.75, min_chain_len=3.0,
+                                 min_closed_len=1.0, stats=st)
+    assert len(out) == 1 and isinstance(out[0], Polyline) and out[0].closed
+    assert st["closed_dropped"] == 0 and st["open_dropped"] == 1
+
+
+def test_simplify_chain_removes_hairpins_and_collinear_points():
+    pts = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0], [10.3, 0.05],     # 10 deg spike
+                    [10.0, 0.1], [20.0, 0.1], [20.0, 10.0]])
+    out, n = g2.simplify_chain(pts, False, 0.01, max_len=1.0)
+    assert n >= 1
+    assert out[0] == pytest.approx([0.0, 0.0]) and out[-1] == pytest.approx([20.0, 10.0])
+    a, b = out[:-2] - out[1:-1], out[2:] - out[1:-1]
+    cosang = np.einsum("ij,ij->i", a, b) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1))
+    assert np.degrees(np.arccos(np.clip(cosang, -1, 1))).min() >= 20.0   # no hairpin left
+    a0, b0 = pts[:-2] - pts[1:-1], pts[2:] - pts[1:-1]                 # precondition: the
+    c0 = np.einsum("ij,ij->i", a0, b0) / (np.linalg.norm(a0, axis=1) * np.linalg.norm(b0, axis=1))
+    assert np.degrees(np.arccos(np.clip(c0, -1, 1))).min() < 20.0       # input had a hairpin
+    assert not any(np.allclose(p, [5.0, 0.0]) for p in out)            # DP drops collinear
+    # a real 90 degree corner and a long acute wedge (edges > max_len) stay
+    wedge = np.array([[0.0, 0.0], [50.0, 5.0], [0.0, 10.0]])
+    w, nw = g2.simplify_chain(wedge, False, 0.01, max_len=1.0)
+    assert nw == 0 and len(w) == 3
+    # closed: a square keeps its 4 corners
+    sq, ns = g2.simplify_chain(_square(0, 0, 10, 10), True, 0.01, max_len=1.0)
+    assert ns == 0 and len(sq) == 4
+
+
+def test_weld_chain_ends_joins_gaps_but_never_collapses_fine_curves():
+    # a circle broken into two arcs by two 0.2 gaps
+    t1 = np.linspace(0.01, np.pi - 0.01, 40)
+    t2 = np.linspace(np.pi + 0.01, 2.0 * np.pi - 0.01, 40)
+    a1 = np.stack([10.0 * np.cos(t1), 10.0 * np.sin(t1)], 1)
+    a2 = np.stack([10.0 * np.cos(t2), 10.0 * np.sin(t2)], 1)
+    segs = np.concatenate([np.stack([a1[:-1], a1[1:]], 1), np.stack([a2[:-1], a2[1:]], 1)])
+    opened, closed = g2.chain_paths(segs, 1e-6)
+    assert len(opened) == 2 and not closed                             # precondition: broken
+    welded, n = g2.weld_chain_ends(segs, 1e-6, 0.3)
+    assert n == 2
+    opened, closed = g2.chain_paths(welded, 1e-6)
+    assert not opened and len(closed) == 1 and len(closed[0]) == 78
+    # a fine circle (chords 0.1 < weld tol 0.3) is untouched: no dangling ends
+    t = np.linspace(0.0, 2.0 * np.pi, 629)[:-1]
+    fine = _ring_segments(np.stack([10.0 * np.cos(t), 10.0 * np.sin(t)], 1))
+    w2, n2 = g2.weld_chain_ends(fine, 1e-6, 0.3)
+    assert n2 == 0 and np.allclose(w2, fine)
+    # the two ends of one short segment are never welded together
+    w3, n3 = g2.weld_chain_ends(np.array([[[0.0, 0.0], [0.1, 0.0]], [[5.0, 5.0], [9.0, 5.0]]]),
+                                1e-6, 0.3)
+    assert n3 == 0 and len(w3) == 2
