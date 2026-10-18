@@ -510,22 +510,19 @@ on the same load: `load_step` 61.0 -> 20.5 s, one view with hidden lines
 
 ## Measured numbers
 
-QA corpus run 3 (30 real-world files: NIST CTC/FTC PMI test parts, Pro/E, NX,
+QA corpus run 4 (30 real-world files: NIST CTC/FTC PMI test parts, Pro/E, NX,
 Inventor, SolidWorks, FreeCAD, KiCad, CadQuery and OCCT exports, trimesh models,
 scans and a topology-optimised bracket; sandboxed with `--timeout 300`
 (`sandbox.timeout_s` 300 in every report), the memory limit and the other
-limits at their defaults, on a shared machine: single re-runs were about 40 %
-faster, so these wall times include load from other jobs): 28 drawings, 2
-rejected inputs (empty and truncated STL, exit 1 in
-0.3 s), exit codes 12 × 0 / 16 × 2 / 2 × 1; median wall time 8.3 s over the 28
-drawn files, 101 s for the 15 MB / 211-solid Inventor assembly (hidden lines,
-section and cross-part dimensions omitted and flagged; 34 % of the 300 s
-timeout and 42 % of its 240 s run deadline, and still under the 144 s run
-deadline of the default 180 s timeout, at 70 % of it), 33 s for the
-554k-triangle wheel; peak RSS median 326 MB, 713 MB on the assembly, 1193 MB on
-the wheel (limit 2048 MB). Every DXF re-read with 0 audit errors and 0 fixes,
-every PDF opened by PyMuPDF without repair, every SVG parsed. Rendered examples:
-`docs/examples/`.
+limits at their defaults, on a quiet machine after three QA/fix rounds):
+28 drawings, 2 rejected inputs (empty and truncated STL, exit 1 in 0.3 s), exit
+codes 12 × 0 / 16 × 2 / 2 × 1; median wall time 5.9 s over the 28 drawn files,
+63 s for the 15 MB / 211-solid Inventor assembly (hidden lines, section and
+cross-part dimensions omitted and flagged; 44 % of the 144 s run deadline of
+the default 180 s timeout), 26 s for the 554k-triangle wheel; peak RSS median
+327 MB, 716 MB on the assembly, 1195 MB on the wheel (limit 2048 MB). Every DXF
+re-read with 0 audit errors and 0 fixes, every PDF opened by PyMuPDF without
+repair, every SVG parsed. Rendered examples: `docs/examples/`.
 
 HLR (front view, this machine):
 

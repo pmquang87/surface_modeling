@@ -82,7 +82,7 @@ Decide, do not pretend. An STL is unusable as a B-rep when it is organic (nothin
 - `docs/lessons_from_stl2step.md`: a measured review of a comparable C++/OpenCASCADE converter.
 - Background: FEM simulation (OpenRadioss, LS-DYNA), CNC and machine-tool engineering; Python tooling for solver automation and post-processing.
 
-## Numbers from the real-world QA corpus (30 files, third run after two fix rounds)
+## Numbers from the real-world QA corpus (30 files, final run after three QA/fix rounds)
 
 | | |
 |---|---|
@@ -90,8 +90,8 @@ Decide, do not pretend. An STL is unusable as a B-rep when it is organic (nothin
 | Drawings produced | 28; the 2 rejections are the empty STL ("empty STL (0 facets)") and the truncated binary STL ("header declares 3476 triangles, file holds 3475.8"), both exit 1 with a `RESULT` line |
 | Exit codes | 12 clean (0), 16 with warning flags (2: inch units, multiple bodies, non-watertight or inverted meshes, unit suspicion, assembly drawn without hidden lines and without a section), 2 failed (1) |
 | Routes | 15 STEP B-rep, 1 tessellated-only STEP routed to the mesh path, 5 STL → faceted STEP → B-rep, 7 STL mesh route |
-| Wall time per file (sandboxed, imports included) | median 8.3 s; 101 s for the 15 MB / 211-solid Inventor assembly (was killed at 300 s before the performance work); 33 s for the 554k-triangle wheel |
-| Peak memory | median 326 MB; 1.19 GB on the 554k-triangle wheel; 713 MB on the assembly |
+| Wall time per file (sandboxed, imports included, quiet machine) | median 5.9 s; 63 s for the 15 MB / 211-solid Inventor assembly (killed at 300 s before the performance work); 26 s for the 554k-triangle wheel |
+| Peak memory | median 327 MB; 1.2 GB on the 554k-triangle wheel; 716 MB on the assembly |
 | Output checks | all 28 DXF files re-read with 0 audit errors and 0 fixes; all PDFs open in PyMuPDF without repair; all SVGs parse with the sheet viewBox |
 | NIST reference check | CTC-01 overall 800 × 450 × 150 and callouts 4 × Ø35, 4 × Ø25, 2 × Ø20 match the NIST drawing; CTC-02 2 × Ø100 / 2 × Ø52 and FTC-07 8 × Ø6.35 (= 8 × Ø.250) match; inch files converted and flagged |
 
