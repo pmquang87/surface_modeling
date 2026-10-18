@@ -1507,13 +1507,15 @@ def test_section_hatch_small_region_gets_lines_or_fill():
     sec.loop_body = [0, 0, 1]
     items, stats = _section_items(sec, (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 121.5, 40))
     hatches = [i for i in items if isinstance(i, HatchLines)]
-    assert len(hatches) == 2
-    by_loop = {round(float(h.loops[0][:, 0].min()), 6): h for h in hatches}
-    assert len(by_loop[x0].segments) >= 2
-    assert stats["hatch_spacings"][0] == 3.0                     # the big region keeps the section spacing
+    # QA round 3 issue 1: one spacing per body - the 4 mm island of the big region's body is
+    # not hatched at its own t / 3 any more; at the body's 3 mm it gets at most one line, so
+    # it is filled (the "fewer than 2 hatch lines" guard): lines OR fill, never a 2nd spacing
+    assert len(hatches) == 1 and stats["hatch_spacings"] == [3.0]
     fills = [i for i in items if isinstance(i, Polygon)]
-    assert len(fills) == 1 and np.allclose(fills[0].points, tiny) and stats["filled_regions"] == 1
+    filled_x = sorted(round(float(f.points[:, 0].min()), 6) for f in fills)
+    assert filled_x == [x0, 120.0] and stats["filled_regions"] == 2
     assert stats["hatch_spacing"] == 3.0 and stats["loops"] == 3
+    assert stats["body_spacing"] == [3.0, None]
 
 
 def test_section_thin_strip_is_filled_at_any_angle():
@@ -1589,7 +1591,8 @@ def test_section_thin_region_in_a_thick_body_is_hatched_not_filled():
     assert not [i for i in items if isinstance(i, Polygon)]      # one part, one treatment
     hatches = [i for i in items if isinstance(i, HatchLines)]
     assert len(hatches) == 2 and all(len(h.segments) >= 2 for h in hatches)
-    assert stats["fill"] == "hatch" and stats["hatch_spacings"] == [3.0, pytest.approx(0.7)]
+    # QA round 3 issue 1: one spacing for the whole body (round 2 drew the strip at 0.7 mm)
+    assert stats["fill"] == "hatch" and stats["hatch_spacings"] == [3.0, 3.0]
     two = _sec_of([big, strip], bodies=[0, 1])                   # control: the strip as its own body
     items2, stats2 = _section_items(two, (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 80, 51.5))
     assert len([i for i in items2 if isinstance(i, Polygon)]) == 1 and stats2["fill"] == "mixed"
@@ -1894,25 +1897,33 @@ def test_marker_with_bands_on_its_side_has_no_connector_across_them():
     center = [i for i in sh.items if isinstance(i, Segment) and i.style == LineStyle.CENTER]
     assert center == []
     tb = _geom_box(res, views, "top")
-    first_line = tb.xmin - ST.dim_first_offset
+    outer_line = tb.xmin - ST.dim_first_offset - (k_left - 1) * ST.dim_pitch
     wide_left = [i for i in sh.items if isinstance(i, Segment) and i.style == LineStyle.CUTTING
                  and abs(i.a[1] - i.b[1]) < 1e-9 and max(i.a[0], i.b[0]) < tb.xmin]
     assert len(wide_left) == 1
-    assert min(wide_left[0].a[0], wide_left[0].b[0]) > first_line   # stops before the first dimension line
-    assert max(wide_left[0].a[0], wide_left[0].b[0]) == pytest.approx(tb.xmin - 1.5)
-    # the letter sits beyond the arrow head, not on the first dimension line, and no dimension
-    # line or text is touched by any marker item (extension lines run parallel to this cutting
-    # line; an arrow shaft crossing one at a right angle is accepted)
+    # QA round 3 issue 5: round 2 kept this end inside the first band zone and let its arrow
+    # shaft cross the extension lines of the left bands at a right angle; now the end moves past
+    # the outermost dimension line (its overshoot and text) instead
+    from src.drawing.layout import _collinear_sides, _item_hits_segment, _marker_geometry, _marker_items
+    boxes = {k: v.bbox for k, v in views.items()}
+    geo = _marker_geometry(sec, views, boxes)
+    old = _marker_items(geo, res.placements["top"][0], res.scale, ST, "A", band_counts(plan)["top"],
+                        _collinear_sides(geo, plan, res.scale))
+    dim_segs = [sh.items[i] for g in sh.meta["dimension_items"] for i in g if isinstance(sh.items[i], Segment)]
+    assert any(_item_hits_segment(m, s.a, s.b) for m in old for s in dim_segs)   # precondition: round 2 touched
+    assert max(wide_left[0].a[0], wide_left[0].b[0]) < outer_line
+    # no dimension line or text is touched by any marker item
     letters = [t for t in sh.items if isinstance(t, Text) and t.text == "A"]
     dims = [sh.items[i] for g in sh.meta["dimension_items"] for i in g]
     marker = [i for i in sh.items if getattr(i, "style", None) == LineStyle.CUTTING] + letters
     for m in marker:
         mb = BBox2D.of_primitives([m])
         for d in dims:
-            if isinstance(d, Segment) and abs(d.a[1] - d.b[1]) > 1e-9:
+            if isinstance(d, Segment):
                 assert not _seg_hits_box(d, mb.expanded(0.1)), (m, d)
             elif isinstance(d, Text):
                 assert not _boxes_overlap(BBox2D.of_primitives([d]), mb), (m, d)
+        _assert_inside(mb, res.placements["top"][1], ("marker", m))
 
 
 # ---- issue 17 (room part): a text wider than its span goes outside, inside the rect --
@@ -2126,3 +2137,292 @@ def test_section_finned_body_with_a_thick_base_is_hatched_not_filled():
     items2, stats2 = _section_items(_sec_of([thin]), (0.0, 0.0), 1.0, ST, BBox2D(0, 0, 100, 31.5))
     assert len([i for i in items2 if isinstance(i, Polygon)]) == 1 and stats2["fill"] == "solid"
     assert stats2["thick_core_bodies"] == 0
+
+
+# =========================================================================
+# QA round 3 (task Z1): issues 1, 4, 5, 8
+# =========================================================================
+
+def _measured_spacing(h):
+    """Perpendicular distance between adjacent lines of a HatchLines item (independent of the
+    layout's own bookkeeping)."""
+    segs = np.asarray(h.segments, float)
+    d = segs[:, 1] - segs[:, 0]
+    i = int(np.argmax(np.hypot(d[:, 0], d[:, 1])))
+    th = math.atan2(d[i, 1], d[i, 0])
+    nrm = np.array([-math.sin(th), math.cos(th)])
+    offs = np.unique(np.round(0.5 * (segs[:, 0] + segs[:, 1]) @ nrm, 6))
+    diffs = np.diff(offs)
+    return float(diffs[diffs > 1e-4].min())
+
+
+# ---- issue 1: one hatch spacing per body ---------------------------------------------
+
+def test_z1_issue1_square_and_strip_of_one_body_share_one_spacing():
+    from src.drawing.layout import _section_items
+    from src.drawing.style import thin_region_spacing
+    square, strip = _sq(0, 0, 40, 40), _sq(50, 0, 3, 40)
+    t_strip = 2 * 120.0 / 86.0
+    assert thin_region_spacing(3.0, t_strip) < 3.0                # precondition: round 2 drew 0.93 mm here
+    items, stats = _section_items(_sec_of([square, strip], bodies=[0, 0]), (0.0, 0.0), 1.0, ST,
+                                  BBox2D(0, 0, 53, 40))
+    hatches = [i for i in items if isinstance(i, HatchLines)]
+    assert len(hatches) == 2 and not [i for i in items if isinstance(i, Polygon)]
+    assert len(set(stats["hatch_spacings"])) == 1
+    measured = {round(_measured_spacing(h), 3) for h in hatches}
+    assert measured == {3.0}, measured
+    assert stats["hatch_spacing"] == 3.0 and stats["body_spacing"] == [3.0]
+    # control: as two bodies the strip may keep its own spacing (one part, one hatch - per part)
+    _, two = _section_items(_sec_of([square, strip], bodies=[0, 1]), (0.0, 0.0), 1.0, ST,
+                            BBox2D(0, 0, 53, 40))
+    assert len(set(two["body_spacing"])) == 2 and two["hatch_spacing"] == min(two["body_spacing"])
+
+
+def test_z1_issue1_narrow_ring_in_a_thick_body_takes_the_body_spacing_not_a_denser_one():
+    from src.drawing.layout import BODY_NARROW_SHARE, _section_items
+    from src.drawing.style import region_fill_below, thin_region_spacing
+    ring = _ring(10.0, 8.0, c=(60.0, 15.0))                      # 2.0 mm wide annulus
+    sq = _sq(0, 0, 30, 30)
+    items, stats = _section_items(_sec_of([sq] + ring, bodies=[0, 0, 0]), (0.0, 0.0), 1.0, ST,
+                                  BBox2D(0, 0, 70, 30))
+    s = stats["nominal_hatch_spacing"]
+    t_ring = 10.0 - 8.0                                           # 2A/P of an annulus
+    a_ring, a_sq = math.pi * (10.0 ** 2 - 8.0 ** 2), 900.0
+    # preconditions: the ring is NOT filled by the 1.4 mm rule, it is narrow (t < 2 s), round 2
+    # gave it its own denser spacing t / 3, and it holds too little of the body to set the spacing
+    assert region_fill_below() <= t_ring < 2.0 * s
+    assert thin_region_spacing(s, t_ring) < s - 1e-6
+    assert a_ring < BODY_NARROW_SHARE * (a_ring + a_sq)
+    hatches = [i for i in items if isinstance(i, HatchLines)]
+    assert len(hatches) == 2 and not [i for i in items if isinstance(i, Polygon)], stats
+    assert stats["fill"] == "hatch" and stats["hatch_spacings"] == [s, s]
+    measured = {round(_measured_spacing(h), 3) for h in hatches}
+    assert measured == {round(s, 3)}, measured                    # one part, one hatch spacing
+    # control: a 0.9 mm ring (below 1.4 mm) is filled; the square keeps the body spacing
+    thin = _ring(10.0, 9.1, c=(60.0, 15.0))
+    items2, stats2 = _section_items(_sec_of([sq] + thin, bodies=[0, 0, 0]), (0.0, 0.0), 1.0, ST,
+                                    BBox2D(0, 0, 70, 30))
+    h2 = [i for i in items2 if isinstance(i, HatchLines)]
+    assert len(h2) == 1 and len([i for i in items2 if isinstance(i, Polygon)]) == 1
+    assert stats2["fill"] == "mixed" and round(_measured_spacing(h2[0]), 3) == round(s, 3)
+
+
+def test_z1_issue1_narrow_regions_holding_most_of_the_body_set_its_spacing():
+    from src.drawing.layout import BODY_NARROW_SHARE, _section_items
+    walls = [_sq(0, 0, 3, 40), _sq(20, 0, 3, 40), _sq(40, 0, 6, 6)]
+    areas = [120.0, 120.0, 36.0]
+    assert sum(areas[:2]) > BODY_NARROW_SHARE * sum(areas)        # precondition: narrow majority
+    items, stats = _section_items(_sec_of(walls, bodies=[0, 0, 0]), (0.0, 0.0), 1.0, ST,
+                                  BBox2D(0, 0, 46, 40))
+    hatches = [i for i in items if isinstance(i, HatchLines)]
+    assert len(hatches) == 3
+    s = {round(_measured_spacing(h), 3) for h in hatches}
+    assert len(s) == 1 and next(iter(s)) == pytest.approx(2 * 120.0 / 86.0 / 3.0, abs=2e-3)
+
+
+# ---- issue 4: the letter sits the same way at both ends of the cutting line --------
+
+def _marker_case(counts):
+    from src.drawing.layout import _marker_geometry, _marker_items
+    views = _box_views(50.0, 30.0, 10.0, iso=False)
+    sec = SectionView(VIEWS["front"], np.array([25.0, 15.0, 5.0]), np.array([0.0, -1.0, 0.0]),
+                      [np.array([[0, 0], [50, 0], [50, 10], [0, 10]], float)], None, label="A",
+                      marker_view="top")
+    boxes = {k: v.bbox for k, v in views.items()}
+    geo = _marker_geometry(sec, views, boxes)
+    assert geo is not None and geo[0] == "top"
+    return geo, _marker_items(geo, (0.0, 0.0), 1.0, ST, "A", counts)
+
+
+def _letter_offsets(geo, items):
+    _, _p2, d2, a2, _clip = geo
+    out = []
+    for k, outward in ((0, -d2), (1, d2)):
+        part = items[4 * k:4 * k + 4]
+        tip = np.asarray(next(i for i in part if isinstance(i, Polygon)).points[0], float)
+        c = np.asarray(next(i for i in part if isinstance(i, Text)).position, float)
+        rel = c - tip
+        out.append((round(float(rel @ outward), 6), round(float(rel @ a2), 6)))
+    return out
+
+
+def test_z1_issue4_marker_letter_is_placed_the_same_at_both_ends():
+    geo, items = _marker_case((1, 0, 0, 0))
+    _, _, _, _, (_t0, s0, _t1, s1) = geo
+    assert {s0, s1} == {"left", "right"}                          # precondition: bands on one end only
+    a, b = _letter_offsets(geo, items)
+    assert a == b, (a, b)
+    # control: without bands both ends were already alike (letter above the arrow)
+    geo0, items0 = _marker_case((0, 0, 0, 0))
+    a0, b0 = _letter_offsets(geo0, items0)
+    assert a0 == b0 and a0 != a
+
+
+# ---- issue 5: the marker never touches an extension or dimension line ---------------
+
+def _thin_top_plane_case():
+    views = _box_views(60.0, 20.0, 10.0, iso=False)
+    plan = plan_dimensions(views, [], DrawingOptions(), ST, np.array([60.0, 20.0, 10.0]))
+    sec = SectionView(VIEWS["top"], np.array([30.0, 10.0, 8.5]), np.array([0.0, 0.0, -1.0]),
+                      [np.array([[0, 0], [60, 0], [60, 20], [0, 20]], float)], None, label="A",
+                      marker_view="front")
+    return views, plan, sec
+
+
+def test_z1_issue5_marker_moves_past_the_bands_when_it_would_cross_an_extension_line():
+    from src.drawing.layout import _marker_geometry, _marker_items, _segments_intersect
+    views, plan, sec = _thin_top_plane_case()
+    h = [d for d in plan.dims if d.view == "front" and d.angle_deg == 90.0]
+    assert len(h) == 1                                            # precondition: the height dim, left
+    res, _, _ = _compose(views=views, section=sec, plan=plan)
+    sh = res.sheet
+    assert sh.meta["marker_view"] == "front"
+    groups = sh.meta["dimension_items"]
+    dim_segs = [sh.items[i] for g in groups for i in g if isinstance(sh.items[i], Segment)]
+    letters = [t for t in sh.items if isinstance(t, Text) and t.text == "A"]
+    marker = [i for i in sh.items if getattr(i, "style", None) == LineStyle.CUTTING]
+    assert len(letters) == 2 and marker
+    # precondition: the round 2 placement (arrow at 6 mm, inside the first band) crosses the
+    # top extension line of the height dim at this scale
+    boxes = {k: v.bbox for k, v in views.items()}
+    geo = _marker_geometry(sec, views, boxes)
+    (ox, oy), _ = res.placements["front"]
+    old = _marker_items(geo, (ox, oy), res.scale, ST, "A", band_counts(plan)["front"])
+    assert any(_segments_intersect(m.a, m.b, s.a, s.b) for m in old if isinstance(m, Segment)
+               for s in dim_segs)
+    for m in marker:
+        for s in dim_segs:
+            if isinstance(m, Segment):
+                assert not _segments_intersect(m.a, m.b, s.a, s.b), (m, s)
+            else:
+                assert not _seg_hits_box(s, BBox2D.of_primitives([m])), (m, s)
+    for t in letters:
+        tb = BBox2D.of_primitives([t])
+        assert not [s for s in dim_segs if _seg_hits_box(s, tb)], t
+        _assert_inside(tb, res.placements["front"][1], "letter")
+    for m in marker:
+        _assert_inside(BBox2D.of_primitives([m]), res.placements["front"][1], ("marker", m))
+
+
+# ---- issue 8: texts crossed by dimension lines count as collisions ------------------
+
+def test_z1_issue8_text_crossed_by_a_foreign_dimension_line_is_a_collision():
+    from src.drawing.layout import text_collisions
+    t = Text((100.0, 100.0), "4 x Ø10 counterbore", 3.5)
+    seg = Segment((110.0, 90.0), (110.0, 120.0), LineStyle.DIMENSION)
+    miss = Segment((200.0, 90.0), (200.0, 120.0), LineStyle.DIMENSION)
+    items = [t, seg, miss]
+    assert text_collisions(items, [0], []) == []                  # precondition: the old accounting
+    out = text_collisions(items, [0], [], groups=[[0], [1], [2]])
+    assert len(out) == 1 and "crossed by a dimension line" in out[0], out
+    assert text_collisions(items, [0], [], groups=[[0, 1], [2]]) == []   # its own line: fine
+    # the section marker crossing a dimension line is a collision too
+    mk = Segment((105.0, 80.0), (115.0, 80.0), LineStyle.CUTTING)
+    dl = Segment((110.0, 70.0), (110.0, 85.0), LineStyle.DIMENSION)
+    out2 = text_collisions([mk, dl], [], [0], groups=[[1]])
+    assert len(out2) == 1 and "section marker" in out2[0], out2
+
+
+def test_z1_issue8_compose_counts_line_crossings_in_the_remaining_collisions():
+    views = _box_views(100.0, 40.0, 15.0, iso=False)
+    # the 100 sits in band 0 with its text at x = 50; the 50 is forced OUTSIDE it (band 1), so
+    # its extension line at x = 50 runs through the 100's text
+    dims = [Dimension("linear", "100", 100.0, p1=(0.0, 0.0), p2=(100.0, 0.0), base=(50.0, 0.0),
+                      angle_deg=0.0, view="front"),
+            Dimension("linear", "50", 50.0, p1=(0.0, 0.0), p2=(50.0, 0.0), base=(25.0, 0.0),
+                      angle_deg=0.0, view="front")]
+    plan = DimensionPlan(dims=dims, undimensioned=[], bands=[("bottom", 0), ("bottom", 1)])
+    res, _, _ = _compose(views=views, section=None, plan=plan)
+    sh = res.sheet
+    groups = sh.meta["dimension_items"]
+    recount = 0
+    for k, g in enumerate(groups):
+        t = next(sh.items[i] for i in g if isinstance(sh.items[i], Text))
+        tb = BBox2D.of_primitives([t]).expanded(-0.2)
+        foreign = [sh.items[i] for kk, gg in enumerate(groups) if kk != k for i in gg
+                   if isinstance(sh.items[i], Segment)]
+        recount += int(any(_seg_hits_box(s, tb) for s in foreign))
+    assert recount == 1                                           # precondition: one crossed text
+    tc = sh.meta["text_collisions"]
+    assert tc["text_line_crossings"] == recount and tc["marker_dimension_crossings"] == 0
+    assert tc["remaining"] >= recount
+    assert any(f[0] == "layout_text_collision" and f[1] == "warning" for f in res.flags)
+    # control: in plan order (the 50 nearer the view) nothing is crossed
+    plan2 = DimensionPlan(dims=dims, undimensioned=[], bands=[("bottom", 1), ("bottom", 0)])
+    res2, _, _ = _compose(views=views, section=None, plan=plan2)
+    assert res2.sheet.meta["text_collisions"]["text_line_crossings"] == 0
+
+
+def test_z1_issue8_callout_leaves_its_rect_rather_than_sit_on_a_dimension_line():
+    from src.drawing.layout import _callout_candidate, _resolve_text_collisions, _segment_hits_box
+    from src.drawing.model import Sheet
+    geom, rect = BBox2D(100, 100, 140, 140), BBox2D(90, 90, 150, 150)
+    d = Dimension("diameter", "Ø4", 4.0, center=(120.0, 120.0), radius=2.0, base=(120.0, 120.0),
+                  leader_angle_deg=45.0, view="v")
+    d = _callout_candidate(d, 45.0, 0.0, geom, ST)
+    # a foreign dimension group: vertical lines every 1.5 mm over the whole placement rect, so
+    # every candidate inside the rect has a line through its text
+    grid = [Segment((x, 90.0), (x, 150.0), LineStyle.DIMENSION) for x in np.arange(90.0, 150.01, 1.5)]
+    fdim = Dimension("linear", "x", 1.0, p1=(0.0, 0.0), p2=(1.0, 0.0), base=(0.5, 0.0), angle_deg=0.0,
+                     view="v")
+    rendered = render_dimension(d, ST)
+    items = list(rendered) + grid
+    sheet = Sheet("A3", 420.0, 297.0)
+    sheet.dimensions = [d, fdim]
+    groups = [list(range(len(rendered))), list(range(len(rendered), len(items)))]
+
+    def text_crossed():
+        t = next(items[i] for i in groups[0] if isinstance(items[i], Text))
+        tb = BBox2D.of_primitives([t]).expanded(-0.2)
+        return any(_segment_hits_box(s.a, s.b, tb) for s in grid), tb
+    assert text_crossed()[0]                                      # precondition: planned text on lines
+    stats = _resolve_text_collisions(items, sheet, groups, [], [], {"v": geom}, {"v": rect},
+                                     BBox2D(10, 10, 410, 287), [], ST)
+    crossed, tb = text_crossed()
+    assert stats["callouts_moved"] == 1 and not crossed, tb
+    assert not (rect.xmin <= tb.xmin and tb.xmax <= rect.xmax and rect.ymin <= tb.ymin and tb.ymax <= rect.ymax)
+    # ... but never into another view's placement rect: block the spot it took
+    items2 = list(rendered) + grid
+    sheet2 = Sheet("A3", 420.0, 297.0)
+    sheet2.dimensions = [d, fdim]
+    other = tb.expanded(3.0)
+    _resolve_text_collisions(items2, sheet2, groups, [], [], {"v": geom}, {"v": rect, "w": other},
+                             BBox2D(10, 10, 410, 287), [], ST)
+    t2 = BBox2D.of_primitives([next(items2[i] for i in groups[0] if isinstance(items2[i], Text))])
+    assert not (t2.xmin < other.xmax and t2.xmax > other.xmin and t2.ymin < other.ymax and t2.ymax > other.ymin)
+
+
+# ---- issue 24: a narrow-span outside text is not put past a neighbour's extension line --
+
+def test_z1_issue24_outside_text_goes_to_the_free_side_not_past_a_neighbour():
+    from src.drawing.layout import _ext_index, _outside_high
+    from src.drawing.model import text_corners
+    s = 0.2                                                       # 1:5, as on NIST FTC 07
+    d12 = Dimension("linear", "12.93", 12.93, p1=(0.0, 0.0), p2=(12.93, 0.0), base=(6.0, 0.0),
+                    angle_deg=0.0, view="front")
+    d35 = Dimension("linear", "35.15", 35.15, p1=(0.0, 0.0), p2=(35.15, 0.0), base=(17.0, 0.0),
+                    angle_deg=0.0, view="front")
+    d100 = Dimension("linear", "100", 100.0, p1=(0.0, 0.0), p2=(100.0, 0.0), base=(50.0, 0.0),
+                     angle_deg=0.0, view="front")
+    plan = DimensionPlan(dims=[d12, d35, d100], undimensioned=[],
+                         bands=[("bottom", 0), ("bottom", 1), ("bottom", 2)])
+    bb = BBox2D(0.0, 0.0, 100.0, 60.0)
+    tw = BBox2D.from_points(text_corners(Text((0, 0), "12.93", ST.text_height))).width
+    assert tw + 2 * ST.dim_text_gap > s * 12.93                   # precondition: the text goes outside
+    reach = ST.arrow_length + 2.0
+    x35 = s * 35.15
+    # precondition: the 35.15 extension line lies between the 12.93 span and its text on the high
+    # end (round 2 counted only lines INSIDE the text box and went high on the room rule)
+    assert s * 12.93 < x35 < s * 12.93 + reach + tw
+    high = _outside_high(d12, ("bottom", 0), bb, s, ST, _ext_index(plan))
+    assert high is False                                          # the free side: past the datum end
+    # control: without the 35.15 the room rule decides (more room past the high end)
+    plan2 = DimensionPlan(dims=[d12, d100], undimensioned=[], bands=[("bottom", 0), ("bottom", 1)])
+    assert _outside_high(d12, ("bottom", 0), bb, s, ST, _ext_index(plan2)) is True
+    # the free side must really be free: with bands on the left side the low end runs into their
+    # corner (measured on FTC 07: both 12.93 texts went there and overlapped), so it is not taken
+    v = Dimension("linear", "12.93", 12.93, p1=(0.0, 0.0), p2=(0.0, 12.93), base=(0.0, 6.0),
+                  angle_deg=90.0, view="front")
+    plan3 = DimensionPlan(dims=[d12, d35, d100, v], undimensioned=[],
+                          bands=[("bottom", 0), ("bottom", 1), ("bottom", 2), ("left", 0)])
+    assert _outside_high(d12, ("bottom", 0), bb, s, ST, _ext_index(plan3)) is True

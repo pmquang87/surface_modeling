@@ -72,23 +72,31 @@ Conventions of this module (no standard behind them):
   off view outlines and off foreign dimension lines wins (QA issue 8).
   Texts that still overlap afterwards give the flag
   ``layout_text_collision`` (WARNING since round 2 issue 10: overprinted
-  dimensions); texts the pass moved give ``layout_text_moved`` (info);
-  ``sheet.meta["text_collisions"]`` counts the moves.
+  dimensions), and so do (round 3 issue 8) texts crossed by a line of
+  another dimension and section-marker items touching a dimension line
+  (``text_collisions(..., groups=...)``); texts the pass moved give
+  ``layout_text_moved`` (info); ``sheet.meta["text_collisions"]`` counts the
+  moves and the collisions left (``remaining``, ``text_overlaps``,
+  ``text_line_crossings``, ``marker_dimension_crossings``).
 * Scale-dependent room (``min_mm_fn`` of ``choose_scale``): a linear
   dimension whose sheet span is shorter than two arrows + 0.5 mm is drawn
   with the arrows outside and its line ``arrow_length + 2`` mm longer at
   both ends (``dimensions._render_linear``); a value text that does not
   fit between the extension lines is placed outside, beyond the arrow, by
-  the layout itself (``_outside_high``: the end whose text box no outer
-  band's extension line crosses, then the end with more room inside the
-  view; round 2 issue 17). That reach, the rendered section marker
+  the layout itself (``_outside_high``: the end with no extension line of
+  this or an outer band between the span and the far end of the text, then
+  the end with more room inside the view; round 2 issue 17, round 3 issue
+  24). That reach, the rendered section marker
   (``_marker_room``) and the rendered callouts (``_callout_room``) are
   reserved at each candidate scale.
 * Section marker and dimension bands (round 2 issue 14): the marker never
   crosses a dimension line. With bands on the side the cutting line leaves
   through, the wide dash ends ``MARKER_BAND_CLEAR`` before the first
   dimension line, the arrow stays ``MARKER_ARROW_AT`` out and the letter
-  goes beyond the arrow head (round 1 moved the arrow past the bands and
+  goes beyond the arrow head, at both ends alike (round 3 issue 4); when
+  that arrow or letter would touch an extension or dimension line, the end
+  moves past the bands as below (round 3 issue 5, ``_marker_past_sides``)
+  (round 1 moved the arrow past the bands and
   joined it with a narrow chain across every dimension and extension
   line). When an extension line of that side lies on the cutting line
   (the plane through a dimensioned hole centre), that end moves past the
@@ -144,9 +152,10 @@ Conventions of this module (no standard behind them):
   (overflow on A3 if nothing fits).
 * Hidden lines are not drawn in the iso view; the section body shows its
   visible edges only. Hatch: one ``HatchLines`` per region (outer loop
-  with its holes), ``hatch_spacing`` of the section's shorter extent ON THE
-  SHEET for every region at least two spacings thick, ``t / 3`` (at least
-  0.7 mm) for thinner ones; fill or hatch is decided per BODY
+  with its holes), ONE spacing per body (QA round 3 issue 1): ``hatch_spacing``
+  of the section's shorter extent ON THE SHEET, or ``t / 3`` (at least
+  0.7 mm) of its narrow regions when those hold more than 20 % of the body's
+  area (``_body_hatch_spacing``); fill or hatch is decided per BODY
   (``SectionView.loop_body``) from its mean thickness ``t = 2A/P``: below
   2.1 mm the body is filled (keyhole ``Polygon``, holes stay open), so one
   wall is never half black, half hatched (round 2 issue 3). Body k is
@@ -1294,6 +1303,34 @@ def _section_bodies(section: SectionView, loops: List[np.ndarray]) -> List[Tuple
     return [(b, groups[b]) for b in order]
 
 
+#: QA round 3 issue 1: the narrow regions of a hatched body (2A/P below two section
+#: spacings, at least ``region_fill_below``) lower the body's ONE spacing only when they
+#: hold more than this share of its area; otherwise they are hatched at the section spacing
+#: (and filled when that leaves fewer than ``HATCH_MIN_SEGMENTS`` lines)
+BODY_NARROW_SHARE = 0.2
+
+
+def _body_hatch_spacing(spacing: float, thicknesses: Sequence[float], areas: Sequence[float]) -> float:
+    """The one hatch spacing of a hatched body (QA round 3 issue 1, ISO 128-50: one part, one hatch).
+
+    ``thicknesses`` / ``areas``: 2A/P and material area of each region (sheet mm). The
+    section ``spacing``, unless the narrow regions (``region_fill_below() <= t < 2 x
+    spacing``; thinner ones are filled anyway) hold more than ``BODY_NARROW_SHARE`` of
+    the body's area: then the smallest ``thin_region_spacing`` of those regions (t / 3,
+    at least ``HATCH_MIN_REGION``). Round 2 chose the spacing per region, so a narrow
+    strip of one solid got 0.75-1.95 mm next to its 3 mm hatch.
+    """
+    s = float(spacing)
+    total = float(sum(max(float(a), 0.0) for a in areas))
+    narrow = [(float(t), max(float(a), 0.0)) for t, a in zip(thicknesses, areas)
+              if region_fill_below() <= float(t) < 2.0 * s]
+    if not narrow or total <= _EPS:
+        return s
+    if sum(a for _, a in narrow) <= BODY_NARROW_SHARE * total:
+        return s
+    return float(min(thin_region_spacing(s, t) for t, _ in narrow))
+
+
 def _section_items(section: SectionView, origin: Point, scale: float, style: SheetStyle,
                    geom: BBox2D) -> Tuple[List[SheetItem], dict]:
     """Section outlines, hatch per region (outer loop with its holes), body edges, A-A label.
@@ -1305,10 +1342,14 @@ def _section_items(section: SectionView, origin: Point, scale: float, style: She
     w whatever its shape, an annulus its radial width). A body with ``t`` below
     ``style.section_fill_below()`` (2.1 mm) is filled solid (ISO 128-50
     blackened thin section); otherwise every region of the body is hatched
-    (one part, one treatment: a wall is never half black, half hatched). The
-    section spacing ``hatch_spacing`` of the shorter extent of all loops is
-    used for every region at least two spacings thick; a thinner region gets
-    ``thin_region_spacing`` (t / 3, at least 0.7 mm). Round 1 (per region,
+    (one part, one treatment: a wall is never half black, half hatched). QA
+    round 3 issue 1: a hatched body has ONE spacing (``_body_hatch_spacing``):
+    the section spacing ``hatch_spacing`` of the shorter extent of all loops,
+    or ``thin_region_spacing`` (t / 3, at least 0.7 mm) of its narrow regions
+    when those hold more than ``BODY_NARROW_SHARE`` of the body's area (a thin
+    ring alone gets t / 3); ``stats["body_spacing"]`` lists it per body (None
+    for a filled body) and ``stats["hatch_spacing"]`` is the drawn spacing
+    (the smallest when bodies differ). Round 1 (per region,
     bbox and hull caliper) filled the straight piece of a wall and hatched its
     L piece, and kept 3 mm hatching on a 0.8 mm ring.
     Review R4 guards: a thin body is still hatched when more than
@@ -1316,8 +1357,9 @@ def _section_items(section: SectionView, origin: Point, scale: float, style: She
     the material (``_thick_core_fraction``: fins pull 2A/P down, the thick base
     must not go black; counted in ``stats["thick_core_bodies"]``); a region of
     a hatched body with its own t below ``region_fill_below()`` (1.4 mm), or
-    with fewer than ``HATCH_MIN_SEGMENTS`` hatch lines, is filled (a 0.8 mm
-    island with one hatch line reads as an empty pocket), giving ``"mixed"``.
+    with fewer than ``HATCH_MIN_SEGMENTS`` hatch lines at the body's spacing, is
+    filled (a 0.8 mm island with one hatch line reads as an empty pocket),
+    giving ``"mixed"``.
     Issue 28: bodies are ranked by id; body k is hatched at 45 degrees (k even)
     or 135 degrees (k odd), with a half-spacing phase shift for k = 2, 3 mod 4,
     so adjacent parts of an assembly read apart.
@@ -1325,7 +1367,7 @@ def _section_items(section: SectionView, origin: Point, scale: float, style: She
     items: List[SheetItem] = []
     stats = {"hatch_segments": 0, "hatch_spacing": None, "loops": 0, "hatch_spacings": [],
              "filled_regions": 0, "fill": None, "filled_area_fraction": 0.0, "bodies": 0,
-             "body_thickness": [], "hatch_angles": [], "thick_core_bodies": 0}
+             "body_thickness": [], "hatch_angles": [], "thick_core_bodies": 0, "body_spacing": []}
     off = np.array([float(origin[0]), float(origin[1])])
     loops = [np.asarray(lp, dtype=float).reshape(-1, 2) * scale + off for lp in section.loops if np.size(lp)]
     bodies = [(b, nest_loops(lps)) for b, lps in _section_bodies(section, loops)] if loops else []
@@ -1362,12 +1404,14 @@ def _section_items(section: SectionView, origin: Point, scale: float, style: She
                     items.append(Polygon(_keyhole(outer, holes), LineStyle.SECTION))
                     stats["filled_regions"] += 1
                 area_filled += a_sum
+                stats["body_spacing"].append(None)
                 continue
             angle = 45.0 if rank % 2 == 0 else 135.0
-            for (outer, holes), (a_r, p_r) in zip(nested, metrics):
-                t = 2.0 * a_r / p_r if p_r > _EPS else 0.0
-                s = thin_region_spacing(spacing, t)
-                phase = 0.5 * s if (rank // 2) % 2 == 1 else 0.0
+            ts = [2.0 * a_r / p_r if p_r > _EPS else 0.0 for a_r, p_r in metrics]
+            s = _body_hatch_spacing(spacing, ts, [m[0] for m in metrics])
+            phase = 0.5 * s if (rank // 2) % 2 == 1 else 0.0
+            body_hatched = False
+            for (outer, holes), (a_r, _p_r), t in zip(nested, metrics, ts):
                 region = [outer] + list(holes)
                 try:
                     segs = hatch_lines(region, s, angle, phase)
@@ -1375,9 +1419,9 @@ def _section_items(section: SectionView, origin: Point, scale: float, style: She
                     log.warning("layout: hatch failed (%s)", exc)
                     segs = np.zeros((0, 2, 2))
                 # review R4: a tiny island of a hatched body (t < 1.4 mm, or fewer than 2 hatch
-                # lines) reads as an empty pocket when hatched; it is filled unless it has a
-                # thick core (fins on a thick base)
-                if (t < region_fill_below() or (len(segs) < HATCH_MIN_SEGMENTS and t < fill_below)) \
+                # lines at the body's spacing) reads as an empty pocket when hatched; it is
+                # filled unless it has a thick core (fins on a thick base)
+                if (t < region_fill_below() or len(segs) < HATCH_MIN_SEGMENTS) \
                         and _thick_core_fraction([(outer, holes)], fill_below) <= THICK_CORE_FRACTION:
                     items.append(Polygon(_keyhole(outer, holes), LineStyle.SECTION))
                     stats["filled_regions"] += 1
@@ -1388,8 +1432,14 @@ def _section_items(section: SectionView, origin: Point, scale: float, style: She
                 stats["hatch_angles"].append(float(angle))
                 n_segs += int(len(segs))
                 n_hatched += 1
+                body_hatched = True
+            stats["body_spacing"].append(float(s) if body_hatched else None)
         fill = ("solid" if n_hatched == 0 else "hatch" if stats["filled_regions"] == 0 else "mixed")
-        stats.update(hatch_segments=n_segs, hatch_spacing=spacing, loops=len(ordered), fill=fill,
+        drawn = [v for v in stats["body_spacing"] if v is not None]
+        # QA round 3 issue 1: the report gives the DRAWN spacing (the single value when every
+        # hatched body agrees, else the smallest); None when nothing is hatched
+        stats.update(hatch_segments=n_segs, hatch_spacing=(min(drawn) if drawn else None),
+                     nominal_hatch_spacing=spacing, loops=len(ordered), fill=fill,
                      bodies=len(bodies),
                      filled_area_fraction=float(area_filled / area_all) if area_all > _EPS else 0.0)
     if section.body is not None:
@@ -1479,16 +1529,25 @@ def _marker_items(geo, origin: Point, scale: float, style: SheetStyle, label: st
     """Cutting-line marker: per end a wide dash, an arrow (shaft + head) and the letter.
 
     See ``_marker_end`` for the positions along the line; ``collinear``: the
-    sides where an extension line lies on the cutting line
-    (``_collinear_sides``).
+    sides whose end goes past the dimension bands (``_marker_past_sides``: an
+    extension line on the cutting line, or one the arrow or letter would
+    cross). The letter is placed the same way at both ends (QA round 3 issue
+    4): beside the arrow tip when either end has it there, else above the
+    arrow.
     """
     _, p2, d2, a2, (t0, s0, t1, s1) = geo
     off = np.array([float(origin[0]), float(origin[1])])
     items: List[SheetItem] = []
     h = style.label_height
+    ends = []
     for t, side, outward in ((t0, s0, -d2), (t1, s1, d2)):
         e = off + scale * (p2 + t * d2)
-        start, end, at, beside = _marker_end(style, int(counts[SIDES.index(side)]), side in collinear)
+        ends.append((e, outward) + _marker_end(style, int(counts[SIDES.index(side)]), side in collinear))
+    # QA round 3 issue 4: ONE letter placement for the marker - beside the arrow tip when
+    # either end needs it (bands on that side), else above the arrow - so the two ends of
+    # one cutting line read alike
+    beside = any(end[5] for end in ends)
+    for e, outward, start, end, at, _own in ends:
         items.append(Segment(_pt2(e + start * outward), _pt2(e + end * outward), LineStyle.CUTTING))
         s = e + at * outward
         tip = s + style.section_arrow_len * a2
@@ -1504,6 +1563,65 @@ def _marker_items(geo, origin: Point, scale: float, style: SheetStyle, label: st
     return items
 
 
+def _view_dimension_segments(name: str, plan: DimensionPlan, boxes: Dict[str, BBox2D], scale: float,
+                              style: SheetStyle) -> List[Segment]:
+    """Extension and dimension line ``Segment`` s of the linear dims of view ``name``, rendered as
+    ``compose`` renders them (band offsets, outside texts) with the view origin at (0, 0)."""
+    bb = boxes.get(name)
+    if bb is None or not plan.dims:
+        return []
+    geom = BBox2D(scale * bb.xmin, scale * bb.ymin, scale * bb.xmax, scale * bb.ymax)
+    ext_index = _ext_index(plan)
+    out: List[Segment] = []
+    for d, band in zip(plan.dims, _resolved_bands(plan)):
+        if d.view != name or d.kind != "linear":
+            continue
+        try:
+            ds = _dim_to_sheet(d, band, (0.0, 0.0), scale, geom, style)
+            go_high = _outside_high(d, band, bb, scale, style, ext_index)
+            off = _outside_text_offset(ds, geom, style, go_high) if go_high is not None else 0.0
+            off = float(ds.text_offset or 0.0) or off
+            if off != float(ds.text_offset or 0.0):
+                ds = dataclasses.replace(ds, text_offset=off)
+            out += [it for it in render_dimension(ds, style) if isinstance(it, Segment)]
+        except Exception as exc:              # a check only: never lose the sheet over it
+            log.debug("layout: dimension segments of %r failed (%s)", d.text, exc)
+    return out
+
+
+def _marker_past_sides(geo, plan: DimensionPlan, boxes: Dict[str, BBox2D], style: SheetStyle, label: str,
+                       scale: float, counts: Tuple[int, int, int, int]) -> set:
+    """Sides whose marker end goes past the dimension bands (``_marker_end`` collinear branch).
+
+    ``_collinear_sides`` (an extension line on the cutting line) plus, QA round 3
+    issue 5, every side with bands whose marker end (dash, arrow shaft, head or
+    letter) touches an extension or dimension line of the marker view's linear
+    dims: the arrow at ``MARKER_ARROW_AT`` runs across the first band zone,
+    parallel to the band side, and crossed the extension lines of a dim whose
+    measured point lies near the cutting line. ``compose`` and ``_marker_room``
+    both use it, so the room ``choose_scale`` reserves is the drawn marker.
+    """
+    sides = set(_collinear_sides(geo, plan, scale))
+    name = geo[0]
+    segs = _view_dimension_segments(name, plan, boxes, scale, style)
+    if not segs:
+        return sides
+    _, _p2, _d2, _a2, (_t0, s0, _t1, s1) = geo
+    for _round in range(2):                   # the letter mode follows both ends (issue 4)
+        items = _marker_items(geo, (0.0, 0.0), scale, style, label, counts, sides)
+        half = len(items) // 2
+        added = False
+        for side, part in ((s0, items[:half]), (s1, items[half:])):
+            if side in sides or int(counts[SIDES.index(side)]) <= 0:
+                continue
+            if any(_item_hits_segment(it, s.a, s.b) for it in part for s in segs):
+                sides.add(side)
+                added = True
+        if not added:
+            break
+    return sides
+
+
 def _marker_room(marker, plan: DimensionPlan, boxes: Dict[str, BBox2D], style: SheetStyle, label: str
                  ) -> Callable[[float], Dict[str, Sides]]:
     """``scale -> {marker view: sides}``: sheet mm the rendered marker reaches beyond the view outline."""
@@ -1516,7 +1634,7 @@ def _marker_room(marker, plan: DimensionPlan, boxes: Dict[str, BBox2D], style: S
         bb = boxes[name]
         geom = BBox2D(scale * bb.xmin, scale * bb.ymin, scale * bb.xmax, scale * bb.ymax)
         items = _marker_items(marker, (0.0, 0.0), scale, style, label, counts,
-                              _collinear_sides(marker, plan, scale))
+                              _marker_past_sides(marker, plan, boxes, style, label, scale, counts))
         box = BBox2D.of_primitives(items)
         if box is None:
             return {}
@@ -1679,9 +1797,10 @@ def _resolve_text_collisions(items: List[SheetItem], sheet: Sheet, groups: List[
     another text, or whose text sits on the marker, tries the leader
     angles 45 / 135 / -45 / -135 and longer leaders; a candidate must keep
     its text off every other text and the marker and inside the frame
-    (``allowed``, off ``blocked``); among those the one inside its view's
-    placement rect, off every view outline and off other dimension lines,
-    with the shortest leader, wins. ``items`` and ``sheet.dimensions`` are
+    (``allowed``, off ``blocked``); among those the ranking is (QA round 3
+    issue 8): out of every other view's placement rect, off other dimension
+    lines, inside its own view's rect, off every view outline, then the
+    shortest leader. ``items`` and ``sheet.dimensions`` are
     updated in place (same item count per dimension). Returns counts.
     """
     stats = {"linear_text_shifted": 0, "callouts_moved": 0, "unresolved": 0}
@@ -1778,7 +1897,15 @@ def _resolve_text_collisions(items: List[SheetItem], sheet: Sheet, groups: List[
     outlines = list(geoms.values())
 
     def callout_score(k: int, rendered: List[SheetItem], t: Text, others: List[BBox2D], rect, e: int, ai: int):
-        """None when the placement is not allowed, else (out of rect, on outlines, on lines, e, ai)."""
+        """None when the placement is not allowed, else (into another view's rect, on lines,
+        out of its own rect, on outlines, leader length, ai).
+
+        QA round 3 issue 8: a text crossed by another dimension's line is a collision of the
+        sheet (layout_text_collision); it now ranks before leaving the own placement rect
+        into free paper (measured on NIST FTC 10: the only in-rect spot for '8 x Ø2.5' put
+        it on the 27 extension line below the view; a clean spot past the view's lower right
+        corner, outside the rect, is taken instead), but never before running into another
+        view's rect."""
         if callout_clash(k, rendered, t, others):
             return None
         tb = _box_of(t)
@@ -1786,12 +1913,15 @@ def _resolve_text_collisions(items: List[SheetItem], sheet: Sheet, groups: List[
             return None
         boxes_r = [b for b in (_box_of(it) for it in rendered) if b is not None]
         out_rect = 0 if (rect is None or all(_inside(b, rect.expanded(1e-6)) for b in boxes_r)) else 1
+        foreign_rects = [r for name, r in rects.items() if name != sheet.dimensions[k].view]
+        into_other = 1 if out_rect and any(_overlaps(b, r) for b in boxes_r for r in foreign_rects) else 0
         on_outline = sum(1 for o in outlines if _overlaps(tb, o))
         foreign = [items[i] for kk, segs in dim_segments.items() if kk != k for i in segs]
-        on_lines = sum(1 for s in foreign if _segment_hits_box(s.a, s.b, tb))
+        inner = tb.expanded(-LINE_CROSS_SHRINK)
+        on_lines = sum(1 for s in foreign if _segment_hits_box(s.a, s.b, inner))
         leader = next((it for it in rendered if isinstance(it, Segment)), None)
         length = math.hypot(leader.b[0] - leader.a[0], leader.b[1] - leader.a[1]) if leader is not None else 0.0
-        return (out_rect, on_outline, on_lines, round(length, 3), ai)
+        return (into_other, on_lines, out_rect, on_outline, round(length, 3), ai)
 
     for _pass in range(2):
         for k, ds in enumerate(sheet.dimensions):
@@ -1804,7 +1934,7 @@ def _resolve_text_collisions(items: List[SheetItem], sheet: Sheet, groups: List[
             others = other_text_boxes(k)
             rect = rects.get(ds.view)
             now = callout_score(k, [items[i] for i in g], items[ti], others, rect, 0, 0)
-            if now is not None and now[:3] == (0, 0, 0):
+            if now is not None and now[:4] == (0, 0, 0, 0):
                 continue                      # clean as planned
             geom = geoms[ds.view]
             angles = [float(ds.leader_angle_deg)] + [a for a in LEADER_ANGLES
@@ -1818,7 +1948,7 @@ def _resolve_text_collisions(items: List[SheetItem], sheet: Sheet, groups: List[
                     score = callout_score(k, rendered, t, others, rect, e, ai)
                     if score is not None and (best is None or score < best[0]):
                         best = (score, cand, rendered)
-                if best is not None and best[0][:3] == (0, 0, 0) and extra > best[0][3]:
+                if best is not None and best[0][:4] == (0, 0, 0, 0) and extra > best[0][4]:
                     break                     # every longer leader is longer than the clean best
             if best is None:
                 if now is None:
@@ -1831,9 +1961,25 @@ def _resolve_text_collisions(items: List[SheetItem], sheet: Sheet, groups: List[
     return stats
 
 
-def text_collisions(items: Sequence[SheetItem], texts_idx: Sequence[int], marker_idx: Sequence[int]) -> List[str]:
-    """Descriptions of every pair of overlapping texts and every text crossed by a marker item."""
-    out: List[str] = []
+#: sheet mm a text box is shrunk by before a dimension line counts as crossing it (the box
+#: estimate is generous; the callout pass uses the same margin)
+LINE_CROSS_SHRINK = 0.2
+
+
+def _collision_lists(items: Sequence[SheetItem], texts_idx: Sequence[int], marker_idx: Sequence[int],
+                     groups: Optional[Sequence[Sequence[int]]] = None,
+                     marker_dim_idx: Optional[Sequence[int]] = None) -> Dict[str, List[str]]:
+    """The collisions left on a sheet, by kind (QA round 3 issue 8).
+
+    ``texts``: overlapping text pairs and texts crossed by a marker item
+    (``marker_idx``); with ``groups`` (the item indices of each dimension):
+    ``text_line_crossings``, texts crossed by a ``Segment`` (extension,
+    dimension, leader or shelf line) of ANOTHER dimension (box shrunk by
+    ``LINE_CROSS_SHRINK``), and ``marker_dimension_crossings``, items of
+    ``marker_dim_idx`` (default ``marker_idx``; the letters included) that
+    touch a dimension ``Segment``.
+    """
+    texts: List[str] = []
     boxes = [(i, _box_of(items[i])) for i in texts_idx]
     boxes = [(i, b) for i, b in boxes if b is not None]
     for a in range(len(boxes)):
@@ -1841,12 +1987,42 @@ def text_collisions(items: Sequence[SheetItem], texts_idx: Sequence[int], marker
         for b in range(a + 1, len(boxes)):
             ib, bb = boxes[b]
             if _overlaps(ba, bb):
-                out.append(f"{items[ia].text!r} overlaps {items[ib].text!r}")
+                texts.append(f"{items[ia].text!r} overlaps {items[ib].text!r}")
         for m in marker_idx:
             if m != ia and _item_hits_box(items[m], ba):
-                out.append(f"{items[ia].text!r} crossed by the section marker")
+                texts.append(f"{items[ia].text!r} crossed by the section marker")
                 break
-    return out
+    lines: List[str] = []
+    marks: List[str] = []
+    if groups:
+        owner = {i: k for k, g in enumerate(groups) for i in g}
+        segs = [(k, items[i]) for k, g in enumerate(groups) for i in g if isinstance(items[i], Segment)]
+        mk = list(marker_idx if marker_dim_idx is None else marker_dim_idx)
+        skip = set(mk)
+        for i, b in boxes:
+            if i in skip:
+                continue                       # a marker letter: counted with the marker below
+            inner = b.expanded(-LINE_CROSS_SHRINK)
+            if inner.xmax <= inner.xmin or inner.ymax <= inner.ymin:
+                continue
+            own = owner.get(i)
+            if any(k != own and _segment_hits_box(s.a, s.b, inner) for k, s in segs):
+                lines.append(f"{items[i].text!r} crossed by a dimension line")
+        for m in mk:
+            if any(owner.get(m) != k and _item_hits_segment(items[m], s.a, s.b) for k, s in segs):
+                what = f"letter {items[m].text!r}" if isinstance(items[m], Text) else "line"
+                marks.append(f"section marker ({what}) crosses a dimension line")
+    return {"texts": texts, "text_line_crossings": lines, "marker_dimension_crossings": marks}
+
+
+def text_collisions(items: Sequence[SheetItem], texts_idx: Sequence[int], marker_idx: Sequence[int],
+                    groups: Optional[Sequence[Sequence[int]]] = None,
+                    marker_dim_idx: Optional[Sequence[int]] = None) -> List[str]:
+    """Descriptions of every pair of overlapping texts and every text crossed by a marker item;
+    with ``groups`` (QA round 3 issue 8) also every text crossed by another dimension's line
+    and every marker item touching a dimension line (``_collision_lists``)."""
+    c = _collision_lists(items, texts_idx, marker_idx, groups, marker_dim_idx)
+    return c["texts"] + c["text_line_crossings"] + c["marker_dimension_crossings"]
 
 
 def _extra_allowances(plan: DimensionPlan, boxes: Dict[str, BBox2D], counts: Dict[str, Tuple[int, int, int, int]],
@@ -1943,9 +2119,15 @@ def _outside_high(d: Dimension, band: Optional[Tuple[str, int]], bb: BBox2D, sca
     """Which end an outside value text of the view-space linear dim ``d`` goes past (True = high
     coordinate end), or None when the text fits between the extension lines.
 
-    The end whose text box is crossed by fewer extension lines of the outer
-    bands of the same side wins (those lines run through this band's zone),
-    then the end with more room inside the view's extent. ``compose`` and
+    The end with fewer extension lines of the same side's dims in this band or
+    further out (those lines run through this band's zone) between its own
+    extension line and the far end of the text wins, then the end with more
+    room inside the view's extent. QA round 3 issue 24: round 2 counted only
+    lines inside the text box, so a line between the span and its text (the
+    35.15 next to the 12.93 of NIST FTC 07) did not count and the text read
+    as belonging to the neighbouring span. A text that leaves the view's
+    extent into a corner where the perpendicular side has bands counts one
+    more (it meets those dims' lines and texts there). ``compose`` and
     ``_short_span_room`` both use it, so the reserved room is what is drawn.
     """
     axis = _linear_axis(d)
@@ -1959,13 +2141,24 @@ def _outside_high(d: Dimension, band: Optional[Tuple[str, int]], bb: BBox2D, sca
         return None
     reach = style.arrow_length + SHORT_SPAN_EXTRA
     side, k = band if band is not None else ("bottom" if axis == 0 else "left", 0)
-    lines = [scale * c for j, ax, c in (ext_index or {}).get((d.view, side), []) if j > k and ax == axis]
+    lines = [scale * c for j, ax, c in (ext_index or {}).get((d.view, side), []) if j >= k and ax == axis]
     crossings = []
-    for a0, a1 in ((scale * hi + reach, scale * hi + reach + tw), (scale * lo - reach - tw, scale * lo - reach)):
-        crossings.append(sum(1 for c in lines if a0 - 0.5 <= c <= a1 + 0.5))
+    eps = 1e-6                     # the dim's own extension lines (and lines on them) do not count
+    bmin, bmax = (bb.xmin, bb.xmax) if axis == 0 else (bb.ymin, bb.ymax)
+    # a text that leaves the view's extent runs into the corner of the perpendicular side's bands
+    # (their dimension lines, extended under their own outside texts): occupied when that side
+    # has bands (the 12.93 / 12.93 pair of NIST FTC 07 met there)
+    ends = (("right" if axis == 0 else "top", scale * hi + eps, scale * hi + reach + tw + 0.5,
+             scale * hi + reach + tw > scale * bmax + 1e-9),
+            ("left" if axis == 0 else "bottom", scale * lo - reach - tw - 0.5, scale * lo - eps,
+             scale * lo - reach - tw < scale * bmin - 1e-9))
+    for perp, a0, a1, leaves in ends:
+        n = sum(1 for c in lines if a0 <= c <= a1)
+        if leaves and (ext_index or {}).get((d.view, perp)):
+            n += 1
+        crossings.append(n)
     if crossings[0] != crossings[1]:
         return crossings[0] < crossings[1]
-    bmin, bmax = (bb.xmin, bb.xmax) if axis == 0 else (bb.ymin, bb.ymax)
     return _outside_goes_high(scale * (lo - bmin), scale * (bmax - hi))
 
 
@@ -2204,8 +2397,10 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
         sec_items, section_stats = _section_items(section, origins[SECTION_KEY], scale, style, geoms[SECTION_KEY])
         items += sec_items
         if marker is not None:
-            mk = _marker_items(marker, origins[marker[0]], scale, style, section.label,
-                               counts.get(marker[0], (0, 0, 0, 0)), _collinear_sides(marker, plan, scale))
+            m_counts = counts.get(marker[0], (0, 0, 0, 0))
+            mk = _marker_items(marker, origins[marker[0]], scale, style, section.label, m_counts,
+                               _marker_past_sides(marker, plan, boxes, style, section.label, scale,
+                                                  m_counts))
             marker_idx = list(range(len(items), len(items) + len(mk)))
             items += mk
     label_idx = [i for i, it in enumerate(items) if isinstance(it, Text) and i not in marker_idx]
@@ -2235,8 +2430,15 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
         collision_stats = {"error": f"{type(exc).__name__}: {exc}"}
     texts_idx = label_idx + [i for i in marker_idx if isinstance(items[i], Text)] + \
         [i for g in dimension_items for i in g if isinstance(items[i], Text)]
-    collisions = text_collisions(items, texts_idx, [i for i in marker_idx if not isinstance(items[i], Text)])
+    # QA round 3 issue 8: texts crossed by another dimension's lines and marker items touching a
+    # dimension line count as collisions too (the warning layout_text_collision)
+    by_kind = _collision_lists(items, texts_idx, [i for i in marker_idx if not isinstance(items[i], Text)],
+                               dimension_items, marker_idx)
+    collisions = by_kind["texts"] + by_kind["text_line_crossings"] + by_kind["marker_dimension_crossings"]
     collision_stats["remaining"] = len(collisions)
+    collision_stats["text_overlaps"] = len(by_kind["texts"])
+    collision_stats["text_line_crossings"] = len(by_kind["text_line_crossings"])
+    collision_stats["marker_dimension_crossings"] = len(by_kind["marker_dimension_crossings"])
 
     projection = "first_angle" if options.projection in ("first", "first_angle") else "third_angle"
     fields = {
@@ -2297,7 +2499,10 @@ def compose(views: Dict[str, ProjectedView], section: Optional[SectionView], pla
     # dimensions); texts the pass moved are reported as info
     if collisions:
         flags.append(("layout_text_collision", "warning",
-                      f"{len(collisions)} text collision(s) left: " + "; ".join(collisions[:5])))
+                      f"{len(collisions)} text collision(s) left ({len(by_kind['texts'])} text overlap(s), "
+                      f"{len(by_kind['text_line_crossings'])} text(s) crossed by dimension lines, "
+                      f"{len(by_kind['marker_dimension_crossings'])} marker / dimension line clash(es)): "
+                      + "; ".join(collisions[:5])))
     moved = int(collision_stats.get("linear_text_shifted", 0) or 0) + int(collision_stats.get("callouts_moved", 0) or 0)
     if moved:
         flags.append(("layout_text_moved", "info",

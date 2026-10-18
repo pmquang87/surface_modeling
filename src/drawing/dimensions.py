@@ -71,7 +71,13 @@ module's conventions):
    angle order, then to the circle nearest the
    corner the angle points to (QA issue 8: every group used to sit on the
    top-right circle at 45 degrees). The arrow sits on the largest circle of
-   the feature; the value is the smallest diameter. ``layout.compose``
+   the feature; the value is the smallest diameter. A counterbore on the
+   face away from the viewer (QA round 3 issue 3, ``_far_side``: its large
+   circle drawn only hidden while the bore is visible, or, without drawn
+   circles, the large cylinder behind the bore along the view normal) gets
+   its arrow on the visible bore circle and the text ``4 x Ø6 / Ø10 cbore
+   far side`` (``stats["far_side_callouts"]``); near and far
+   counterbores of one size are separate groups. ``layout.compose``
    moves a callout whose text still collides.
    Bosses, fillets and rounds are not dimensioned: one ``undimensioned``
    entry per radius group (``boss_group`` / ``fillet_group`` /
@@ -254,14 +260,56 @@ def _diameter_text(radius: float, count: int) -> str:
     return f"{count} x {base}" if count > 1 else base
 
 
-def hole_callout_text(radii, kind: str, count: int) -> str:
+#: QA round 3 issue 3: the kind word of a far-side counterbore callout. Compact on purpose:
+#: the first wording ('... counterbore (cbore far side)', 17 characters more than the near-side
+#: text) took the whole top band of NIST FTC 10 and pushed '8 x Ø2.5' to a 93 mm leader
+#: across the view; 'cbore far side' is 3 characters more than 'counterbore'.
+FAR_SIDE_NOTE = "cbore far side"
+
+
+def hole_callout_text(radii, kind: str, count: int, far_side: bool = False) -> str:
     """Callout text of a hole feature group: ``4 x Ø6.5``, ``Ø10.5 / Ø15.9 counterbore``.
 
-    ``radii`` ascending; ``kind`` "hole" | "counterbore" | "stepped".
+    ``radii`` ascending; ``kind`` "hole" | "counterbore" | "stepped". ``far_side``
+    (QA round 3 issue 3): the counterbore lies on the face away from the viewer; the kind
+    word is ``FAR_SIDE_NOTE`` instead (``4 x Ø6 / Ø10 cbore far side``).
     """
     parts = " / ".join(f"{DIAMETER_SIGN}{format_value(2.0 * float(r))}" for r in radii)
-    base = parts if kind == "hole" else f"{parts} {kind}"
+    if far_side and kind == "counterbore":
+        base = f"{parts} {FAR_SIDE_NOTE}"
+    else:
+        base = parts if kind == "hole" else f"{parts} {kind}"
     return f"{count} x {base}" if count > 1 else base
+
+
+def _far_side(cl: "_Cluster", index: Dict[str, np.ndarray], n: np.ndarray) -> bool:
+    """True when the counterbore of ``cl`` (two radii) lies on the face away from the viewer
+    of the view with normal ``n`` (toward the viewer) and index ``index`` (QA round 3 issue 3).
+
+    The view decides when it draws the circles: the large one visible -> near side; the
+    large one only hidden while the small one is visible -> far side. Otherwise (a
+    synthetic view without circles) the axial positions decide: the large cylinder's
+    centre behind the small one's along ``n``.
+    """
+    if cl.kind != "counterbore" or len(cl.radii) != 2:
+        return False
+    r_small, r_big = cl.radii[0], cl.radii[-1]
+    big_vis = _has_circle(index["visible"], cl.centre, r_big)
+    if big_vis:
+        return False
+    if _has_circle(index["hidden"], cl.centre, r_big) and \
+            _has_circle(index["visible"], cl.centre, r_small):
+        return True
+    try:
+        t = {0: [], 1: []}
+        for f in cl.feats:
+            k = 1 if abs(float(f.radius) - r_big) <= RADIUS_GROUP_TOL else 0
+            t[k].append(float(np.dot(np.asarray(f.center, dtype=float), n)))
+        if not t[0] or not t[1]:
+            return False
+        return float(np.mean(t[1])) < float(np.mean(t[0])) - 1e-9
+    except Exception:
+        return False
 
 
 # -------------------------------------------------------------------- plan --
@@ -388,6 +436,7 @@ class _Cluster:
     radii: List[float]            # ascending, merged within RADIUS_GROUP_TOL
     kind: str                     # "hole" | "counterbore" | "stepped"
     status: str = "unknown"       # how the view draws its circles: visible | partial | hidden | unknown
+    far: bool = False             # counterbore on the face away from the viewer (QA round 3 issue 3)
 
 
 def _merged_radii(feats: List[CylFeature]) -> List[float]:
@@ -639,7 +688,7 @@ def _circle_status(index: Dict[str, np.ndarray], c: np.ndarray, radii: List[floa
 
 
 def _same_signature(a: _Cluster, b: _Cluster) -> bool:
-    return (a.kind == b.kind and len(a.radii) == len(b.radii)
+    return (a.kind == b.kind and len(a.radii) == len(b.radii) and a.far == b.far
             and all(abs(x - y) <= RADIUS_GROUP_TOL for x, y in zip(a.radii, b.radii)))
 
 
@@ -917,7 +966,7 @@ def plan_dimensions(views: Dict[str, ProjectedView], features: List[CylFeature],
     undimensioned: List[dict] = []
     flags: List[Tuple[str, str, str]] = []
     stats = {"coaxial_runs_split": 0, "hidden_only": 0, "od_diameter": None, "position_refs_moved": 0,
-             "position_sides_switched": 0, "overall_sides_switched": 0}
+             "position_sides_switched": 0, "overall_sides_switched": 0, "far_side_callouts": 0}
     boxes = {name: _view_bbox(v) for name, v in views.items()}
     ext = np.asarray(model_extents, dtype=float).reshape(-1) if model_extents is not None else None
     if ext is not None and (ext.shape != (3,) or not np.all(np.isfinite(ext))):
@@ -1100,7 +1149,10 @@ def plan_dimensions(views: Dict[str, ProjectedView], features: List[CylFeature],
             if st == "hidden":
                 hidden_only.setdefault(cands[0], []).append(cl)
                 continue
-            per_view.setdefault(name, []).append(_Cluster(c_v, cl.feats, cl.radii, cl.kind, st))
+            placed_cl = _Cluster(c_v, cl.feats, cl.radii, cl.kind, st)
+            placed_cl.far = _far_side(placed_cl, index_of(name),
+                                      np.asarray(views[name].spec.n, dtype=float))
+            per_view.setdefault(name, []).append(placed_cl)
     for name, cls in hidden_only.items():
         for grp in _group_clusters(cls):
             stats["hidden_only"] += len(grp)
@@ -1140,12 +1192,17 @@ def plan_dimensions(views: Dict[str, ProjectedView], features: List[CylFeature],
                                       "reason": "cap", "view": name})
                 continue
             best = None
-            text = hole_callout_text(first.radii, first.kind, len(grp))
+            text = hole_callout_text(first.radii, first.kind, len(grp), far_side=first.far)
+            # QA round 3 issue 3: a counterbore on the far face is called out on its visible
+            # bore circle (the large circle is dashed there) and says so in the text
+            r_lead = r_small if first.far else r_big
+            if first.far:
+                stats["far_side_callouts"] += 1
             for ai, a in enumerate(LEADER_ANGLES):
                 for cl in grp:
-                    exit_len = _leader_exit(cl.centre, cl.radii[-1], a, bb)
+                    exit_len = _leader_exit(cl.centre, r_lead, a, bb)
                     # the leader runs on past the outline (exit margin + text) before its shelf
-                    seg = _leader_segment(cl.centre, cl.radii[-1], a, exit_len + beyond)
+                    seg = _leader_segment(cl.centre, r_lead, a, exit_len + beyond)
                     crossings = sum(1 for s in leaders if _segments_cross(seg, s))
                     crossings += _crossed_circles(seg, cl.centre, circle_arr)
                     cost = (exit_len + _angle_penalty(a, cl.centre, placed, diag)
@@ -1160,7 +1217,7 @@ def plan_dimensions(views: Dict[str, ProjectedView], features: List[CylFeature],
             placed.append((ang, cl.centre))
             leaders.append(seg)
             r_arrow = max(float(np.mean([float(f.radius) for f in cl.feats
-                                         if abs(float(f.radius) - r_big) <= RADIUS_GROUP_TOL])), 0.0)
+                                         if abs(float(f.radius) - r_lead) <= RADIUS_GROUP_TOL])), 0.0)
             cx, cy = float(cl.centre[0]), float(cl.centre[1])
             dims.append(Dimension(kind="diameter", text=text, value=2.0 * r_small, center=(cx, cy), radius=r_arrow,
                                   leader_angle_deg=ang, base=(cx, cy), view=name, count=len(grp)))
@@ -1193,7 +1250,7 @@ def plan_dimensions(views: Dict[str, ProjectedView], features: List[CylFeature],
                 continue
             rx, ry = float(ref.centre[0]), float(ref.centre[1])
             r_ref = max(float(np.mean([float(f.radius) for f in ref.feats
-                                       if abs(float(f.radius) - r_big) <= RADIUS_GROUP_TOL] or [r_big])), 0.0)
+                                       if abs(float(f.radius) - r_lead) <= RADIUS_GROUP_TOL] or [r_lead])), 0.0)
             for axis in (0, 1):
                 c_ax, c_other = (rx, ry) if axis == 0 else (ry, rx)
                 lo_e, hi_e = (db.xmin, db.xmax) if axis == 0 else (db.ymin, db.ymax)

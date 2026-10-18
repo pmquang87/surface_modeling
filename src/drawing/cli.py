@@ -4,7 +4,9 @@ Contract (the ``src/convert.py`` pattern):
 
 * stdout carries exactly one line, ``RESULT {json}`` (the quality report),
   on success and on failure; progress and library output go to stderr
-  (``--quiet`` silences progress).
+  (``--quiet`` silences progress except one ``src.drawing.stage`` line per
+  stage boundary; sandboxed, the parent forwards only those lines of the
+  child's stderr tail).
 * exit 0 = drawing written, no warning flag; 2 = drawing written with
   warning flags; 1 = failed (usage errors included: ``_Parser`` turns
   argparse's exit 2 into 1, prints the usage on stderr and nothing on
@@ -146,7 +148,8 @@ def build_parser() -> _Parser:
                    help="run in this process (no child, no limits)")
     p.add_argument("--options-json", dest="options_json", default=None, metavar="FILE",
                    help="DrawingOptions as JSON; explicit flags override it")
-    p.add_argument("--quiet", action="store_true", help="no progress on stderr")
+    p.add_argument("--quiet", action="store_true",
+                   help="no progress on stderr except one 'src.drawing.stage' line per stage")
     return p
 
 
@@ -308,6 +311,19 @@ def _add_breach_flag(quality: dict, box: dict) -> None:
             return
 
 
+def _stderr_to_forward(tail: Optional[str], quiet: bool) -> str:
+    """The part of the child's stderr tail the parent prints: all of it, or under
+    ``--quiet`` only the ``src.drawing.stage`` lines (QA round 3 issue 30: the docs
+    promise one stage line per stage boundary on stderr under --quiet, and a sandboxed
+    --quiet run printed none; they stayed in ``sandbox.stderr_tail``)."""
+    if not tail:
+        return ""
+    if not quiet:
+        return str(tail)
+    keep = [ln for ln in str(tail).splitlines() if STAGE_LOGGER in ln]
+    return "\n".join(keep)
+
+
 def _run_sandboxed(input_path: str, out_dir: str, opts: DrawingOptions, stderr) -> tuple:
     from .pipeline import input_error_text          # standard library only at import
     from .report import PROGRESS_FILENAME, write_report_json
@@ -349,8 +365,9 @@ def _run_sandboxed(input_path: str, out_dir: str, opts: DrawingOptions, stderr) 
                                progress_file=PROGRESS_FILENAME)
         box = dict(res.sandbox or {})
         box["enabled"] = True
-        if not opts.quiet and res.stderr_tail:
-            stderr.write(res.stderr_tail if res.stderr_tail.endswith("\n") else res.stderr_tail + "\n")
+        tail = _stderr_to_forward(res.stderr_tail, opts.quiet)
+        if tail:
+            stderr.write(tail if tail.endswith("\n") else tail + "\n")
             stderr.flush()
         result = res.result if isinstance(res.result, dict) else None
         reason = res.failure_reason()

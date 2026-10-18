@@ -579,7 +579,10 @@ def test_project_mesh_noisy_sphere_has_no_noise_fragments(monkeypatch):
     assert len(org.visible) == 1                           # outline only, fold noise removed
     assert len(org.visible[0].points) < 120                # was 171 with the pixel staircase
     # negative control: without the chain-length filter and hysteresis fragments come back
+    # (and without the round-3 dangling-stub and fan-chord filters, which also remove them)
     monkeypatch.setattr(mesh_views, "_MIN_CHAIN_PX", 0.0)
+    monkeypatch.setattr(mesh_views, "_DANGLING_PAPER_MM", 0.0)
+    monkeypatch.setattr(mesh_views, "drop_fan_duplicates", lambda p, t, *a, **k: (list(p), 0))
     orig = mesh_views.edge_visibility
     monkeypatch.setattr(mesh_views, "edge_visibility",
                         lambda s, b, g, tol_px=1.5, nbhd=1: orig(s, b, g, tol_px=tol_px, nbhd=nbhd,
@@ -1584,6 +1587,7 @@ def test_weld_joins_raster_broken_rim_pieces(monkeypatch):
         o, c = chain_paths(primitives_to_segments(pv.visible, 0.01), 1e-6)
         return len(o) + len(c)
 
+    monkeypatch.setattr(mesh_views, "_DANGLING_PAPER_MM", 0.0)     # round 3: not this test's filter
     monkeypatch.setattr(mesh_views, "_WELD_PAPER_MM", 0.0)
     pv0 = project_mesh(cyl, VIEWS["top"], raster_px=1024, feature_angle_deg=30.0, organic=False,
                        paper_scale=1.0)
@@ -1615,3 +1619,280 @@ def test_section_mesh_fitted_pin_with_other_tessellation_keeps_its_body():
     assert all(abs(a - np.pi * 25.0) < 0.5 for a, _, _ in circ)
     assert circ[0][2] != circ[1][2], sv.loop_body              # pin and tube: two bodies
     assert len(set(sv.loop_body)) == 2
+
+
+# ------------------------------------------------------------- QA round 3
+
+def _plen(p):
+    if isinstance(p, Segment):
+        return float(np.linalg.norm(np.subtract(p.b, p.a)))
+    pts = np.asarray(p.points, float)
+    ring = np.vstack([pts, pts[:1]]) if p.closed else pts
+    return float(np.linalg.norm(np.diff(ring, axis=0), axis=1).sum())
+
+
+def _prim_segs(p):
+    pts = np.asarray(p.points, float) if isinstance(p, Polyline) else np.array([p.a, p.b], float)
+    if isinstance(p, Polyline) and p.closed:
+        pts = np.vstack([pts, pts[:1]])
+    return np.stack([pts[:-1], pts[1:]], 1)
+
+
+def _overprint_fraction(p, vis_segs, tol, step=0.25):
+    """Share of the samples (``step`` apart) of primitive p within tol of a visible segment."""
+    segs = _prim_segs(p)
+    pts = []
+    for a, b in segs:
+        n = max(2, int(np.ceil(np.linalg.norm(b - a) / step)) + 1)
+        pts.append(a + (b - a) * np.linspace(0.0, 1.0, n)[:, None])
+    pts = np.vstack(pts)
+    a, b = vis_segs[:, 0], vis_segs[:, 1]
+    ab = b - a
+    t = np.clip(np.einsum("pk,vk->pv", pts, ab) - np.einsum("vk,vk->v", a, ab)[None, :], 0.0, None)
+    t = np.minimum(t / np.maximum(np.einsum("vk,vk->v", ab, ab), 1e-300)[None, :], 1.0)
+    proj = a[None, :, :] + t[:, :, None] * ab[None, :, :]
+    d = np.linalg.norm(proj - pts[:, None, :], axis=2).min(axis=1)
+    return float(np.mean(d <= tol))
+
+
+def _plate_flange():
+    """Plate 50 x 50 x 3 (z 0..3) on a 49.6 x 49.6 x 1 flange (z -1..0): in the top
+    view the flange outline is hidden 0.2 mm inside the plate outline."""
+    plate = _box((50.0, 50.0, 3.0), (0.0, 0.0, 1.5))
+    flange = _box((49.6, 49.6, 1.0), (0.0, 0.0, -0.5))
+    return trimesh.util.concatenate([plate, flange])
+
+
+def test_mesh_hidden_lines_beside_visible_outline_are_removed(monkeypatch):
+    """Issue 10 (09 flange, 25): a hidden edge 0.1-0.3 mm on paper beside a visible
+    outline was kept by the 0.5 px clean-up tolerance and printed over it."""
+    from src.drawing import mesh_views
+    m = _plate_flange()
+    vis_segs = lambda pv: np.concatenate([_prim_segs(p) for p in pv.visible])  # noqa: E731
+    monkeypatch.setattr(mesh_views, "_HIDDEN_COVER_PAPER_MM", 0.0)        # precondition: old rule
+    monkeypatch.setattr(mesh_views, "_HIDDEN_PARALLEL_PAPER_MM", 0.0)
+    pv0 = project_mesh(m, VIEWS["top"], raster_px=1024, feature_angle_deg=30.0, organic=False,
+                       paper_scale=1.0)
+    over0 = [p for p in pv0.hidden if _overprint_fraction(p, vis_segs(pv0), 0.3) > 0.8]
+    assert over0                                                          # the flange outline
+    monkeypatch.undo()
+    pv = project_mesh(m, VIEWS["top"], raster_px=1024, feature_angle_deg=30.0, organic=False,
+                      paper_scale=1.0)
+    assert [p for p in pv.hidden if _overprint_fraction(p, vis_segs(pv), 0.3) > 0.8] == []
+    assert pv.stats["hidden_covered_mm"] > 150.0                          # ~4 x 49.6 mm
+    assert len(_segments(pv.visible)) + len([p for p in pv.visible if isinstance(p, Polyline)]) >= 1
+    # a hidden edge 1 mm inside the outline is a real edge and stays
+    plate = _box((50.0, 50.0, 3.0), (0.0, 0.0, 1.5))
+    flange = _box((48.0, 48.0, 1.0), (0.0, 0.0, -0.5))
+    pv2 = project_mesh(trimesh.util.concatenate([plate, flange]), VIEWS["top"], raster_px=1024,
+                       feature_angle_deg=30.0, organic=False, paper_scale=1.0)
+    assert sum(_plen(p) for p in pv2.hidden) > 150.0
+
+
+def _tube_with_pins(n=400, seed=1):
+    """Thin tube (r 40..41, height 30) with n random 1 mm cubes inside: in the front view
+    every cube is hidden behind the tube wall."""
+    tube = trimesh.creation.annulus(r_min=40.0, r_max=41.0, height=30.0)
+    rng = np.random.default_rng(seed)
+    pins = []
+    for _ in range(n):
+        b = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+        b.apply_translation((rng.uniform(-25, 25), rng.uniform(-25, 25), rng.uniform(-12, 12)))
+        pins.append(b)
+    return trimesh.util.concatenate([tube] + pins)
+
+
+def test_mesh_hidden_density_keeps_only_long_chains(monkeypatch):
+    """Issue 2 (25 wheel hub): every hidden chain was drawn, a black mass with no flag."""
+    from src.drawing import mesh_views
+    m = _tube_with_pins()
+    monkeypatch.setattr(mesh_views, "_HIDDEN_DENSITY_RATIO", float("inf"))   # precondition
+    monkeypatch.setattr(mesh_views, "_HIDDEN_DENSITY_MAX_SEGMENTS", 10 ** 12)
+    pv0 = project_mesh(m, VIEWS["front"], raster_px=512, feature_angle_deg=30.0, organic=False,
+                       paper_scale=1.0)
+    h0 = sum(_plen(p) for p in pv0.hidden)
+    v0 = sum(_plen(p) for p in pv0.visible)
+    assert h0 > 3.0 * v0 and pv0.stats["hidden_dropped"] is False
+    assert sum(1 for p in pv0.hidden if _plen(p) <= 5.0) > 100
+    monkeypatch.undo()
+    pv = project_mesh(m, VIEWS["front"], raster_px=512, feature_angle_deg=30.0, organic=False,
+                      paper_scale=1.0)
+    # Z2 review: a partial thinning is NOT "hidden lines dropped" (that means none are drawn)
+    assert pv.stats["hidden_reduced"] is True and pv.stats["hidden_reduced_reason"] == "density"
+    assert pv.stats["hidden_dropped"] is False and "hidden_dropped_reason" not in pv.stats
+    assert pv.hidden and all(_plen(p) > 5.0 for p in pv.hidden)
+    assert len(pv.hidden) < len(pv0.hidden)
+    assert pv.stats["hidden_density_removed"] == len(pv0.hidden) - len(pv.hidden)
+    assert pv.stats["hidden_density_kept"] == len(pv.hidden)
+    # Z2 review: --max-hidden-primitives none (no cap) reaches the mesh route and keeps
+    # every hidden chain
+    pvn = project_mesh(m, VIEWS["front"], raster_px=512, feature_angle_deg=30.0, organic=False,
+                       paper_scale=1.0, max_hidden_primitives=None)
+    assert len(pvn.hidden) == len(pv0.hidden) and not pvn.stats.get("hidden_reduced")
+    # a small edge cap alone (ratio rule not met) triggers the cut with its own reason
+    monkeypatch.setattr(mesh_views, "_HIDDEN_DENSITY_RATIO", float("inf"))
+    pvc = project_mesh(m, VIEWS["front"], raster_px=512, feature_angle_deg=30.0, organic=False,
+                       paper_scale=1.0, max_hidden_primitives=10)
+    assert pvc.stats["hidden_edges"] > 10                                   # precondition
+    assert pvc.stats["hidden_reduced"] is True
+    assert pvc.stats["hidden_reduced_reason"] == "max_hidden_primitives"
+    monkeypatch.undo()
+    # the same tube at a scale where the pins are long on paper is not reduced... and a
+    # plain box with one hidden pocket is never touched
+    hb = _hollow_box()
+    pvb = project_mesh(hb, VIEWS["top"], raster_px=512, feature_angle_deg=30.0, organic=False,
+                       paper_scale=1.0)
+    assert pvb.hidden and pvb.stats["hidden_dropped"] is False and not pvb.stats.get("hidden_reduced")
+
+
+def test_hidden_density_second_step_drops_locally_dense_long_chains():
+    """Issue 2, measured on 25: keeping chains > 5 mm left 88 % of the hub ink (long fold
+    silhouettes); chains lying in cells above 1.5 mm of line per mm2 go, a long hidden
+    line through sparse paper stays."""
+    from src.drawing.mesh_views import _reduce_hidden_density
+    from src.drawing.model import LineStyle
+    fold = [Segment((0.0, 0.2 * k), (20.0, 0.2 * k + 3.0), LineStyle.HIDDEN) for k in range(40)]
+    rim = Segment((-60.0, 40.0), (60.0, 40.0), LineStyle.HIDDEN)
+    vis = [Segment((-60.0, -10.0), (60.0, -10.0)), Segment((-60.0, 50.0), (60.0, 50.0))]
+    st = {}
+    out = _reduce_hidden_density(fold + [rim], vis, 1.0, st)
+    assert all(_plen(p) > 5.0 for p in fold + [rim])                      # precondition: all long
+    assert st["hidden_reduced"] is True and st["hidden_reduced_reason"] == "density"
+    assert out == [rim] and st["hidden_dense_dropped"] == 40
+    assert st["hidden_paper_mm_kept"] == pytest.approx(120.0)
+    assert not st.get("hidden_dropped")                                   # rim still drawn
+    # when every hidden chain goes, the view really has no hidden lines: hidden_dropped
+    st3 = {}
+    assert _reduce_hidden_density(list(fold), vis, 1.0, st3) == []
+    assert st3["hidden_dropped"] is True and st3["hidden_dropped_reason"] == "density"
+    assert st3["hidden_density_kept"] == 0 and st3["hidden_density_removed"] == 40
+    # below the global ratio nothing happens
+    st2 = {}
+    assert _reduce_hidden_density([rim], vis, 1.0, st2) == [rim] and "hidden_reduced" not in st2
+
+
+def _bumped_box():
+    """40 x 30 x 10 box subdivided 3 times with the top-face vertex at the origin pulled
+    to (0.55, -0.92, 6.12): an oblique bump whose creases end on the face, so the top
+    view at 1:20 holds a 0.31 mm crease stub with a free end."""
+    m = _box((40.0, 30.0, 10.0))
+    for _ in range(3):
+        m = m.subdivide()
+    v = np.array(m.vertices)
+    i = int(np.argmin(np.linalg.norm(v - [0.0, 0.0, 5.0], axis=1)))
+    assert np.allclose(v[i], [0.0, 0.0, 5.0])
+    v[i] += (0.55, -0.92, 1.12)
+    m.vertices = v
+    return m
+
+
+def _dangling_short(prims, others, lim, tol):
+    """Open primitives shorter than lim with at least one end farther than tol from
+    every other primitive."""
+    from src.drawing.geometry2d import _prim_ends_and_length
+    out = []
+    for p in prims:
+        el = _prim_ends_and_length(p)
+        if el is None or el[1] >= lim:
+            continue
+        rest = [q for q in prims + others if q is not p]
+        if not rest:
+            out.append(p)
+            continue
+        segs = np.concatenate([_prim_segs(q) for q in rest])
+        free = 0
+        for e in el[0]:
+            a, b = segs[:, 0], segs[:, 1]
+            ab = b - a
+            t = np.clip(((e - a) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-300), 0, 1)
+            if np.min(np.linalg.norm(a + t[:, None] * ab - e, axis=1)) > tol:
+                free += 1
+        if free:
+            out.append(p)
+    return out
+
+
+def test_mesh_short_dangling_fragments_are_dropped(monkeypatch):
+    """Issue 9: sub-millimetre stubs hanging off creases of a jittered tessellation."""
+    from src.drawing import mesh_views
+    m = _bumped_box()
+    scale = 0.05
+    monkeypatch.setattr(mesh_views, "_DANGLING_PAPER_MM", 0.0)                # precondition
+    pv0 = project_mesh(m, VIEWS["top"], raster_px=1024, feature_angle_deg=30.0, organic=False,
+                       paper_scale=scale)
+    tol = 0.3 / scale
+    assert _dangling_short(pv0.visible, pv0.hidden, 0.5 / scale, tol)
+    monkeypatch.undo()
+    pv = project_mesh(m, VIEWS["top"], raster_px=1024, feature_angle_deg=30.0, organic=False,
+                      paper_scale=scale)
+    assert _dangling_short(pv.visible, pv.hidden, 0.5 / scale, tol) == []
+    assert _dangling_short(pv.hidden, pv.visible, 0.5 / scale, tol) == []
+    assert pv.stats["fragments_dropped"] >= 1 and "fan_dropped" in pv.stats
+    assert len(pv.visible) == len(pv0.visible) - pv.stats["fragments_dropped"]
+    out = np.concatenate([_prim_segs(p) for p in pv.visible]).reshape(-1, 2)
+    assert np.allclose(np.ptp(out, axis=0), (40.0, 30.0), atol=0.05)      # the outline stays
+
+
+def _bolt_plate():
+    """Plate 100 x 60 x 10 with four r5 through holes (32 sections, trimesh boolean)."""
+    plate = trimesh.creation.box(extents=(100.0, 60.0, 10.0))
+    try:
+        for x, y in ((-35, -18), (35, -18), (-35, 18), (35, 18)):
+            c = trimesh.creation.cylinder(radius=5.0, height=30.0, sections=32)
+            c.apply_translation((x, y, 0))
+            plate = plate.difference(c)
+    except Exception as exc:  # pragma: no cover - boolean backend missing
+        pytest.skip(f"trimesh boolean not available: {exc}")
+    return plate
+
+
+def test_iso_keeps_bolt_circle_rims(monkeypatch):
+    """Issue 21 (25, 28): the iso lost its through-holes; here the boolean's sliver
+    triangles take single rim edges out of the candidates and the rim breaks into open
+    pieces that the organic 3 mm chain filter drops."""
+    from src.drawing import mesh_views
+    m = _bolt_plate()
+    spec = VIEWS["iso"]
+    centres = spec.to_view(np.array([[x, y, 5.0] for x, y in ((-35, -18), (35, -18), (-35, 18),
+                                                               (35, 18))]))[:, :2]
+    monkeypatch.setattr(mesh_views, "_FILL_SLIVER_GAPS", False)                # precondition
+    monkeypatch.setattr(mesh_views, "_ISO_WELD_PAPER_MM", mesh_views._WELD_PAPER_MM)
+    monkeypatch.setattr(mesh_views, "_ISO_LOOP_CLOSE_PAPER_MM", 0.0)
+    pv0 = project_mesh(m, spec, raster_px=1024, feature_angle_deg=30.0, organic=True,
+                       hidden=False, paper_scale=0.5)
+    assert pv0.stats["n_sliver_pairs"] > 0
+    assert sum(1 for c in centres if _loops_near(pv0.visible, c, 2.0)) == 0
+    monkeypatch.undo()
+    pv = project_mesh(m, spec, raster_px=1024, feature_angle_deg=30.0, organic=True,
+                      hidden=False, paper_scale=0.5)
+    found = 0
+    for c in centres:
+        loops = [p for p in _loops_near(pv.visible, c, 2.0) if 25.0 < _plen(p) < 33.0]
+        found += bool(loops)                             # an r5 ellipse: 2 pi 5 = 31.4 at most
+    # the fourth rim (far left) is split at both extremes by 3-vertex sliver loops of
+    # the boolean, which neither the gap fill nor the loop closing bridges
+    assert found >= 3
+    assert pv.stats["sliver_gaps_filled"] > 0 and pv.stats["loops_closed"] >= 1
+
+
+def test_depth_sign_mesh_skips_the_cavity_rule_on_organic_meshes():
+    """Issue 35 (29 bunny): the cavity rule turned the organic bunny to show its back."""
+    from src.drawing.mesh_load import choose_depth_sign_mesh
+    m = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
+    v = np.array(m.vertices)
+    sel = v[:, 1] > 0.3
+    v[sel, 1] -= 0.6 * (v[sel, 1] - 0.3)
+    m.vertices = v
+    assert classify(m)["verdict"] == "organic"                              # precondition
+    r0 = choose_depth_sign_mesh(m, np.eye(3))
+    assert r0["method"] == "mesh_cavity"                                    # precondition
+    r = choose_depth_sign_mesh(m, np.eye(3), organic=True)
+    assert r["method"] == "mesh_feature_edges" and "organic: cavity rule skipped" in r["reason"]
+    # control: a prismatic pocketed plate keeps the cavity rule
+    rc = choose_depth_sign_mesh(_pocketed_plate(), np.eye(3), organic=False)
+    assert rc["method"] == "mesh_cavity"
+    # Z2 review: the flag alone decides - the same plate called organic skips the rule too,
+    # and the default (no keyword) is the cavity rule
+    assert choose_depth_sign_mesh(_pocketed_plate(), np.eye(3))["method"] == "mesh_cavity"
+    rco = choose_depth_sign_mesh(_pocketed_plate(), np.eye(3), organic=True)
+    assert rco["method"] != "mesh_cavity" and "organic: cavity rule skipped" in rco["reason"]

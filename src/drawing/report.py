@@ -89,8 +89,9 @@ FLAGS: Dict[str, str] = {
     # ---- QA round 1 ----
     "loose_curves_ignored": "info",        # free edges/vertices (sketch/PMI curve sets) not drawn
     "supplemental_shells_ignored": "info",  # free shells/faces next to solids not drawn
-    "supplemental_geometry_ignored": "info",
-    "loose_curves_drawn": "info",          # pure wireframe / surface model keeps them
+    # (QA round 3 issue 29: supplemental_geometry_ignored and loose_curves_drawn were never
+    # raised - a pure wireframe has no faces, so the B-rep stage fails before drawing it -
+    # and are removed from the table)
     "dimension_extent_mismatch": "warning",
     "unit_assumed_mm": "info",             # STL carries no unit; may be raised to warning
     "unit_suspect": "info",                # sizes look like another unit; may be raised
@@ -116,6 +117,8 @@ FLAGS: Dict[str, str] = {
     "section_gaps_bridged": "info",        # open-mesh section gaps closed by chords; may be raised
     "winding_repaired": "info",            # inconsistent winding; volume of a repaired copy
     "dimension_hidden_only": "info",       # holes seen only hidden in their axial view
+    # ---- QA round 3 ----
+    "mesh_winding_inconsistent": "info",   # open mesh with winding conflicts (no repaired volume)
     # sandbox breaches (the run failed; exit 1 regardless of the severity)
     "sandbox_timeout": "warning",
     "sandbox_memory_exceeded": "warning",
@@ -167,8 +170,6 @@ FLAG_MEANINGS: Dict[str, str] = {
                             "PMI annotations are not drawn and not in the bbox",
     "supplemental_shells_ignored": "free shells / faces or tessellated bodies next to the drawn "
                                    "bodies are not drawn",
-    "supplemental_geometry_ignored": "other supplemental geometry is not drawn",
-    "loose_curves_drawn": "a pure wireframe or surface model keeps its loose curves",
     "dimension_extent_mismatch": "an overall dimension differs from the model extent",
     "unit_assumed_mm": "an STL carries no unit and was read as mm (warning when the size "
                        "looks implausible)",
@@ -183,11 +184,15 @@ FLAG_MEANINGS: Dict[str, str] = {
     "not_a_solid": "no closed component (triangle soup): no section, no overall dimensions, "
                    "level minimal",
     "mesh_non_manifold": "the mesh has edges with more than two faces",
-    "section_fallback": "no hole axis fits the section mode: bbox centre, thin-part plane, or "
-                        "no solid (no section)",
+    "section_fallback": "no hole axis fits the section mode: bbox-centre plane (moved through a "
+                        "body centroid when it cuts nothing), thin-part plane, or an open B-rep "
+                        "surface model (no section); a mesh that is not a solid reports "
+                        "not_a_solid instead",
     "interior_silhouettes_omitted": "organic mesh too large for silhouette candidates: interior "
                                     "silhouettes are not drawn",
-    "layout_text_collision": "dimension texts still overlap after the resolution pass",
+    "layout_text_collision": "after the resolution pass dimension texts still overlap, a text is "
+                             "crossed by another dimension's line, or the section marker touches "
+                             "a dimension line (counts in sheet.text_collisions)",
     "hidden_lines_omitted_assembly": "large assembly (more than 20 solids, or 50000 raw hidden "
                                      "edges in a view): no hidden lines",
     "section_skipped_budget": "the run deadline was too close (or the section's estimated "
@@ -207,6 +212,10 @@ FLAG_MEANINGS: Dict[str, str] = {
                         "winding-repaired copy",
     "dimension_hidden_only": "hole features seen only as hidden circles in their axial view "
                              "get no callout (undimensioned)",
+    "mesh_winding_inconsistent": "an open mesh has faces wound against their neighbours "
+                                 "(winding conflicts, count in the detail and in "
+                                 "geometry.winding_conflicts); no repaired volume exists for "
+                                 "an open mesh, the views are not affected",
     "sandbox_timeout": "the child exceeded the wall-clock limit (run failed)",
     "sandbox_memory_exceeded": "the child exceeded the memory limit (run failed)",
     "sandbox_cpu_exceeded": "the child exceeded the CPU-time backstop (run failed)",

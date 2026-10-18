@@ -1180,10 +1180,15 @@ def dedupe_primitives(prims: list, tol: float) -> list:
     Duplicates have the same type and style and coincide within ``tol``:
     Segments in either direction; Circles by centre and radius; Arcs by
     centre, radius, start angle (mod 360) and sweep; Polylines point by point
-    forward or reversed with the same ``closed`` flag. An Arc whose centre
-    and radius match a Circle of the same style is covered by it and dropped
-    as well (QA round 2 issue 18). Any other item (Text, Polygon,
-    HatchLines) is passed through untouched.
+    forward or reversed with the same ``closed`` flag (closed rings also
+    from any start point, QA round 3 issue 11). An Arc whose centre and
+    radius match a Circle of the same style is covered by it and dropped
+    as well (QA round 2 issue 18). QA round 3 issue 11: a closed Polyline
+    sampled on a circle (``_ring_circle``) is a copy of a Circle or of
+    another such ring with the same centre and radius (a Circle is kept),
+    and Arcs of one circle whose sweeps join into the full turn are
+    replaced by ONE Circle at the place of the first. Any other item (Text,
+    Polygon, HatchLines) is passed through untouched.
     """
     from scipy.spatial import cKDTree
 
@@ -1222,7 +1227,9 @@ def dedupe_primitives(prims: list, tol: float) -> list:
                 return False
             if np.all(np.linalg.norm(pa - qa, axis=1) <= tol):
                 return True
-            return bool(np.all(np.linalg.norm(pa - qa[::-1], axis=1) <= tol))
+            if np.all(np.linalg.norm(pa - qa[::-1], axis=1) <= tol):
+                return True
+            return bool(p.closed) and _same_ring(pa, qa, tol)
         return False
 
     def key(p) -> Tuple[float, float]:
@@ -1246,24 +1253,273 @@ def dedupe_primitives(prims: list, tol: float) -> list:
         for local, root in enumerate(roots):
             if root != local:                 # root is the smallest index of its component
                 drop.add(idxs[local])
+    # QA round 3 issue 11 (08): one circle written as a Circle and as a closed
+    # Polyline sampled on it, or as two rings of different sampling. A closed
+    # Polyline whose vertices all lie within tol of one circle (>= 8 vertices,
+    # winding once around the centre, every chord within tol of the circle or
+    # spanning <= 22.5 degrees, Z2 review) counts as that circle; copies within
+    # tol (centre and radius, same style) go, a Circle wins over a ring and a
+    # finer ring over a coarser one.
+    circ_like = []                    # (index, centre, radius, is_circle, vertex count)
+    for i in groups[Circle]:
+        if i not in drop:
+            c = prims[i]
+            circ_like.append((i, (float(c.center[0]), float(c.center[1])), abs(float(c.radius)),
+                              True, 0))
+    for i in groups[Polyline]:
+        if i not in drop and bool(prims[i].closed):
+            ring_pts = np.asarray(prims[i].points, float).reshape(-1, 2)
+            fit = _ring_circle(ring_pts, tol)
+            if fit is not None:
+                circ_like.append((i, fit[0], fit[1], False, len(ring_pts)))
+    if len(circ_like) >= 2:
+        ckeys = np.array([cl[1] for cl in circ_like], dtype=np.float64)
+        pairs = cKDTree(ckeys).query_pairs(r, output_type="ndarray")
+        # a Circle wins, then the finer ring (Z2 review), then the first
+        order = sorted(range(len(circ_like)),
+                       key=lambda k: (not circ_like[k][3], -circ_like[k][4], circ_like[k][0]))
+        rank = {k: n for n, k in enumerate(order)}
+        for a_, b_ in pairs:
+            ca, cb = circ_like[a_], circ_like[b_]
+            if prims[ca[0]].style != prims[cb[0]].style or abs(ca[2] - cb[2]) > tol:
+                continue
+            if ca[0] in drop or cb[0] in drop:
+                continue
+            drop.add(cb[0] if rank[a_] < rank[b_] else ca[0])
     # QA round 2 issue 18: an Arc lying on a Circle of the same style (centre and
     # radius within tol) is covered by it - HLR repeats a hidden blind-hole circle
-    # as the Circle plus the two seam halves (05, 07)
-    circ = [i for i in groups[Circle] if i not in drop]
+    # as the Circle plus the two seam halves (05, 07); a circular ring covers it too
+    circ = [cl for cl in circ_like if cl[0] not in drop]
     arcs = [i for i in groups[Arc] if i not in drop]
     if circ and arcs:
-        ckeys = np.array([key(prims[i]) for i in circ], dtype=np.float64)
-        tree = cKDTree(ckeys)
+        tree = cKDTree(np.array([cl[1] for cl in circ], dtype=np.float64))
         for i in arcs:
             a = prims[i]
             for j in tree.query_ball_point(key(a), r):
-                c = prims[circ[j]]
-                if c.style == a.style and abs(float(c.radius) - float(a.radius)) <= tol:
+                c = circ[j]
+                if prims[c[0]].style == a.style and abs(c[2] - abs(float(a.radius))) <= tol:
                     drop.add(i)
                     break
+    # QA round 3 issue 11 (01): arcs of one circle whose sweeps join into the full
+    # turn (a hole drawn as two 180-degree hidden halves) become ONE Circle at the
+    # place of the first, so the dash runs on and the circle is written once
+    replace: dict = {}
+    arcs = [i for i in groups[Arc] if i not in drop]
+    if len(arcs) >= 2:
+        akeys = np.array([key(prims[i]) for i in arcs], dtype=np.float64)
+        pairs = cKDTree(akeys).query_pairs(r, output_type="ndarray")
+        ok = [(a_, b_) for a_, b_ in pairs
+              if prims[arcs[a_]].style == prims[arcs[b_]].style
+              and abs(abs(float(prims[arcs[a_]].radius)) - abs(float(prims[arcs[b_]].radius))) <= tol]
+        if ok:
+            roots = _union_find_roots(len(arcs), ok)
+            comp: dict = {}
+            for local, root in enumerate(roots):
+                comp.setdefault(int(root), []).append(arcs[local])
+            for members in comp.values():
+                if len(members) < 2:
+                    continue
+                first = prims[min(members)]
+                rad = abs(float(first.radius))
+                ang_tol = max(math.degrees(tol / max(rad, tol)), 1e-6)
+                if _arcs_cover_turn([prims[m] for m in members], ang_tol):
+                    replace[min(members)] = Circle((float(first.center[0]), float(first.center[1])),
+                                                   rad, first.style)
+                    drop.update(m for m in members if m != min(members))
+    if drop or replace:
+        log.debug("dedupe_primitives: dropped %d duplicates, %d arc sets merged into circles",
+                  len(drop), len(replace))
+    return [replace.get(i, p) for i, p in enumerate(prims) if i not in drop]
+
+
+def _same_ring(pa: np.ndarray, qa: np.ndarray, tol: float) -> bool:
+    """True when closed rings ``pa`` and ``qa`` (same point count) hold the same
+    vertices in cyclic order, either direction, from any start point."""
+    n = len(pa)
+    if n == 0 or len(qa) != n:
+        return False
+    d0 = np.linalg.norm(qa - pa[0], axis=1)
+    for s in np.flatnonzero(d0 <= tol)[:4].tolist():
+        fwd = np.roll(qa, -s, axis=0)
+        if np.all(np.linalg.norm(pa - fwd, axis=1) <= tol):
+            return True
+        rev = np.roll(qa[::-1], -(n - 1 - s), axis=0)
+        if np.all(np.linalg.norm(pa - rev, axis=1) <= tol):
+            return True
+    return False
+
+
+_RING_MAX_CHORD_DEG = 22.5   # a sampled circle: 16+ vertices per turn, or chords within tol
+
+
+def _ring_circle(pts: np.ndarray, tol: float, *, chord_check: bool = True
+                 ) -> Optional[Tuple[Tuple[float, float], float]]:
+    """(centre, radius) when the closed ring ``pts`` is a sampled circle within ``tol``.
+
+    Needs >= 8 vertices (a repeated closing point is ignored), all within
+    ``tol`` of the least-squares circle, and a winding of one full turn
+    around its centre; None otherwise. With ``chord_check`` (default) every
+    chord must also stay close to the circle: its sagitta r(1 - cos(t/2))
+    within ``tol``, or its sweep t at most ``_RING_MAX_CHORD_DEG`` (22.5
+    degrees, 16 vertices per turn). Z2 review: the vertex test alone made
+    every regular polygon with 8+ sides a circle (an octagon next to its
+    circumscribed Circle was dropped as a copy). ``chord_check=False`` is
+    the vertex-only test (the writers' "dash this ring as one closed
+    curve" decision, where a coarse mesh hole rim is wanted).
+    """
+    p = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    if len(p) >= 2 and np.allclose(p[0], p[-1]):
+        p = p[:-1]
+    if len(p) < 8 or not np.all(np.isfinite(p)):
+        return None
+    m = p.mean(axis=0)
+    q = p - m
+    A = np.column_stack([2.0 * q, np.ones(len(q))])
+    try:
+        sol, *_ = np.linalg.lstsq(A, (q * q).sum(axis=1), rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    c = sol[:2]
+    rr = float(sol[2] + c @ c)
+    if not rr > 0.0:
+        return None
+    rad = math.sqrt(rr)
+    dist = np.linalg.norm(q - c, axis=1)
+    if float(np.max(np.abs(dist - rad))) > tol:
+        return None
+    ang = np.arctan2(q[:, 1] - c[1], q[:, 0] - c[0])
+    dang = np.diff(np.r_[ang, ang[:1]])
+    dang = (dang + np.pi) % (2.0 * np.pi) - np.pi
+    if abs(abs(float(dang.sum())) - 2.0 * np.pi) > 1e-3:
+        return None
+    if chord_check:
+        t = np.abs(dang)
+        sag = rad * (1.0 - np.cos(0.5 * t))
+        ok = (sag <= tol) | (t <= math.radians(_RING_MAX_CHORD_DEG) + 1e-9)
+        if not bool(np.all(ok)):
+            return None
+    return (float(c[0] + m[0]), float(c[1] + m[1])), rad
+
+
+def _arcs_cover_turn(arcs: list, ang_tol: float) -> bool:
+    """True when the CCW sweeps of ``arcs`` cover 0..360 degrees (gaps <= ang_tol)."""
+    iv = []
+    for a in arcs:
+        s = _norm_deg(float(a.start_deg))
+        sw = _arc_sweep(float(a.start_deg), float(a.end_deg))
+        if sw >= 360.0:
+            return True
+        e = s + sw
+        if e > 360.0:
+            iv += [(s, 360.0), (0.0, e - 360.0)]
+        else:
+            iv.append((s, e))
+    iv.sort()
+    reach = 0.0
+    for s, e in iv:
+        if s > reach + ang_tol:
+            return False
+        reach = max(reach, e)
+    return reach >= 360.0 - ang_tol
+
+
+def drop_fan_duplicates(prims: list, tol: float, max_deg: float = 15.0) -> Tuple[list, int]:
+    """Drop Segments that lie on a longer Segment of the same style (QA round 3 issue 9).
+
+    Mesh fans leave chords from one vertex whose far ends lie a fraction of
+    a millimetre apart; on paper they print as one thick wedge. A Segment
+    whose two end points both lie within ``tol`` of ONE longer Segment of the
+    same style, at most ``max_deg`` apart in direction, is dropped. Other
+    primitives are never touched. Returns (kept primitives, number dropped).
+    """
+    from .model import Segment
+
+    prims = list(prims)
+    idx = [k for k, p in enumerate(prims) if type(p) is Segment]
+    if len(idx) < 2 or not tol > 0.0:
+        return prims, 0
+    segs = np.array([[prims[k].a, prims[k].b] for k in idx], dtype=np.float64).reshape(-1, 2, 2)
+    L = np.linalg.norm(segs[:, 1] - segs[:, 0], axis=1)
+    I, J = _near_pairs(segs, None, float(tol), max_sin=math.sin(math.radians(float(max_deg))))
+    if len(I) == 0:
+        return prims, 0
+    # the shorter of each pair is the candidate, the longer the cover
+    short = np.where(L[I] <= L[J], I, J)
+    cover = np.where(L[I] <= L[J], J, I)
+    same = np.array([prims[idx[s]].style == prims[idx[c]].style for s, c in zip(short, cover)], dtype=bool)
+    short, cover = short[same], cover[same]
+    if len(short) == 0:
+        return prims, 0
+    d0 = _point_seg_dist_pairs(segs[short, 0], segs[cover, 0], segs[cover, 1])
+    d1 = _point_seg_dist_pairs(segs[short, 1], segs[cover, 0], segs[cover, 1])
+    on = (d0 <= tol) & (d1 <= tol)
+    drop = set()
+    for s, c in zip(short[on].tolist(), cover[on].tolist()):
+        if c in drop:                    # never drop both of an equal pair
+            continue
+        drop.add(s)
     if drop:
-        log.debug("dedupe_primitives: dropped %d duplicates", len(drop))
-    return [p for i, p in enumerate(prims) if i not in drop]
+        log.debug("drop_fan_duplicates: dropped %d chords", len(drop))
+    dropped = {idx[s] for s in drop}
+    return [p for k, p in enumerate(prims) if k not in dropped], len(dropped)
+
+
+def drop_mostly_covered(hidden: np.ndarray, visible: np.ndarray, tol: float, frac: float = 0.8, *,
+                        max_sin: float = None, deadline: Optional[float] = None
+                        ) -> Tuple[np.ndarray, float]:
+    """Drop hidden segments lying within ``tol`` of visible ones along > ``frac`` of their length.
+
+    QA round 3 issue 10: on the mesh route a hidden edge 0.1-0.3 mm (on paper)
+    beside a visible outline - the depth-buffer silhouette versus the exact
+    edge, a flange 0.2 mm inside a plate - printed on top of the outline.
+    Unlike ``subtract_covered`` nothing is cut: a hidden segment is kept
+    whole or dropped whole, so a hidden line that only converges with a
+    visible one at a corner keeps its full length. Each hidden segment is
+    sampled at about ``tol`` (at most 200 samples); a sample is covered when
+    it lies within ``tol`` of a visible segment at most ``asin(max_sin)``
+    (default 15 degrees) off its direction. Returns (kept segments, dropped
+    length).
+    """
+    hid = _as_segments(hidden)
+    vis = _as_segments(visible)
+    tol = float(tol)
+    if len(hid) == 0 or len(vis) == 0 or not tol > 0.0:
+        return hid.copy(), 0.0
+    vis = vis[np.linalg.norm(vis[:, 1] - vis[:, 0], axis=1) > 0.0]
+    if len(vis) == 0:
+        return hid.copy(), 0.0
+    ms = _LOOSE_SIN if max_sin is None else float(max_sin)
+    Hc, Vc = _near_pairs(hid, vis, tol, max_sin=ms, deadline=deadline)
+    if len(Hc) == 0:
+        return hid.copy(), 0.0
+    L = np.linalg.norm(hid[:, 1] - hid[:, 0], axis=1)
+    cand = np.unique(Hc)
+    ns = np.clip(np.ceil(L[cand] / tol).astype(np.int64) + 1, 2, 201)
+    n_of = np.zeros(len(hid), dtype=np.int64)
+    n_of[cand] = ns
+    first = np.zeros(len(hid), dtype=np.int64)
+    first[cand] = np.cumsum(ns) - ns
+    covered = np.zeros(int(ns.sum()), dtype=bool)
+    o = np.argsort(Hc, kind="stable")
+    Hc, Vc = Hc[o], Vc[o]
+    # one (sample, visible) distance per candidate pair, in chunks
+    rep = n_of[Hc]
+    pair_of = np.repeat(np.arange(len(Hc)), rep)
+    k = np.arange(len(pair_of)) - np.repeat(np.cumsum(rep) - rep, rep)
+    h = Hc[pair_of]
+    t = k / (n_of[h] - 1)
+    P = hid[h, 0] + (hid[h, 1] - hid[h, 0]) * t[:, None]
+    v = Vc[pair_of]
+    d = _point_seg_dist_pairs(P, vis[v, 0], vis[v, 1])
+    hit = d <= tol
+    covered[(first[h] + k)[hit]] = True
+    frac_cov = np.zeros(len(hid))
+    starts = first[cand]
+    frac_cov[cand] = np.add.reduceat(covered.astype(np.float64), starts) / ns
+    drop = frac_cov > float(frac)
+    if not drop.any():
+        return hid.copy(), 0.0
+    return hid[~drop].copy(), float(L[drop].sum())
 
 
 def drop_covered_curves(hidden: list, visible: list, tol: float) -> list:
@@ -1506,7 +1762,8 @@ def chain_to_primitives(segments: np.ndarray, style, tol: float, *, short_len: f
                         min_closed_len: Optional[float] = None,
                         simplify_tol: Optional[float] = None,
                         hairpin_len: Optional[float] = None,
-                        stats: Optional[dict] = None) -> list:
+                        stats: Optional[dict] = None,
+                        close_gap: Optional[float] = None) -> list:
     """Chain segments with ``chain_paths`` and emit drawing primitives (QA issue 6).
 
     Dashed edges written one element per chord never show the dash pattern
@@ -1531,9 +1788,14 @@ def chain_to_primitives(segments: np.ndarray, style, tol: float, *, short_len: f
     ``simplify_chain`` (Douglas-Peucker at that tolerance, then hairpin
     vertices with an interior angle below 20 degrees and an adjacent edge
     shorter than ``hairpin_len`` removed; QA round 2 issue 19) before it is
-    measured and emitted. ``stats`` (a dict, optional) receives
-    ``open_dropped``, ``closed_dropped`` and ``hairpins_removed``.
-    ``style`` is the ``LineStyle`` of every output primitive.
+    measured and emitted. ``close_gap`` (optional, QA round 3 issue 21): an
+    open chain of at least 4 points whose two ends lie within ``close_gap``
+    and within a tenth of its length of each other is closed before the
+    thresholds (a hole rim broken once by raster visibility or a sliver
+    gap is a loop, not an open piece for the open-chain filter). ``stats``
+    (a dict, optional) receives ``open_dropped``, ``closed_dropped``,
+    ``hairpins_removed`` and ``loops_closed``. ``style`` is the
+    ``LineStyle`` of every output primitive.
     """
     from .model import LineStyle, Polyline, Segment
 
@@ -1548,6 +1810,19 @@ def chain_to_primitives(segments: np.ndarray, style, tol: float, *, short_len: f
     else:
         all_poly = bool(polyline_all)
     opened, closed = chain_paths(segs, tol, deadline=deadline)
+    n_closed_now = 0
+    if close_gap is not None and float(close_gap) > 0.0 and opened:
+        still = []
+        for p in opened:
+            if len(p) >= 4:
+                gap = float(np.linalg.norm(p[-1] - p[0]))
+                length = float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum())
+                if gap <= float(close_gap) and gap <= 0.1 * length:
+                    closed = list(closed) + [p[:-1] if gap <= tol else p]
+                    n_closed_now += 1
+                    continue
+            still.append(p)
+        opened = still
     out: list = []
     n_drop = 0
     n_open_drop = n_closed_drop = n_hair = 0
@@ -1581,6 +1856,8 @@ def chain_to_primitives(segments: np.ndarray, style, tol: float, *, short_len: f
         stats["open_dropped"] = stats.get("open_dropped", 0) + n_open_drop
         stats["closed_dropped"] = stats.get("closed_dropped", 0) + n_closed_drop
         stats["hairpins_removed"] = stats.get("hairpins_removed", 0) + n_hair
+        if close_gap is not None:
+            stats["loops_closed"] = stats.get("loops_closed", 0) + n_closed_now
     return out
 
 
@@ -1739,7 +2016,8 @@ def _prim_ends_and_length(p):
 
 
 def drop_isolated_fragments(prims: list, min_len: float, touch_tol: float, deflection: float,
-                            context: Optional[list] = None) -> Tuple[list, int]:
+                            context: Optional[list] = None, *,
+                            dangling: bool = False) -> Tuple[list, int]:
     """Drop short open primitives that touch nothing (QA issue 35).
 
     A ``Segment``, open ``Polyline`` or ``Arc`` shorter than ``min_len``
@@ -1747,7 +2025,10 @@ def drop_isolated_fragments(prims: list, min_len: float, touch_tol: float, defle
     OTHER primitive of ``prims`` and ``context`` (flattened at
     ``deflection``; interiors count, so a stub ending on a line is kept) is
     an isolated fragment and removed. Closed items, Circles and anything
-    longer are always kept. Returns (kept primitives, number dropped).
+    longer are always kept. ``dangling=True`` (mesh route, QA round 3 issue
+    9) also removes a short primitive with ONE free end (a stub hanging off
+    a line); one that joins two others at both ends stays. Returns (kept
+    primitives, number dropped).
     """
     prims = list(prims)
     if min_len <= 0.0 or not prims:
@@ -1793,7 +2074,10 @@ def drop_isolated_fragments(prims: list, min_len: float, touch_tol: float, defle
         dist = _point_seg_dist_pairs(ends[I], flat[J, 0], flat[J, 1])
         touched[I[dist <= touch_tol]] = True
     touched = touched.reshape(-1, 2)
-    drop = {cand[k][0] for k in range(len(cand)) if not touched[k].any()}
+    if dangling:
+        drop = {cand[k][0] for k in range(len(cand)) if not touched[k].all()}
+    else:
+        drop = {cand[k][0] for k in range(len(cand)) if not touched[k].any()}
     if drop:
         log.debug("drop_isolated_fragments: dropped %d fragments shorter than %.4g", len(drop), min_len)
     return [p for i, p in enumerate(prims) if i not in drop], len(drop)
@@ -1805,4 +2089,5 @@ __all__: Sequence[str] = (
     "subtract_covered", "subtract_covered_curves", "dedupe_primitives", "drop_covered_curves",
     "primitives_to_segments",
     "chain_to_primitives", "drop_isolated_fragments", "simplify_chain", "weld_chain_ends",
+    "drop_fan_duplicates", "drop_mostly_covered",
 )

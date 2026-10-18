@@ -597,3 +597,66 @@ def test_wide_span_text_stays_centred_and_explicit_offset_wins():
     ts = BBox2D.from_points(text_corners(_parts(render_dimension(s, ST))[1][0]))
     assert ts.xmax < 0.0
     assert linear_reach(2.2, "2.77", ST, text_offset=off)[0] > ST.arrow_length + dm.SHORT_SPAN_EXTRA
+
+
+# ======================================================= QA round 3 (task Z1) ==
+
+def _cbore_block(z0):
+    """40 x 40 x 10 block, Ø6 through bore at (20, 20) and a Ø10 x 3 counterbore from z0
+    (0: on the bottom face, the far side seen from the top view; 7: on the top face)."""
+    Cut, Box, Cyl, Ax2, Dir, Pnt = _occ()
+    shape = Box(Pnt(0, 0, 0), 40.0, 40.0, 10.0).Shape()
+    shape = Cut(shape, Cyl(Ax2(Pnt(20, 20, -1), Dir(0, 0, 1)), 3.0, 12.0).Shape()).Shape()
+    lo = z0 - 1.0 if z0 <= 0.0 else z0
+    return Cut(shape, Cyl(Ax2(Pnt(20, 20, lo), Dir(0, 0, 1)), 5.0, 4.0).Shape()).Shape()
+
+
+@pytest.mark.parametrize("z0, far", [(0.0, True), (7.0, False)])
+def test_z1_issue3_counterbore_on_the_far_face_gets_the_leader_on_the_visible_bore(z0, far):
+    from src.drawing.brep_features import cylinder_features
+    shape = _cbore_block(z0)
+    feats = cylinder_features(shape)
+    assert sorted(round(f.radius, 6) for f in feats if f.kind == "hole") == [3.0, 5.0]   # precondition
+    views = _project(shape, ["front", "top"])
+    idx = dm._circle_index(views["top"])
+    c = np.array([20.0, 20.0])
+    # precondition: the view draws the Ø10 circle hidden exactly when the counterbore is far
+    assert dm._has_circle(idx["visible"], c, 3.0)
+    assert dm._has_circle(idx["visible"], c, 5.0) is (not far)
+    b = _extents(shape)
+    plan = plan_dimensions(views, feats, DrawingOptions(), ST, b[1] - b[0], model_bounds=b)
+    d = _diam(plan)
+    assert len(d) == 1 and d[0].view == "top" and d[0].text.startswith("Ø6 / Ø10 ")
+    if far:
+        assert d[0].radius == pytest.approx(3.0)                 # arrow on the visible bore
+        assert d[0].text == "Ø6 / Ø10 cbore far side"
+        assert plan.stats["far_side_callouts"] == 1
+    else:
+        assert d[0].radius == pytest.approx(5.0)
+        assert d[0].text == "Ø6 / Ø10 counterbore" and "far side" not in d[0].text
+        assert plan.stats["far_side_callouts"] == 0
+
+
+def test_z1_issue3_far_side_from_the_axial_positions_when_the_view_has_no_circles():
+    # a synthetic view (no circle drawn at all: status unknown): the far side follows from the
+    # axial position of the big cylinder against the view normal (top: +z toward the viewer)
+    far = [_hole(20.0, 20.0, 3.0, z=5.0, length=10.0), _hole(20.0, 20.0, 5.0, z=1.5, length=3.0)]
+    near = [_hole(20.0, 20.0, 3.0, z=5.0, length=10.0), _hole(20.0, 20.0, 5.0, z=8.5, length=3.0)]
+    ext = np.array([40.0, 40.0, 10.0])
+    df = _diam(plan_dimensions(_box_views(40.0, 40.0, 10.0), far, DrawingOptions(), ST, ext))
+    dn = _diam(plan_dimensions(_box_views(40.0, 40.0, 10.0), near, DrawingOptions(), ST, ext))
+    assert df[0].text == "Ø6 / Ø10 cbore far side" and df[0].radius == pytest.approx(3.0)
+    assert dn[0].text == "Ø6 / Ø10 counterbore" and dn[0].radius == pytest.approx(5.0)
+
+
+def test_z1_issue3_hole_callout_text_far_side_keyword():
+    assert dm.hole_callout_text([3.0, 5.0], "counterbore", 4) == "4 x Ø6 / Ø10 counterbore"
+    far = dm.hole_callout_text([3.0, 5.0], "counterbore", 4, far_side=True)
+    near = dm.hole_callout_text([3.0, 5.0], "counterbore", 4)
+    assert far == "4 x Ø6 / Ø10 cbore far side"
+    # review Z1: the far-side text stays compact (the first wording was 17 characters longer
+    # than the near-side one and took the whole top band of NIST FTC 10)
+    assert len(far) - len(near) <= 3
+    # the note is for counterbores only
+    assert dm.hole_callout_text([3.0, 5.0], "stepped", 4, far_side=True) == "4 x Ø6 / Ø10 stepped"
+    assert dm.hole_callout_text([3.0], "hole", 2, far_side=True) == "2 x Ø6"

@@ -37,7 +37,7 @@ import numpy as np
 
 from ..model import (Arc, Circle, HatchLines, Polygon, Polyline, Segment, Sheet, Text)
 from ..style import DEFAULT_STYLE, SheetStyle
-from . import arc_span, clean_text, fmt, item_line_props, line_props, valid_item
+from . import arc_span, clean_text, fmt, hidden_pieces, item_line_props, line_props, valid_item
 
 log = logging.getLogger(__name__)
 
@@ -145,7 +145,9 @@ def write_svg(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE) 
         if isinstance(item, Text):
             texts.append(_text(item, H))
         else:
-            geom.append(_geom(item, sheet_style, adapted))
+            # hidden polylines with short corner legs: one element per piece (QA3 #23)
+            for piece in hidden_pieces(item, sheet_style):
+                geom.append(_geom(piece, sheet_style, adapted))
     if skipped:
         log.warning("svg: skipped %d degenerate or non-finite items", skipped)
     Ws, Hs = fmt(W), fmt(H)

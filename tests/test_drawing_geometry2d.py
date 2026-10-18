@@ -1089,3 +1089,160 @@ def test_weld_chain_ends_joins_gaps_but_never_collapses_fine_curves():
     w3, n3 = g2.weld_chain_ends(np.array([[[0.0, 0.0], [0.1, 0.0]], [[5.0, 5.0], [9.0, 5.0]]]),
                                 1e-6, 0.3)
     assert n3 == 0 and len(w3) == 2
+
+
+# ------------------------------------- QA round 3 (issues 9, 10, 11): duplicates, fans, cover
+
+def _circle_pts(c, r, n, start=0.0, ccw=True):
+    t = start + np.linspace(0.0, 2.0 * np.pi, n + 1)[:-1]
+    if not ccw:
+        t = t[::-1]
+    return np.stack([c[0] + r * np.cos(t), c[1] + r * np.sin(t)], 1)
+
+
+def test_dedupe_merges_complementary_hidden_arcs_into_one_circle():
+    """Issue 11 (01): a hole drawn as two 180-degree hidden arcs restarted the dash."""
+    c = (239.1, 189.1)
+    a1 = Arc(c, 3.81, 270.0, 90.0, LineStyle.HIDDEN)
+    a2 = Arc(c, 3.81, 90.0, 270.0, LineStyle.HIDDEN)
+    keep = Segment((0.0, 0.0), (5.0, 0.0), LineStyle.HIDDEN)
+    out = g2.dedupe_primitives([keep, a1, a2], 1e-6)
+    assert len(out) == 2 and out[0] is keep
+    assert isinstance(out[1], Circle) and out[1].style == LineStyle.HIDDEN
+    assert out[1].radius == pytest.approx(3.81) and np.allclose(out[1].center, c)
+    # three arcs covering the turn with a tiny overlap merge too
+    thirds = [Arc(c, 2.0, 0.0, 120.0, LineStyle.HIDDEN), Arc(c, 2.0, 119.9, 240.0, LineStyle.HIDDEN),
+              Arc(c, 2.0, 240.0, 360.0, LineStyle.HIDDEN)]
+    out3 = g2.dedupe_primitives(thirds, 1e-6)
+    assert len(out3) == 1 and isinstance(out3[0], Circle)
+    # negative: arcs leaving a 60-degree gap, another radius or another style stay arcs
+    gap = [Arc(c, 2.0, 0.0, 180.0, LineStyle.HIDDEN), Arc(c, 2.0, 180.0, 300.0, LineStyle.HIDDEN)]
+    assert g2.dedupe_primitives(gap, 1e-6) == gap
+    mixed = [Arc(c, 2.0, 0.0, 180.0, LineStyle.HIDDEN), Arc(c, 2.0, 180.0, 360.0, LineStyle.VISIBLE)]
+    assert g2.dedupe_primitives(mixed, 1e-6) == mixed
+    radii = [Arc(c, 2.0, 0.0, 180.0, LineStyle.HIDDEN), Arc(c, 2.1, 180.0, 360.0, LineStyle.HIDDEN)]
+    assert g2.dedupe_primitives(radii, 1e-6) == radii
+
+
+def test_dedupe_drops_circle_copies_across_types_and_ring_directions():
+    """Issue 11 (08): the far-wall circle came twice as closed Polylines traversed in
+    opposite directions from the same start point; a Circle offset by 1e-6 is one."""
+    c, r = (214.697, 101.27), 1.51
+    ring = _circle_pts(c, r, 16, start=np.pi / 2)
+    rev = np.vstack([ring[:1], ring[1:][::-1]])                 # same start, other direction
+    p1 = Polyline(ring, closed=True, style=LineStyle.HIDDEN)
+    p2 = Polyline(rev, closed=True, style=LineStyle.HIDDEN)
+    assert not np.allclose(ring, rev) and not np.allclose(ring, rev[::-1])   # precondition
+    assert g2.dedupe_primitives([p1, p2], 1e-6) == [p1]
+    rolled = Polyline(np.roll(ring, 5, axis=0), closed=True, style=LineStyle.HIDDEN)
+    assert g2.dedupe_primitives([p1, rolled], 1e-6) == [p1]
+    circ = Circle(c, r, LineStyle.HIDDEN)
+    circ2 = Circle((c[0] + 1e-6, c[1]), r, LineStyle.HIDDEN)
+    assert g2.dedupe_primitives([circ, circ2], 1e-5) == [circ]
+    # a closed Polyline sampled on the circle (other count) is a copy of the Circle
+    fine = Polyline(_circle_pts(c, r, 64, start=0.3), closed=True, style=LineStyle.HIDDEN)
+    assert g2.dedupe_primitives([fine, circ], 1e-3) == [circ]
+    # ... and two rings of different sampling on one circle are one (the finer ring
+    # stays: it is the closer drawing of the circle, Z2 review)
+    assert g2.dedupe_primitives([p1, fine], 1e-2) == [fine]
+    # negative: a square ring and a circle of another radius are kept
+    sq = Polyline(_square(0, 0, 3, 3), closed=True, style=LineStyle.HIDDEN)
+    other = Circle(c, 2.0 * r, LineStyle.HIDDEN)
+    assert g2.dedupe_primitives([sq, other, p1], 1e-3) == [sq, other, p1]
+    # an open polyline on the circle is not a copy of it
+    half = Polyline(_circle_pts(c, r, 32)[:12], closed=False, style=LineStyle.HIDDEN)
+    assert g2.dedupe_primitives([circ, half], 1e-3) == [circ, half]
+
+
+def test_ring_circle_rejects_coarse_regular_polygons():
+    """Z2 review: _ring_circle only checked that the vertices lie on a circle, so any
+    regular polygon with >= 8 vertices was a 'sampled circle': an octagon next to its
+    circumscribed Circle, an octagon next to a 16-gon, an Arc on the octagon's
+    circumcircle were dropped. A ring is a circle only when every chord stays within
+    tol of the circle (sagitta) or spans at most 22.5 degrees (16+ vertices per turn)."""
+    c, r, tol = (5.0, -2.0), 4.0, 1e-3
+    octo = _circle_pts(c, r, 8, start=0.1)
+    # precondition: the octagon's vertices lie on the circle within tol and the old
+    # vertex-only test accepted it
+    assert np.max(np.abs(np.linalg.norm(octo - np.array(c), axis=1) - r)) < 1e-9
+    assert r * (1.0 - np.cos(np.pi / 8)) > tol                     # sagitta 0.30 >> tol
+    assert g2._ring_circle(octo, tol) is None
+    assert g2._ring_circle(_circle_pts(c, r, 16), tol) is not None
+    oct_p = Polyline(octo, closed=True, style=LineStyle.HIDDEN)
+    circ = Circle(c, r, LineStyle.HIDDEN)
+    assert g2.dedupe_primitives([oct_p, circ], tol) == [oct_p, circ]                  # (a)
+    p16 = Polyline(_circle_pts(c, r, 16, start=0.3), closed=True, style=LineStyle.HIDDEN)
+    assert g2.dedupe_primitives([oct_p, p16], tol) == [oct_p, p16]                    # (b)
+    arc = Arc(c, r, 10.0, 80.0, LineStyle.HIDDEN)
+    assert g2.dedupe_primitives([oct_p, arc], tol) == [oct_p, arc]                    # (c)
+    # a coarse ring of a tiny circle whose chords stay within tol IS that circle
+    rs = 0.01
+    tiny = Polyline(_circle_pts(c, rs, 8), closed=True, style=LineStyle.HIDDEN)
+    assert rs * (1.0 - np.cos(np.pi / 8)) <= tol                    # precondition
+    assert g2.dedupe_primitives([tiny, Circle(c, rs, LineStyle.HIDDEN)], tol) == [
+        Circle(c, rs, LineStyle.HIDDEN)]
+
+
+def test_drop_isolated_fragments_dangling_mode():
+    """Issue 9: a stub shorter than the limit with one free end is noise on the mesh route."""
+    long_line = Segment((0.0, 0.0), (10.0, 0.0))
+    stub = Segment((5.0, 0.0), (5.0, 0.2))               # touches the line at one end only
+    bridge = Segment((10.0, 0.0), (10.2, 0.0))            # dangling off the line end
+    link = Segment((20.0, 0.0), (20.2, 0.0))
+    a = Segment((15.0, 0.0), (20.0, 0.0))
+    b = Segment((20.2, 0.0), (25.0, 0.0))                 # link joins a and b: both ends touch
+    prims = [long_line, stub, bridge, a, link, b]
+    kept, n = g2.drop_isolated_fragments(prims, 0.5, 0.01, 0.01)
+    assert n == 0 and kept == prims                      # precondition: none is isolated
+    kept, n = g2.drop_isolated_fragments(prims, 0.5, 0.01, 0.01, dangling=True)
+    assert n == 2 and stub not in kept and bridge not in kept
+    assert link in kept and long_line in kept and a in kept and b in kept
+
+
+def test_drop_fan_duplicates_keeps_the_longer_chord():
+    """Issue 9: fan chords from one vertex whose far ends lie 0.2 apart print as one
+    thick wedge; the shorter one goes."""
+    v = (0.0, 0.0)
+    long_c = Segment(v, (30.0, 0.0))
+    short_c = Segment(v, (20.0, 0.2))
+    far = Segment(v, (20.0, 5.0))                         # another direction: kept
+    hid = Segment(v, (20.0, 0.1), LineStyle.HIDDEN)       # other style: kept
+    pl = Polyline(np.array([[0.0, 1.0], [10.0, 1.1], [20.0, 1.0]]), False)
+    out, n = g2.drop_fan_duplicates([long_c, short_c, far, hid, pl], 0.3)
+    assert n == 1 and short_c not in out and len(out) == 4
+    out2, n2 = g2.drop_fan_duplicates([long_c, short_c], 0.1)
+    assert n2 == 0                                        # ends 0.2 apart > tol: kept
+
+
+def test_drop_mostly_covered_drops_parallel_copies_only():
+    """Issue 10: a hidden run 0.2 mm beside a visible outline along its whole length."""
+    vis = np.array([[[0.0, 0.0], [50.0, 0.0]]])
+    hid = np.array([[[1.0, 0.2], [49.0, 0.2]],           # parallel copy: dropped
+                    [[0.0, 0.25], [100.0, 0.25]],         # half beside the outline: kept
+                    [[10.0, -5.0], [10.0, 5.0]],          # crossing: kept
+                    [[0.0, 1.0], [50.0, 1.0]]])           # 1 mm away: kept
+    out, removed = g2.drop_mostly_covered(hid, vis, 0.3, 0.8)
+    assert len(out) == 3 and removed == pytest.approx(48.0)
+    assert not any(np.allclose(s, hid[0]) for s in out)
+    out0, r0 = g2.drop_mostly_covered(hid, vis, 0.1, 0.8)   # precondition: 0.2 > 0.1 keeps it
+    assert len(out0) == 4 and r0 == 0.0
+
+
+def test_chain_to_primitives_close_gap_closes_a_once_broken_rim():
+    """Issue 21: a rim broken once (gap 0.6 on a 31 mm ring) is a loop for the loop
+    threshold; a C-shape with a wide opening stays open."""
+    t = np.linspace(0.0, 2.0 * np.pi, 33)[:-1]
+    ring = np.stack([5.0 * np.cos(t), 5.0 * np.sin(t)], 1)
+    broken = _ring_segments(ring)[:-1]                       # last chord missing: gap 0.98
+    st = {}
+    out0 = g2.chain_to_primitives(broken, LineStyle.VISIBLE, 1e-6, min_chain_len=40.0,
+                                  min_closed_len=1.0, stats=st)
+    assert out0 == [] and st["open_dropped"] == 1           # precondition: dropped as open
+    st = {}
+    out = g2.chain_to_primitives(broken, LineStyle.VISIBLE, 1e-6, min_chain_len=40.0,
+                                 min_closed_len=1.0, stats=st, close_gap=1.0, short_len=3.0)
+    assert len(out) == 1 and isinstance(out[0], Polyline) and out[0].closed
+    assert st["loops_closed"] == 1 and len(out[0].points) == 32
+    c_shape = _ring_segments(ring)[:-6]                      # opening of 6 chords: 5.6 apart
+    out2 = g2.chain_to_primitives(c_shape, LineStyle.VISIBLE, 1e-6, close_gap=1.0, short_len=3.0)
+    assert len(out2) == 1 and not out2[0].closed

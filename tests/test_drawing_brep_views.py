@@ -1345,3 +1345,27 @@ def test_fitted_bolt_with_another_seam_keeps_its_body():
     block = np.array([[10.0, 5.0], [20.0, 5.0], [20.0, 15.0], [10.0, 15.0]])
     assert bs.merge_void_bodies([rect, hole, bolt], [0, 0, 1], lambda b: False) == [0, 0, 1]
     assert bs.merge_void_bodies([rect, hole, block], [0, 0, 2], lambda b: False) == [0, 0, 0]
+
+
+# ------------------------------------ QA round 3 issue 11: split hidden hole circles
+
+def test_split_hidden_hole_circle_is_one_circle():
+    """01: an exporter splits periodic faces, so a hidden hole rim arrives as two
+    180-degree arcs whose dashes restart at the seam; the view holds one Circle."""
+    from OCP.ShapeUpgrade import ShapeUpgrade_ShapeDivideClosed
+    from src.drawing.brep_views import project_brep
+    from src.drawing.model import LineStyle
+    sd = ShapeUpgrade_ShapeDivideClosed(_blind_hole_from_below())
+    sd.SetNbSplitPoints(1)
+    assert sd.Perform()
+    split = sd.Result()
+    import src.drawing.brep_views as bv
+    raw = bv.edges_to_primitives(bv._compounds_exact(split, VIEWS["top"])[1](
+        bv._compounds_exact(split, VIEWS["top"])[0]).HCompound(), 0.02, LineStyle.HIDDEN)
+    raw_arcs = [p for p in raw if isinstance(p, Arc) and abs(p.radius - 5.0) < 1e-6]
+    assert len(raw_arcs) >= 2                                   # precondition: halves
+    pv = project_brep(split, VIEWS["top"], exact=True, deflection=0.02)
+    circles = [p for p in pv.hidden if isinstance(p, Circle) and abs(p.radius - 5.0) < 1e-6]
+    arcs = [p for p in pv.hidden if isinstance(p, Arc) and abs(p.radius - 5.0) < 1e-6]
+    assert arcs == [] and len(circles) == 1, pv.hidden
+    assert np.allclose(circles[0].center, (30.0, 20.0), atol=1e-6)

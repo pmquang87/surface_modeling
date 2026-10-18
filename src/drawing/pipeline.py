@@ -172,6 +172,9 @@ _BRIDGE_WARN_SHARE = 0.05
 # more, layout.strip_items; at most 64 characters with a '(' part)
 UNIT_NOTE_ASSUMED = "Dimensions in mm (unit assumed, see report)"
 UNIT_NOTE_SUSPECT = "Dimensions in mm (unit doubtful, see report)"
+# QA round 3 issue 16: routes that run no B-rep feature detection (planar facets or a
+# mesh): their undimensioned list gets one generic {kind: features} entry
+_NO_BREP_FEATURE_SOURCES = ("stl_faceted_step", "stl_mesh", "step_tessellated_mesh")
 
 stage_logger = logging.getLogger("src.drawing.stage")
 
@@ -503,6 +506,13 @@ def _section_report(ctx: _Ctx, sec, info: Optional[dict] = None) -> None:
          "seconds": st.get("seconds"), "reason": info.get("reason"),
          "hole_kind": info.get("hole_kind"),
          "retried_at_body": bool(st.get("retried_at_body", False))}
+    if d["retried_at_body"]:
+        # QA round 3 issue 26: the plane no longer goes through the point the reason names
+        d["reason"] = f"{info.get('reason') or 'plane'}_body_centroid_retry"
+        try:
+            d["retry_mm"] = round(float(st.get("retry_mm") or 0.0), 6)
+        except (TypeError, ValueError):
+            d["retry_mm"] = None
     for key in ("kept_length_ratio", "kept_area_ratio", "bridged_gaps", "bridge_max_gap",
                 "bridge_rejected", "excess_bodies", "half_space_excess_mm",
                 "half_space_excess_tol_mm", "fasteners_unsectioned", "bodies_skipped"):
@@ -530,8 +540,17 @@ def _section_report(ctx: _Ctx, sec, info: Optional[dict] = None) -> None:
                      + (f" ({100.0 * share:.3g} % of the section extent {extent:.4g} mm)"
                         if extent > 0.0 else ""))
     if st.get("nudged"):
+        try:
+            nv = float(st.get("nudge_mm"))
+            # the magnitude plus the side (the sign is relative to the plane normal)
+            nudge = (f"{abs(nv):.4g} mm "
+                     f"{'against' if nv < 0.0 else 'along'} the plane normal")
+        except (TypeError, ValueError):
+            nudge = "one step"
         ctx.rep.flag("section_nudged", "info", "the plane gave no closed loop (or lay in a "
-                     "planar face) and was moved by 1 % of the depth")
+                     f"planar face) and was moved by {nudge} (1 % of the depth)"
+                     + (f"; still empty, then moved {float(d.get('retry_mm') or 0.0):.4g} mm "
+                        f"through a body centroid" if d["retried_at_body"] else ""))
     if int(st.get("open_wires_dropped", 0) or 0) > 0:
         ctx.rep.flag("section_open_wires", "warning",
                      f"{st.get('open_wires_dropped')} open section wire(s) dropped")
@@ -738,14 +757,25 @@ def _brep_stage(ctx: _Ctx, shape, lo, hi, *, exact_ok: bool, features_on: bool,
                                features=ctx.features or None)
             sec.marker_view = marker
             _section_report(ctx, sec, info)
+            st_sec = sec.stats or {}
+            retry = ""
+            if st_sec.get("retried_at_body"):
+                # QA round 3 issue 26: the plane moved; the text says where it went
+                try:
+                    off = f"{float(st_sec.get('retry_mm') or 0.0):.4g} mm"
+                except (TypeError, ValueError):
+                    off = "an unknown offset"
+                retry = (f"; the bbox-centre plane cut nothing and was moved {off} through "
+                         f"a body centroid")
             if info.get("reason") == "bbox_centre_fallback":
                 ctx.rep.flag("section_fallback", "info",
-                             "no hole axis fits the section mode: the plane goes through the "
-                             "bbox centre")
+                             "no hole axis fits the section mode"
+                             + (retry or ": the plane goes through the bbox centre"))
             elif info.get("reason") == "thin_part":
                 ctx.rep.flag("section_fallback", "info",
-                             "no hole axis fits the section mode and the part is thin: the top "
-                             "plane goes through the bbox centre")
+                             "no hole axis fits the section mode and the part is thin"
+                             + (retry.replace("bbox-centre plane", "top plane") or
+                                ": the top plane goes through the bbox centre"))
             ctx.section = sec if sec.loops else None
     except Exception as exc:
         if strict:
@@ -969,11 +999,13 @@ def _run_step_tessellated(ctx: _Ctx, exc) -> None:
                  f"converted the geometry to mm on read")
     # QA round 2 issue 24: what the triangles leave out, as on the B-rep route
     rep.data["route"]["stl_to_step"]["skipped_reason"] = "tessellated_step"
-    bodies = dict(getattr(exc, "bodies", None) or {})
     dropped = {k: int(v) for k, v in (getattr(exc, "dropped", None) or {}).items()
                if isinstance(v, (int, float)) and int(v) > 0}
-    bodies["dropped"] = dropped
+    bodies = _tessellated_bodies(getattr(exc, "bodies", None) or {}, dropped)
+    dropped = bodies["dropped"]
     rep.data["geometry"]["bodies"] = bodies
+    if bodies.get("solids") is not None:              # QA round 3 issue 25
+        rep.data["geometry"]["solids"] = bodies.get("solids")
     n_shells = int(dropped.get("tessellated_shells_outside", 0) or 0)
     supp = {k: int(dropped.get(k, 0)) for k in ("free_shells", "free_faces", "tessellated_bodies")
             if dropped.get(k)}
@@ -1013,10 +1045,46 @@ def _run_step_tessellated(ctx: _Ctx, exc) -> None:
     _mesh_stage(ctx, mesh_o, organic)
 
 
+_FOLDED_TESS_KEYS = ("free_shells", "free_faces", "tessellated_bodies")
+
+
+def _tessellated_bodies(bodies: dict, dropped: dict) -> dict:
+    """``geometry.bodies`` of a tessellated-only STEP (QA round 3 issue 25).
+
+    ``tessellated_shells_outside`` (``brep_load.tessellated_dropped``) is the
+    larger of the transfer's dropped free shells / faces / tessellated bodies
+    and the text count, so it already holds them: those keys are removed from
+    ``dropped`` (FTC 08 counted its one supplemental shell twice). Every body
+    of this route is tessellated, so a ``tessellated_bodies`` of 0 (the
+    loader keeps all-tessellated input as is and counts none) becomes the
+    drawn bodies: the solids, else the free shells plus one for loose faces.
+    Returns a new dict with ``dropped`` set; never raises.
+    """
+    out = dict(bodies or {})
+    d = {k: v for k, v in dict(dropped or {}).items()}
+    if d.get("tessellated_shells_outside"):
+        for k in _FOLDED_TESS_KEYS:
+            d.pop(k, None)
+    out["dropped"] = d
+    try:
+        n_tess = int(out.get("tessellated_bodies") or 0)
+        if n_tess <= 0:
+            if out.get("drawn") == "solids" or int(out.get("solids") or 0) > 0:
+                n_tess = int(out.get("solids") or 0)
+            else:
+                n_tess = int(out.get("free_shells") or 0) + (1 if out.get("free_faces") else 0)
+            out["tessellated_bodies"] = n_tess
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
 def _mesh_geometry(ctx: _Ctx, census: dict) -> None:
     g = ctx.rep.data["geometry"]
     for key in ("bbox_min", "bbox_max", "extents", "volume_mm3", "area_mm2", "triangles",
-                "watertight", "components", "volume_approximate", "volume_source"):
+                "watertight", "components", "volume_approximate", "volume_source",
+                # QA round 3 issue 28: the census values behind the winding / volume flags
+                "winding_conflicts", "degenerate_faces", "volume_raw_signed_mm3"):
         g[key] = census.get(key)
     if census.get("boundary_edges") is not None:
         g["closed"] = int(census.get("boundary_edges") or 0) == 0
@@ -1063,6 +1131,13 @@ def _mesh_flags(ctx: _Ctx, census: dict, cls: dict) -> Tuple[bool, bool]:
         rep.flag("winding_repaired", "info",
                  f"{conflicts} winding conflict(s): volume {g(census.get('volume_mm3'))} mm3 "
                  f"from a winding-repaired copy (raw signed sum {g(raw_signed)} mm3)")
+    elif conflicts > 0 and not inverted_solid and not census.get("inverted"):
+        # QA round 3 issue 28: an open mesh has no repaired volume, so neither branch
+        # above reported its inconsistent winding (the 25 wheel: 160 conflicts)
+        rep.flag("mesh_winding_inconsistent", "info",
+                 f"{conflicts} edge(s) whose two faces run the winding in the same direction"
+                 + ("" if census.get("watertight") else " on an open mesh")
+                 + ": no winding-repaired volume; the views are not affected")
     comps = int(census.get("components") or 0)
     if comps > 0:
         ctx.n_bodies = comps
@@ -1396,6 +1471,29 @@ def _assembly_hole_groups(features) -> List[dict]:
                                                                          kv[0][1]))]
 
 
+def _assembly_omission_detail(omitted) -> str:
+    """The count part of the ``dimensions_omitted_assembly`` detail, split by reason (QA
+    round 3 issue 27: the total of both reasons was printed as 'reason assembly' and the
+    filled holes appeared a second time after it):
+    ``'8 hole feature(s) in 2 radius group(s), reason assembly; 4 in 1 group(s) filled by
+    a fastener, reason filled_by_fastener'``."""
+    n_asm = g_asm = n_fill = g_fill = 0
+    for u in omitted or []:
+        try:
+            n = int(u.get("count") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if u.get("reason") == "filled_by_fastener":
+            n_fill, g_fill = n_fill + n, g_fill + 1
+        else:
+            n_asm, g_asm = n_asm + n, g_asm + 1
+    text = f"{n_asm} hole feature(s) in {g_asm} radius group(s), reason assembly"
+    if n_fill:
+        text += (f"; {n_fill} in {g_fill} group(s) filled by a fastener, reason "
+                 f"filled_by_fastener")
+    return text
+
+
 def _report_dimensions(rep: Report, plan) -> None:
     rep.data["dimensions"] = [{"kind": d.kind, "view": d.view, "value_mm": float(d.value),
                                "text": d.text, "count": int(d.count)} for d in plan.dims]
@@ -1426,7 +1524,21 @@ def _report_section_fill(rep: Report, sl: dict, scale: Optional[float] = None) -
     from .style import section_fill_below
     sec = rep.data["section"]
     sec["hatch_segments"] = int(sl.get("hatch_segments") or 0)
-    sec["hatch_spacing_mm"] = sl.get("hatch_spacing")
+    # QA round 3 issue 1: the layout hatches each body at ONE spacing; hatch_spacing is the
+    # drawn one (the single value, or the smallest when the bodies differ) and the per-body
+    # list (None for a filled body) is hatch_spacings_mm
+    # (rounded like the list; None when nothing is hatched, e.g. an all-solid thin section)
+    try:
+        hs = sl.get("hatch_spacing")
+        sec["hatch_spacing_mm"] = None if hs is None else round(float(hs), 4)
+    except (TypeError, ValueError):
+        sec["hatch_spacing_mm"] = None
+    if sl.get("body_spacing") is not None:
+        try:
+            sec["hatch_spacings_mm"] = [None if v is None else round(float(v), 4)
+                                        for v in list(sl.get("body_spacing"))[:64]]
+        except (TypeError, ValueError):
+            pass
     sec["fill"] = sl.get("fill")
     sec["filled_regions"] = int(sl.get("filled_regions") or 0)
     try:
@@ -1497,21 +1609,22 @@ def _sheet_and_write(ctx: _Ctx) -> None:
             plan = dimensions.DimensionPlan(dims=[], undimensioned=[])
         if ctx.assembly:
             plan.undimensioned = list(omitted) + list(plan.undimensioned)
-            n_holes = sum(int(u.get("count") or 0) for u in omitted)
-            n_filled = sum(int(u.get("count") or 0) for u in omitted
-                           if u.get("reason") == "filled_by_fastener")
-            filled_txt = (f"; {n_filled} filled by a fastener, reason filled_by_fastener"
-                          if n_filled else "")
             rep.flag("dimensions_omitted_assembly", "info",
                      f"{ctx.n_bodies} solids > {_ASSEMBLY_MIN_SOLIDS}: no hole callouts and no "
-                     f"position dimensions ({n_holes} hole feature(s) in {len(omitted)} radius "
-                     f"group(s), undimensioned reason assembly{filled_txt})")
+                     f"position dimensions ({_assembly_omission_detail(omitted)})")
         hidden_only = int((getattr(plan, "stats", None) or {}).get("hidden_only") or 0)
         if hidden_only > 0:
             # R3: callouts are placed on visible circles only (QA round 2 issue 27)
             rep.flag("dimension_hidden_only", "info",
                      f"{hidden_only} hole feature(s) seen only as hidden circles in their axial "
                      f"view: no callout (see undimensioned)")
+    if ctx.source in _NO_BREP_FEATURE_SOURCES:
+        # QA round 3 issue 16: no feature detection on this route, so the drawn holes,
+        # pockets and fillets carry no dimension; an empty undimensioned list would read
+        # as "fully dimensioned"
+        plan.undimensioned = list(plan.undimensioned) + [
+            {"kind": "features", "count": None, "reason": "route_without_brep_features",
+             "view": None, "route": ctx.source}]
     t_dims = time.perf_counter()
     ctx.timing["dimensions_s"] = ctx.timing.get("dimensions_s", 0.0) + (t_dims - t0)
     _report_dimensions(rep, plan)

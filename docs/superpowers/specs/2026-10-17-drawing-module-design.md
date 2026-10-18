@@ -517,8 +517,8 @@ flags: `holes_not_detected_mesh_route`, `organic_classified`,
 `approval_blank` (listed as a warning in the first version of this spec; the
 approval field of an auto-generated drawing is always blank, so a warning
 would make every run exit 2), `loose_curves_ignored`,
-`supplemental_shells_ignored`, `supplemental_geometry_ignored`,
-`loose_curves_drawn`, `unit_assumed_mm`, `unit_suspect`, `section_fallback`,
+`supplemental_shells_ignored`, `mesh_winding_inconsistent`,
+`unit_assumed_mm`, `unit_suspect`, `section_fallback`,
 `interior_silhouettes_omitted`, `hidden_lines_omitted_assembly`,
 `layout_text_moved`, `layout_dims_dropped`, `dimensions_omitted_assembly`,
 `section_skipped_assembly`, `section_blackened`, `section_gaps_bridged`,

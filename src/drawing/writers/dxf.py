@@ -84,7 +84,7 @@ import numpy as np
 from ..model import (Arc, Circle, Dimension, HatchLines, LineStyle, Polygon, Polyline, Segment,
                      Sheet, Text)
 from ..style import DEFAULT_STYLE, SheetStyle
-from . import CAP_HEIGHT, arc_span, clean_text, hidden_ltscale, valid_item
+from . import CAP_HEIGHT, arc_span, clean_text, hidden_ltscale, hidden_pieces, valid_item
 from .svg import polyline_points
 
 log = logging.getLogger(__name__)
@@ -627,11 +627,13 @@ def write_dxf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE, 
         if copy:
             replaced += 1
             continue
-        k = None
-        if isinstance(item, (Segment, Polyline, Circle, Arc)):
-            k = hidden_ltscale(item, sheet_style)
-            adapted += int(k is not None)
-        _add_item(msp, item, sheet_style, ltscale=k)
+        # hidden polylines with short corner legs: one entity per piece (QA round 3 issue 23)
+        for piece in hidden_pieces(item, sheet_style):
+            k = None
+            if isinstance(piece, (Segment, Polyline, Circle, Arc)):
+                k = hidden_ltscale(piece, sheet_style)
+                adapted += int(k is not None)
+            _add_item(msp, piece, sheet_style, ltscale=k)
     if skipped:
         log.warning("dxf: skipped %d degenerate or non-finite items", skipped)
 

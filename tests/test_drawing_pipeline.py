@@ -1020,7 +1020,11 @@ def test_issue19_triangle_soup_is_not_a_solid(tmp_path):
     assert rep["route"]["pipeline"] == "mesh"
     assert rep["route"]["stl_to_step"]["skipped_reason"] == "not_solid"
     assert rep["section"] is None and rep["dimensions"] == []
-    assert rep["undimensioned"] == [{"kind": "overall", "reason": "not_a_solid", "view": None}]
+    # QA round 3 issue 16: the mesh route also discloses the features it cannot detect
+    assert rep["undimensioned"] == [{"kind": "overall", "reason": "not_a_solid", "view": None},
+                                    {"kind": "features", "count": None,
+                                     "reason": "route_without_brep_features", "view": None,
+                                     "route": "stl_mesh"}]
     assert rep["quality"]["level"] == "minimal"
 
 
@@ -1975,8 +1979,11 @@ def test_r5_assembly_filled_holes_are_disclosed_end_to_end(tmp_path, monkeypatch
     assert sum(int(u["count"]) for u in filled) == 3, und
     assert sum(int(u["count"]) for u in asm) == 12, und
     fl = [f for f in rep["quality"]["flags"] if f["code"] == "dimensions_omitted_assembly"]
-    assert len(fl) == 1 and "15 hole feature(s)" in fl[0]["detail"], fl
-    assert "3 filled" in fl[0]["detail"], fl
+    # QA round 3 issue 27: the counts are split by reason (the old detail printed the total
+    # 15 as 'reason assembly' and the 3 filled holes again after it)
+    assert len(fl) == 1 and "12 hole feature(s)" in fl[0]["detail"], fl
+    assert "15 hole" not in fl[0]["detail"], fl
+    assert "3 in 1 group(s) filled by a fastener" in fl[0]["detail"], fl
 
 
 def _section_report_for(tmp_path, sl, scale=None):
@@ -2034,3 +2041,225 @@ def test_r5_timing_has_features_dimensions_and_layout_buckets(plate_files, tmp_p
     # write_s stays the whole sheet stage: dimensions + layout + writers
     parts = t["dimensions_s"] + t["layout_s"] + t["writers_s"]
     assert abs(parts - t["write_s"]) < 0.05 + 0.02 * t["write_s"], t
+
+
+# ======================================================= QA round 3 (task Z1) ==
+
+def _u_channel(thin=2.0, thick=10.0, length=40.0, width=30.0, base=5.0, height=25.0):
+    """U channel along x: base 0..base in z, a thin wall at y 0..thin and a thick wall at
+    y width-thick..width, both up to z = height. ONE solid; a z plane above the base cuts it
+    into two separate regions (the walls)."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    s = _box_shape(length, width, height)
+    gap = _box_shape(length + 2.0, width - thin - thick, height, origin=(-1.0, thin, base))
+    return BRepAlgoAPI_Cut(s, gap).Shape()
+
+
+@needs_ocp
+def test_z1_issue1_one_hatch_spacing_per_body_and_the_report_gives_the_drawn_one(tmp_path):
+    """QA round 3 issue 1: the two walls of one solid were hatched at 3 mm and t/3; the
+    report gave the nominal value. Now one spacing per body, measured from the DXF HATCH."""
+    import ezdxf
+    from src.drawing.pipeline import run
+    from src.drawing.writers.dxf import ANSI31_SPACING
+    p = _write_step(_u_channel(), tmp_path / "u.step")
+    _, rep = run(p, str(tmp_path / "o"), _opts(formats=("dxf",), views=("front", "top"),
+                                               section="top", orient="fixed"))
+    assert rep["ok"] is True, rep["error"]
+    sec = rep["section"]
+    assert sec["loops"] == 2 and sec.get("bodies") == 1          # precondition: 2 regions, 1 body
+    doc = ezdxf.readfile(str(tmp_path / "o" / "u.dxf"))
+    spacings = [round(h.dxf.pattern_scale * ANSI31_SPACING, 4)
+                for h in doc.modelspace().query("HATCH") if not h.dxf.solid_fill]
+    assert len(spacings) == 2, spacings
+    assert len(set(spacings)) == 1, spacings                       # one part, one spacing
+    assert sec["hatch_spacing_mm"] == pytest.approx(spacings[0], abs=1e-3)
+    assert sec["hatch_spacings_mm"] == [pytest.approx(spacings[0], abs=1e-3)]
+
+
+def test_z1_issue1_report_section_fill_takes_the_drawn_spacing(tmp_path):
+    sl = {"fill": "hatch", "hatch_spacing": 1.5, "body_spacing": [3.0, None, 1.5],
+          "hatch_segments": 10, "bodies": 3}
+    sec = _section_report_for(tmp_path, sl, scale=1.0).data["section"]
+    assert sec["hatch_spacing_mm"] == 1.5                           # the drawn minimum
+    assert sec["hatch_spacings_mm"] == [3.0, None, 1.5]
+
+
+def test_z1_issue16_routes_without_brep_features_disclose_the_omission(plate_files, tmp_path):
+    from src.drawing.pipeline import run
+    ent = {"kind": "features", "reason": "route_without_brep_features"}
+
+    def has(rep):
+        return any(all(u.get(k) == v for k, v in ent.items()) for u in rep["undimensioned"])
+    _, ref = run(plate_files["step"], str(tmp_path / "s"), _opts(formats=("svg",),
+                                                                views=("front", "top")))
+    assert ref["ok"] is True and ref["route"]["source"] == "step"
+    assert not has(ref)                                            # control: true B-rep route
+    for mode, source in (("auto", "stl_faceted_step"), ("off", "stl_mesh")):
+        _, rep = run(plate_files["stl"], str(tmp_path / mode),
+                     _opts(formats=("svg",), views=("front", "top"), stl_to_step=mode))
+        assert rep["ok"] is True, rep["error"]
+        assert rep["route"]["source"] == source                    # precondition
+        assert rep["geometry"]["features"]["holes"] is None        # nothing was detected
+        assert has(rep), rep["undimensioned"]
+        e = next(u for u in rep["undimensioned"] if u.get("kind") == "features")
+        assert e.get("route") == source
+
+
+def test_z1_issue25_tessellated_dropped_shell_is_counted_once():
+    from src.drawing.pipeline import _tessellated_bodies
+    bodies = {"solids": 1, "free_shells": 1, "free_faces": 0, "tessellated_bodies": 0,
+              "drawn": "solids"}
+    dropped = {"free_shells": 1, "tessellated_shells_outside": 1, "annotation_occurrences": 60}
+    out = _tessellated_bodies(bodies, dropped)
+    assert out["dropped"] == {"tessellated_shells_outside": 1, "annotation_occurrences": 60}
+    assert out["tessellated_bodies"] == 1            # every drawn body of this route is tessellated
+    # control: without the folded count the transfer's own keys stay
+    out2 = _tessellated_bodies(bodies, {"free_shells": 1})
+    assert out2["dropped"] == {"free_shells": 1}
+    # a value the loader already filled is kept
+    assert _tessellated_bodies(dict(bodies, tessellated_bodies=2), {})["tessellated_bodies"] == 2
+
+
+@needs_ocp
+def test_z1_issue25_tessellated_route_fills_solids_and_tessellated_bodies(tmp_path):
+    from src.drawing.pipeline import run
+    p = tmp_path / "tess.stp"
+    p.write_text(_tess_step_text(), encoding="ascii")
+    _, rep = run(str(p), str(tmp_path / "o"), _opts(formats=("svg",), views=("front",)))
+    assert rep["ok"] is True and rep["route"]["source"] == "step_tessellated_mesh"
+    g = rep["geometry"]
+    assert g["bodies"]["solids"] == 1                              # precondition
+    assert g["solids"] == 1
+    assert g["bodies"]["tessellated_bodies"] >= 1
+
+
+@needs_ocp
+def test_z1_issue26_section_reason_after_the_body_centroid_retry(tmp_path):
+    from src.drawing.pipeline import run
+    two = _compound([_box_shape(20, 20, 2), _box_shape(20, 20, 2, origin=(0.0, 0.0, 8.0))])
+    p = _write_step(two, tmp_path / "two.step")
+    _, rep = run(p, str(tmp_path / "o"), _opts(formats=("svg",), views=("front", "top")))
+    assert rep["ok"] is True, rep["error"]
+    sec = rep["section"]
+    assert sec["retried_at_body"] is True                          # precondition: the gap plane
+    assert "body_centroid" in sec["reason"], sec["reason"]
+    assert abs(sec["retry_mm"]) > 1.0
+    fl = [f for f in rep["quality"]["flags"] if f["code"] == "section_fallback"]
+    assert len(fl) == 1 and "goes through the bbox centre" not in fl[0]["detail"], fl
+    assert "centroid" in fl[0]["detail"]
+
+
+def test_z1_issue27_assembly_omission_detail_splits_the_reasons():
+    from src.drawing.pipeline import _assembly_omission_detail
+    omitted = [{"reason": "assembly", "count": 5}, {"reason": "assembly", "count": 3},
+               {"reason": "filled_by_fastener", "count": 4}]
+    t = _assembly_omission_detail(omitted)
+    assert "8 hole feature(s) in 2 radius group(s), reason assembly" in t, t
+    assert "4 in 1 group(s) filled by a fastener" in t, t
+    assert "12" not in t                                           # no double-counted total
+    assert "filled" not in _assembly_omission_detail(omitted[:2])
+
+
+def _open_misoriented_box(path):
+    import trimesh
+    m = trimesh.creation.box(extents=(20.0, 10.0, 5.0))
+    faces = m.faces[1:].copy()                                     # one face deleted: open
+    faces[[1, 2, 3]] = faces[[1, 2, 3]][:, ::-1]                   # three faces flipped
+    trimesh.Trimesh(m.vertices.copy(), faces, process=False).export(str(path))
+    return str(path)
+
+
+def test_z1_issue28_open_mesh_with_inconsistent_winding_is_flagged(tmp_path):
+    from src.drawing.mesh_load import load_mesh_model
+    from src.drawing.pipeline import run
+    p = _open_misoriented_box(tmp_path / "open.stl")
+    c = load_mesh_model(p).census
+    assert c["winding_conflicts"] > 0 and not c["volume_repaired"]   # precondition
+    _, rep = run(p, str(tmp_path / "o"), _opts(formats=("svg",), views=("front",),
+                                               stl_to_step="off"))
+    assert rep["ok"] is True, rep["error"]
+    fl = [f for f in rep["quality"]["flags"] if f["code"] == "mesh_winding_inconsistent"]
+    assert len(fl) == 1 and fl[0]["severity"] == "info", rep["quality"]["flags"]
+    assert str(c["winding_conflicts"]) in fl[0]["detail"]
+    assert rep["geometry"]["winding_conflicts"] == c["winding_conflicts"]
+    assert "degenerate_faces" in rep["geometry"]
+    # control: a closed, consistently wound box raises nothing about the winding
+    q = _box_stl(tmp_path / "ok.stl", (20.0, 10.0, 5.0))
+    _, ok = run(q, str(tmp_path / "k"), _opts(formats=("svg",), views=("front",),
+                                              stl_to_step="off"))
+    assert "mesh_winding_inconsistent" not in _codes(ok)
+    assert ok["geometry"]["winding_conflicts"] == 0
+
+
+def test_z1_issue29_never_raised_flags_are_gone_and_fallback_wording():
+    from src.drawing.report import FLAG_MEANINGS, FLAGS
+    for code in ("loose_curves_drawn", "supplemental_geometry_ignored"):
+        assert code not in FLAGS and code not in FLAG_MEANINGS
+    m = FLAG_MEANINGS["section_fallback"]
+    assert "no solid (no section)" not in m
+    assert "surface model" in m and "not_a_solid" in m
+    assert FLAGS.get("mesh_winding_inconsistent") == "info"
+    path = os.path.join(REPO, "docs", "drawing_module.md")
+    text = open(path, encoding="utf-8").read()
+    assert "`loose_curves_drawn`" not in text and "`supplemental_geometry_ignored`" not in text
+
+
+@needs_ocp
+def test_z1_issue30_sandboxed_quiet_run_keeps_the_stage_lines_on_stderr(tmp_path):
+    p = _write_step(_box_shape(30, 20, 10), tmp_path / "box.step")
+    proc = _cli([p, str(tmp_path / "o"), "--quiet", "--formats", "svg", "--views", "front"])
+    rep = _result(proc)
+    assert rep["sandbox"]["enabled"] is True                       # precondition: sandboxed
+    lines = [ln for ln in proc.stderr.splitlines() if ln.strip()]
+    assert lines, "no stage line reached stderr under --quiet"
+    assert all("src.drawing.stage" in ln for ln in lines), lines[:5]
+    assert any("stage done" in ln for ln in lines), lines
+
+
+def test_z1_issue30_docs_name_the_run3_timeout():
+    text = open(os.path.join(REPO, "docs", "drawing_module.md"), encoding="utf-8").read()
+    for ln in text.splitlines():
+        if "default limits" in ln:
+            assert "--timeout" in ln, ln
+    assert "--timeout 300" in text.split("## Measured numbers", 1)[1].split("HLR (front", 1)[0]
+
+
+# ---- review Z1: report rounding and wording --------------------------------------------
+
+def test_z1_review_hatch_spacing_is_rounded_like_the_list_and_null_when_all_solid(tmp_path):
+    raw = 1.0597614673911924                                      # the unrounded value of FTC 08
+    sl = {"fill": "hatch", "hatch_spacing": raw, "body_spacing": [raw], "hatch_segments": 4,
+          "bodies": 1}
+    sec = _section_report_for(tmp_path, sl, scale=1.0).data["section"]
+    assert round(raw, 4) != raw                                   # precondition: needs rounding
+    assert sec["hatch_spacing_mm"] == 1.0598 and sec["hatch_spacings_mm"] == [1.0598]
+    solid = {"fill": "solid", "hatch_spacing": None, "body_spacing": [None], "hatch_segments": 0,
+             "bodies": 1}
+    sec2 = _section_report_for(tmp_path, solid, scale=1.0).data["section"]
+    assert sec2["hatch_spacing_mm"] is None and sec2["hatch_spacings_mm"] == [None]
+
+
+def test_z1_review_section_nudged_detail_gives_magnitude_and_side(tmp_path):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from src.drawing.pipeline import _Ctx, _section_report
+    from src.drawing.report import Report
+
+    def detail(nudge):
+        rep = Report(str(tmp_path / "p.step"), str(tmp_path), _opts())
+        ctx = _Ctx(rep, str(tmp_path / "p.step"), str(tmp_path), _opts(), lambda s: None)
+        sec = SimpleNamespace(label="A", spec=SimpleNamespace(name="top"), marker_view="front",
+                              plane_point=np.zeros(3), plane_normal=np.array([0.0, 0.0, 1.0]),
+                              loops=[np.array([[0, 0], [1, 0], [1, 1]], float)],
+                              stats={"nudged": True, "nudge_mm": nudge})
+        _section_report(ctx, sec)
+        f = [fl for fl in rep.data["quality"]["flags"] if fl["code"] == "section_nudged"]
+        assert len(f) == 1                                        # precondition: the flag fires
+        return f[0]["detail"]
+
+    neg, pos = detail(-0.003399), detail(0.25)
+    assert "-0.0034" not in neg and "0.003399 mm against the plane normal" in neg, neg
+    assert "0.25 mm along the plane normal" in pos, pos

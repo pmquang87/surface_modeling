@@ -761,8 +761,15 @@ DEPTH_CAVITY_MAX_IMBALANCE = 0.02  # ... and the projected areas of both sides a
 
 def choose_depth_sign_mesh(mesh, matrix, margin: float = 1.2,
                            cavity_share: float = DEPTH_CAVITY_SHARE,
-                           cavity_ratio: float = DEPTH_CAVITY_RATIO) -> dict:
+                           cavity_ratio: float = DEPTH_CAVITY_RATIO, *,
+                           organic: bool = False) -> dict:
     """Keep or flip the front view's depth sign for a mesh drawn with ``matrix``.
+
+    ``organic`` (QA round 3 issue 35): the classifier verdict was organic.
+    'Look into the cavity' means nothing on a scan (the bunny's back is a
+    larger open recess than its front and the iso showed the back), so the
+    cavity rule is skipped and only the feature-edge rule decides; the
+    reason then says 'organic: cavity rule skipped'.
 
     ``matrix`` is the orientation (``v' = matrix @ v``) from
     ``projection.auto_orientation``; the front viewer stands at -Y of the
@@ -805,9 +812,11 @@ def choose_depth_sign_mesh(mesh, matrix, margin: float = 1.2,
     # (divergence theorem): a triangle soup (QA 22: 12-21 %, cavity 2 x the bbox)
     # or a badly wound / broken mesh (QA 21: 32 %, 25: 4.7 %) is not trusted
     reliable = imbalance <= DEPTH_CAVITY_MAX_IMBALANCE and share <= 1.0
-    if not reliable:
+    if organic:
+        cav_txt += "; organic: cavity rule skipped"
+    elif not reliable:
         cav_txt += f"; not used: projected areas differ by {100.0 * imbalance:.3g} %"
-    if reliable and vol > 0 and share >= float(cavity_share) and \
+    if not organic and reliable and vol > 0 and share >= float(cavity_share) and \
             (c_flip > r * c_keep or c_keep > r * c_flip):
         method = "mesh_cavity"
         flip = bool(c_flip > r * c_keep)

@@ -1088,3 +1088,175 @@ def test_dxf_iso_linetypes_from_sheet_style(tmp_path, style):
     # no-op guard: the stock DASHED pattern is not the ISO hidden pattern
     stock = doc.linetypes.get("DASHED").simplified_line_pattern()
     assert tuple(stock) != pytest.approx(_iso_pattern(style.dash_hidden), abs=1e-6)
+
+
+# --------------------------------- QA round 3: arc dash rule, one tolerance, corner legs
+
+import math  # noqa: E402
+
+
+def _arc_fill(length, pattern):
+    """(n, rest): whole periods n of ``pattern`` before the closing dash, and the
+    length left once n periods plus one dash are laid out (0 = exact fit)."""
+    d, g = float(pattern[0]), float(pattern[1])
+    n = (length - d) / (d + g)
+    return n, length - (round(n) * (d + g) + d)
+
+
+def test_hidden_arc_gets_whole_periods_and_a_closing_dash():
+    """Issue 11: a 180-degree hidden arc (01: r 3.81 = 3.19 periods) was dashed like an
+    open line from phase 0 and ended in a gap."""
+    from src.drawing.writers import hidden_ltscale, item_line_props
+    arc = Arc((0.0, 0.0), 3.81, 0.0, 180.0, LineStyle.HIDDEN)
+    L = 3.81 * math.pi
+    std = tuple(DEFAULT_STYLE.dash_hidden)
+    n0, rest0 = _arc_fill(L, std)
+    assert abs(rest0) > 0.1                               # precondition: the stock pattern does not fit
+    _, dash, adapted = item_line_props(arc)
+    assert adapted
+    n, rest = _arc_fill(L, dash)
+    assert abs(rest) < 1e-6 and round(n) >= 2 and abs(n - round(n)) < 1e-6
+    # the DXF decides the same and its uniform scale also fits whole periods + a dash
+    k = hidden_ltscale(arc)
+    assert k is not None
+    nk, restk = _arc_fill(L, [v * k for v in std])
+    assert abs(restk) < 1e-6 and round(nk) == round(n)
+    # a 270-degree arc gets at least 3 periods, a semicircle of r 1 at least 2
+    _, d270, _ = item_line_props(Arc((0.0, 0.0), 1.0, 0.0, 270.0, LineStyle.HIDDEN))
+    assert round(_arc_fill(1.5 * math.pi, d270)[0]) >= 3
+    _, d180, _ = item_line_props(Arc((0.0, 0.0), 1.0, 90.0, 270.0, LineStyle.HIDDEN))
+    assert round(_arc_fill(math.pi, d180)[0]) >= 2
+    # visible arcs and full circles keep their rules
+    assert item_line_props(Arc((0.0, 0.0), 3.81, 0.0, 180.0, LineStyle.VISIBLE))[1] is None
+
+
+def test_dash_adapted_is_one_decision_in_every_writer():
+    """Issue 34: PDF/SVG called a pattern adapted at a 1e-9 difference, the DXF only
+    beyond 1 % - 124 vs 104 on the 22 soup."""
+    from src.drawing.writers import hidden_ltscale, item_line_props
+    period = sum(DEFAULT_STYLE.dash_hidden)
+    c = Circle((0.0, 0.0), 4.02 * period / (2.0 * math.pi), LineStyle.HIDDEN)
+    assert item_line_props(c)[2] == (hidden_ltscale(c) is not None)
+    assert item_line_props(c)[2] is False                 # 0.5 % off a whole number: stock
+    rng = np.random.default_rng(7)
+    for L in rng.uniform(0.3, 40.0, 200):
+        r = float(L) / (2.0 * math.pi)
+        pts = np.array([[0.0, 0.0], [0.5 * L, 0.0], [0.5 * L, 0.5 * L]])
+        for it in (Segment((0.0, 0.0), (float(L), 0.0), LineStyle.HIDDEN),
+                   Circle((0.0, 0.0), r, LineStyle.HIDDEN),
+                   Arc((0.0, 0.0), r * 2.0, 0.0, 180.0, LineStyle.HIDDEN),
+                   Arc((0.0, 0.0), r * 4.0, 10.0, 60.0, LineStyle.HIDDEN),
+                   Polyline(pts, False, LineStyle.HIDDEN)):
+            assert item_line_props(it)[2] == (hidden_ltscale(it) is not None), (L, it)
+
+
+def _u_sheet():
+    pts = np.array([[100.0, 100.0], [100.0, 103.18], [105.56, 103.18], [105.56, 100.0]])
+    return Sheet("A3", 420.0, 297.0, items=[Polyline(pts, False, LineStyle.HIDDEN)],
+                 meta={"scale": 1.0}), [3.18, 5.56, 3.18]
+
+
+def test_hidden_pieces_split_short_corner_legs_only():
+    """Issue 23 (18): the counterbore U (3.18 + 5.56 + 3.18 = 11.9 mm) kept the stock
+    dash from phase 0, so the first 3.18 mm leg printed solid."""
+    from src.drawing.writers import hidden_pieces, item_line_props
+    sheet, legs = _u_sheet()
+    u = sheet.items[0]
+    std = tuple(DEFAULT_STYLE.dash_hidden)
+    assert item_line_props(u)[1] == pytest.approx(std)    # precondition: one stock pattern
+    assert _dash_pieces(legs[0], std, False)[1] == 0      # ... the first leg shows no gap
+    pieces = hidden_pieces(u)
+    assert len(pieces) == 3
+    for p, leg in zip(pieces, legs):
+        L = float(np.linalg.norm(np.diff(np.asarray(p.points if isinstance(p, Polyline)
+                                                     else [p.a, p.b]), axis=0), axis=1).sum())
+        assert L == pytest.approx(leg)
+        assert _dash_pieces(leg, item_line_props(p)[1], False)[1] >= 1
+    # a long straight run and a gently curved one stay one piece
+    t = np.linspace(0.0, 1.0, 40)
+    arc_pl = Polyline(np.column_stack([50.0 * np.cos(t), 50.0 * np.sin(t)]), False, LineStyle.HIDDEN)
+    assert hidden_pieces(arc_pl) == [arc_pl]
+    long_l = Polyline(np.array([[0.0, 0.0], [30.0, 0.0], [30.0, 30.0]]), False, LineStyle.HIDDEN)
+    assert hidden_pieces(long_l) == [long_l]
+    # legs shorter than 1 mm (mesh zig-zags) do not split; visible polylines never split
+    zig = Polyline(np.array([[0.0, 0.0], [0.4, 0.4], [0.8, 0.0], [1.2, 0.4], [10.0, 0.4]]), False,
+                   LineStyle.HIDDEN)
+    assert hidden_pieces(zig) == [zig]
+    vis = Polyline(u.points, False, LineStyle.VISIBLE)
+    assert hidden_pieces(vis) == [vis]
+    # a closed rectangle 2 x 20 splits into its four sides
+    rect = Polyline(np.array([[0.0, 0.0], [20.0, 0.0], [20.0, 2.0], [0.0, 2.0]]), True,
+                    LineStyle.HIDDEN)
+    assert len(hidden_pieces(rect)) == 4
+
+
+def test_svg_pdf_dxf_write_every_corner_leg_with_a_gap(tmp_path):
+    import ezdxf
+    sheet, legs = _u_sheet()
+    rs = write_svg(sheet, str(tmp_path / "u.svg"))
+    root = ET.parse(str(tmp_path / "u.svg")).getroot()
+    drawn = [e for e in root.iter() if e.get("class") == "hidden"]
+    assert len(drawn) == 3 and rs["dash_adapted"] == 3
+    for e, leg in zip(drawn, legs):
+        assert _dash_pieces(leg, [float(v) for v in e.get("stroke-dasharray").split()], False)[1] >= 1
+    rp = write_pdf(sheet, str(tmp_path / "u.pdf"), compress=False)
+    data = (tmp_path / "u.pdf").read_bytes()
+    ops = _pdf_content(data, _pdf_objects(data)).decode("latin-1").split("\n")
+    pats, cur = [], None
+    for op in ops:
+        m = re.search(r"\[([^\]]*)\] 0 d", op)
+        if m:
+            cur = [float(v) / MM for v in m.group(1).split()]
+        if op.endswith(" S"):
+            pats.append(cur)
+    assert len(pats) == 3 and rp["dash_adapted"] == 3
+    for pat, leg in zip(pats, legs):
+        assert _dash_pieces(leg, pat, False)[1] >= 1
+    rd = write_dxf(sheet, str(tmp_path / "u.dxf"))
+    assert rd["audit_errors"] == 0 and rd["dash_adapted"] == 3
+    doc = ezdxf.readfile(str(tmp_path / "u.dxf"))
+    ents = [e for e in doc.modelspace() if e.dxf.layer == "HIDDEN"]
+    base = doc.linetypes.get(doc.layers.get("HIDDEN").dxf.linetype).simplified_line_pattern()
+    assert len(ents) == 3
+    for e, leg in zip(ents, legs):
+        assert _dash_pieces(leg, [v * float(e.dxf.get("ltscale", 1.0)) for v in base], False)[1] >= 1
+
+
+def _ngon(n, r=3.0, rot=0.0, c=(40.0, 30.0)):
+    t = rot + np.linspace(0.0, 2.0 * np.pi, n + 1)[:-1]
+    return np.column_stack([c[0] + r * np.cos(t), c[1] + r * np.sin(t)])
+
+
+def test_hidden_pieces_keep_coarse_circle_rings_whole():
+    """Z2 review: a coarse hidden hole rim (r 3 mm, 8 or 10 sides: a simplified mesh
+    circle) was split into 8 or 10 Segments, each with its own dash pair, so the
+    whole-period closed-curve rule was lost; a regular 12-gon (turn exactly 30 degrees)
+    split into a rotation-dependent number of pieces through float noise."""
+    from src.drawing.writers import hidden_pieces, item_line_props, _CORNER_DEG
+    period = sum(DEFAULT_STYLE.dash_hidden)
+    for n in (8, 10):
+        ring = Polyline(_ngon(n), True, LineStyle.HIDDEN)
+        leg = 2.0 * 3.0 * math.sin(math.pi / n)
+        # precondition: every vertex turns more than 30 degrees and every leg is a short
+        # corner run of at least 1 mm, so the corner rule alone splits it
+        assert 360.0 / n > _CORNER_DEG and 1.0 <= leg < 2.0 * period
+        assert hidden_pieces(ring) == [ring]
+    assert item_line_props(Polyline(_ngon(8), True, LineStyle.HIDDEN))[2] is True   # ring fit
+    # the 12-gon at 30 degrees: one piece at every rotation (no float coin toss)
+    counts = {len(hidden_pieces(Polyline(_ngon(12, rot=k * 0.0137), True, LineStyle.HIDDEN)))
+              for k in range(40)}
+    assert counts == {1}
+    # ... and the same for an open chain whose vertices turn exactly 30 degrees
+    open_counts = {len(hidden_pieces(Polyline(_ngon(12, rot=k * 0.0137)[:7], False,
+                                              LineStyle.HIDDEN))) for k in range(40)}
+    assert open_counts == {1}
+    # negative: a hexagon (6 vertices, not a sampled circle) and a 2 x 20 rectangle still
+    # split at their corners; a clearly sharper turn (31 degrees) is still a corner
+    assert len(hidden_pieces(Polyline(_ngon(6), True, LineStyle.HIDDEN))) == 6
+    rect = Polyline(np.array([[0.0, 0.0], [20.0, 0.0], [20.0, 2.0], [0.0, 2.0]]), True,
+                    LineStyle.HIDDEN)
+    assert len(hidden_pieces(rect)) == 4
+    a = math.radians(31.0)
+    bent = Polyline(np.array([[0.0, 0.0], [3.0, 0.0], [3.0 + 3.0 * math.cos(a), 3.0 * math.sin(a)]]),
+                    False, LineStyle.HIDDEN)
+    assert len(hidden_pieces(bent)) == 2

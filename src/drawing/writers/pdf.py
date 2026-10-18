@@ -37,7 +37,7 @@ import numpy as np
 
 from ..model import (Arc, Circle, HatchLines, LineStyle, Polygon, Polyline, Segment, Sheet, Text)
 from ..style import DEFAULT_STYLE, SheetStyle
-from . import arc_span, clean_text, fmt, item_line_props, line_props, valid_item
+from . import arc_span, clean_text, fmt, hidden_pieces, item_line_props, line_props, valid_item
 from .svg import polyline_points
 
 log = logging.getLogger(__name__)
@@ -238,7 +238,8 @@ def write_pdf(sheet: Sheet, path: str, sheet_style: SheetStyle = DEFAULT_STYLE,
         if not valid_item(item):
             skipped += 1
             continue
-        adapted += int(bool(_draw_item(pw, item, sheet_style)))
+        for piece in hidden_pieces(item, sheet_style):          # QA round 3 issue 23
+            adapted += int(bool(_draw_item(pw, piece, sheet_style)))
     if skipped:
         log.warning("pdf: skipped %d degenerate or non-finite items", skipped)
     data, n_obj = pw.to_bytes()

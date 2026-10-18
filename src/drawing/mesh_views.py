@@ -53,8 +53,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .geometry2d import (chain_to_primitives, dedupe_primitives, merge_collinear, weld_chain_ends,
-                         premerge_collinear, subtract_covered)
+from .geometry2d import (chain_to_primitives, dedupe_primitives, drop_fan_duplicates,
+                         drop_isolated_fragments, drop_mostly_covered, merge_collinear,
+                         premerge_collinear, subtract_covered, weld_chain_ends)
 from .model import BBox2D, LineStyle, Polyline, ProjectedView, Segment
 
 log = logging.getLogger(__name__)
@@ -74,6 +75,21 @@ _SLIVER_REL = 1e-5                # faces with a min altitude below this x bbox 
 _DEFAULT_VIEW_PAPER_MM = 120.0    # paper-scale guess: the view's long side spans this on paper
 _MAX_ORGANIC_SILHOUETTE_FACES = 2_000_000   # above: organic silhouettes skipped and disclosed
 _SKIMAGE_WARM = {"done": False}
+# QA round 3
+_HIDDEN_COVER_PAPER_MM = 0.1      # #10: hidden runs within this of a visible run are cut (loose)
+_HIDDEN_PARALLEL_PAPER_MM = 0.3   # #10: ... and dropped whole when beside one along > 80 %
+_HIDDEN_PARALLEL_SHARE = 0.8
+_HIDDEN_DENSITY_RATIO = 3.0       # #2: hidden ink above 3 x the visible ink on paper ...
+_HIDDEN_DENSITY_MAX_SEGMENTS = 20_000   # ... or more hidden edges than this: reduce
+_HIDDEN_DENSITY_KEEP_PAPER_MM = 5.0     # #2: a reduced view keeps hidden chains longer than this
+_DENSITY_DEFAULT = object()     # project_mesh max_hidden_primitives: "use the constant above"
+_DENSITY_CELL_PAPER_MM = 5.0      # #2 step 2: paper cell for the local ink density
+_DENSITY_MAX_INK = 1.5            # #2 step 2: mm of line per mm2 above which hidden chains go
+_DANGLING_PAPER_MM = 0.5         # #9: open pieces shorter than this with a free end are dropped
+_FAN_PAPER_MM = 0.3               # #9: fan chords whose ends lie this close to a longer one go
+_FILL_SLIVER_GAPS = True          # #21: one- or two-edge chain gaps left by sliver pairs are filled
+_ISO_WELD_PAPER_MM = 0.5          # #21: the iso view welds chain ends up to this (others 0.3)
+_ISO_LOOP_CLOSE_PAPER_MM = 1.0    # #21: iso chains whose ends are this close (<= 10 % length) close
 
 
 # ------------------------------------------------------------------ raster
@@ -452,10 +468,70 @@ def candidate_edges(mesh, n: np.ndarray, feature_angle_deg: float,
         if len(bnd):
             parts.append(bnd)
     parts = [p.reshape(-1, 2) for p in parts if len(p)]
+    counts["sliver_gaps_filled"] = 0
     if not parts:
         return np.zeros((0, 2), dtype=np.int64), counts
-    cand = np.unique(np.sort(np.vstack(parts), axis=1), axis=0)
-    return cand.astype(np.int64), counts
+    cand = np.unique(np.sort(np.vstack(parts), axis=1), axis=0).astype(np.int64)
+    if _FILL_SLIVER_GAPS and len(adj) and unreliable is not None and unreliable.any():
+        cand, counts["sliver_gaps_filled"] = _fill_sliver_gaps(cand, adj_e[unreliable],
+                                                               len(mesh.vertices))
+    return cand, counts
+
+
+def _fill_sliver_gaps(cand: np.ndarray, unreliable_edges: np.ndarray, n_vert: int
+                      ) -> Tuple[np.ndarray, int]:
+    """Bridge one- and two-edge gaps that sliver pairs leave in feature chains (QA3 #21).
+
+    An adjacency pair with a degenerate face is not classified, so a hole rim
+    whose top face was fanned into slivers by a boolean loses single edges
+    and breaks into open pieces (measured: a trimesh boolean plate with four
+    r5 holes, 345 sliver pairs, every rim in 11 pieces; the iso's organic
+    3 mm chain filter then dropped them all). An unclassified edge whose two
+    vertices are both chain ends (degree 1 among the candidates) is added;
+    so are two unclassified edges u-w-v through a vertex w that has no
+    candidate edge, when u and v are chain ends and w has exactly those two.
+    Returns (candidates, number of edges added).
+    """
+    U = np.unique(np.sort(np.asarray(unreliable_edges, dtype=np.int64).reshape(-1, 2), axis=1), axis=0)
+    if len(U) == 0:
+        return cand, 0
+    deg = np.bincount(cand.ravel(), minlength=n_vert)
+    du, dv = deg[U[:, 0]], deg[U[:, 1]]
+    one = U[(du == 1) & (dv == 1)]
+    # two-edge gaps: u (deg 1) - w (deg 0) - v (deg 1)
+    half = (((du == 1) & (dv == 0)) | ((du == 0) & (dv == 1)))
+    H = U[half]
+    two = np.zeros((0, 2), dtype=np.int64)
+    if len(H):
+        w = np.where(deg[H[:, 0]] == 0, H[:, 0], H[:, 1])
+        order = np.argsort(w, kind="stable")
+        H, w = H[order], w[order]
+        uw, start, cnt = np.unique(w, return_index=True, return_counts=True)
+        pick = start[cnt == 2]
+        if len(pick):
+            two = np.vstack([H[pick], H[pick + 1]])
+    add = np.vstack([one, two]) if len(two) else one
+    if len(add) == 0:
+        return cand, 0
+    # an end may close only one gap
+    ends = np.r_[one.ravel(), two.ravel()]
+    ends = ends[deg[ends] == 1]
+    u_end, c_end = np.unique(ends, return_counts=True)
+    multi = set(u_end[c_end > 1].tolist())
+    if multi:
+        keep_one = np.array([not (a in multi or b in multi) for a, b in one.tolist()], dtype=bool)
+        one = one[keep_one] if len(one) else one
+        if len(two):
+            m2 = len(two) // 2
+            ok = np.array([not any(x in multi for x in (two[k, 0], two[k, 1], two[k + m2, 0],
+                                                        two[k + m2, 1]) if deg[x] == 1)
+                           for k in range(m2)], dtype=bool)
+            two = np.vstack([two[:m2][ok], two[m2:][ok]])
+        add = np.vstack([one, two]) if len(two) else one
+    if len(add) == 0:
+        return cand, 0
+    out = np.unique(np.vstack([cand, add]), axis=0)
+    return out, int(len(out) - len(cand))
 
 
 def _degenerate_faces(mesh) -> Optional[np.ndarray]:
@@ -496,7 +572,8 @@ def _project(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: b
              hidden: bool = True, cap: Optional[Tuple[Sequence[np.ndarray], float]] = None,
              exclude_plane: Optional[Tuple[np.ndarray, np.ndarray, float]] = None,
              grid_points: Optional[np.ndarray] = None, paper_scale: Optional[float] = None,
-             time_budget_s: Optional[float] = None) -> ProjectedView:
+             time_budget_s: Optional[float] = None,
+             max_hidden_primitives=_DENSITY_DEFAULT) -> ProjectedView:
     """Shared body of ``project_mesh`` and the section body projection.
 
     ``cap`` = (loops in view coords, depth) is filled into the depth buffer
@@ -576,10 +653,15 @@ def _project(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: b
     min_chain = max(_MIN_CHAIN_PX * px, (_ORGANIC_MIN_CHAIN_PAPER_MM / scale) if organic else 0.0)
     min_loop = max(_MIN_CHAIN_PX * px, (_ORGANIC_MIN_LOOP_PAPER_MM / scale) if organic else 0.0)
     min_loop = min(min_loop, min_chain)
-    weld_r = max(tol, _WELD_PAPER_MM / scale)
+    weld_mm = _ISO_WELD_PAPER_MM if getattr(spec, "name", "") == "iso" else _WELD_PAPER_MM
+    weld_r = max(tol, weld_mm / scale)
+    stats["sliver_gaps_filled"] = int(counts.get("sliver_gaps_filled", 0))
     chain_kw = dict(short_len=short_len, min_chain_len=min_chain, min_closed_len=min_loop,
                     simplify_tol=max(tol, _SIMPLIFY_PAPER_MM / scale),
                     hairpin_len=_HAIRPIN_PAPER_MM / scale)
+    if getattr(spec, "name", "") == "iso":
+        # QA round 3 issue 21: a rim broken once is closed before the loop threshold
+        chain_kw["close_gap"] = _ISO_LOOP_CLOSE_PAPER_MM / scale
     stats["min_chain_len"] = min_chain
     stats["min_loop_len"] = min_loop
     cst: dict = {}
@@ -590,12 +672,22 @@ def _project(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: b
         try:
             _check(deadline)
             hid = premerge_collinear(hid, tol)
+            len0 = _seg_len(hid)
             cover = np.concatenate([vis, outline_edges]) if len(outline_edges) else vis
-            hid = subtract_covered(hid, cover, tol, loose=True, deadline=deadline)
+            # QA round 3 issue 10: the paper-scaled loose cover of the B-rep route
+            # (0.1 mm on paper), not the 0.5 px clean-up tolerance
+            cover_tol = max(tol, _HIDDEN_COVER_PAPER_MM / scale)
+            hid = subtract_covered(hid, cover, cover_tol, loose=True, deadline=deadline, min_len=tol)
             if len(outline_edges) and len(hid):
                 hid = subtract_covered(hid, outline_edges, _OUTLINE_COVER_PX * px, loose=True,
                                        deadline=deadline, min_len=tol)
             hid = _clean_segments(hid, tol, deadline)
+            par_tol = max(tol, _HIDDEN_PARALLEL_PAPER_MM / scale)
+            if len(hid) and len(cover) and _HIDDEN_PARALLEL_PAPER_MM > 0.0:
+                hid, _ = drop_mostly_covered(hid, cover, par_tol, _HIDDEN_PARALLEL_SHARE,
+                                             deadline=deadline)
+            stats["hidden_cover_tol"] = cover_tol
+            stats["hidden_covered_mm"] = round(max(len0 - _seg_len(hid), 0.0), 6)
             hid, nw_h = weld_chain_ends(hid, tol, weld_r)
             n_weld += nw_h
             hidden_prims = chain_to_primitives(hid, LineStyle.HIDDEN, tol, deadline=deadline,
@@ -608,11 +700,35 @@ def _project(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: b
     stats["closed_loops_dropped"] = int(cst.get("closed_dropped", 0))
     stats["dropped_chains"] = int(cst.get("open_dropped", 0) + cst.get("closed_dropped", 0))
     stats["hairpins_removed"] = int(cst.get("hairpins_removed", 0))
+    stats["loops_closed"] = int(cst.get("loops_closed", 0))
     visible = dedupe_primitives(visible, tol)
     hidden_prims = dedupe_primitives(hidden_prims, tol) if hidden else []
+    outline_prims = [Polyline(L, closed=True, style=LineStyle.VISIBLE) for L in loops]
+    # QA round 3 issue 9: fan chords and sub-0.5 mm stubs with a free end
+    fan_tol = max(tol, _FAN_PAPER_MM / scale)
+    visible, n_fan = drop_fan_duplicates(visible, fan_tol)
+    n_frag = 0
+    if hidden_prims:
+        hidden_prims, n_fan_h = drop_fan_duplicates(hidden_prims, fan_tol)
+        n_fan += n_fan_h
+    if _DANGLING_PAPER_MM > 0.0:
+        lim = _DANGLING_PAPER_MM / scale
+        visible, nv = drop_isolated_fragments(visible, lim, weld_r, tol,
+                                              context=hidden_prims + outline_prims, dangling=True)
+        n_frag += nv
+        if hidden_prims:
+            hidden_prims, nh = drop_isolated_fragments(hidden_prims, lim, weld_r, tol,
+                                                       context=visible + outline_prims,
+                                                       dangling=True)
+            n_frag += nh
+    stats["fan_dropped"] = int(n_fan)
+    stats["fragments_dropped"] = int(n_frag)
+    if hidden_prims:
+        hidden_prims = _reduce_hidden_density(hidden_prims, visible + outline_prims, scale, stats,
+                                              max_edges=max_hidden_primitives)
     stats["visibility_s"] = time.perf_counter() - t0
     if loops:
-        visible = [Polyline(L, closed=True, style=LineStyle.VISIBLE) for L in loops] + visible
+        visible = outline_prims + visible
 
     bbox = BBox2D.from_points(xy)
     stats["n_visible"] = len(visible)
@@ -624,6 +740,151 @@ def _project(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: b
                          algorithm="depth_buffer", stats=stats)
 
 
+def _seg_len(segs) -> float:
+    s = np.asarray(segs, dtype=np.float64).reshape(-1, 2, 2)
+    return float(np.linalg.norm(s[:, 1] - s[:, 0], axis=1).sum()) if len(s) else 0.0
+
+
+def _prim_len_edges(p) -> Tuple[float, int]:
+    """(length, number of straight edges) of a drawn primitive."""
+    if isinstance(p, Segment):
+        return float(math.dist(tuple(map(float, p.a)), tuple(map(float, p.b)))), 1
+    if isinstance(p, Polyline):
+        pts = np.asarray(p.points, dtype=np.float64).reshape(-1, 2)
+        if len(pts) < 2:
+            return 0.0, 0
+        ring = np.vstack([pts, pts[:1]]) if p.closed else pts
+        return float(np.linalg.norm(np.diff(ring, axis=0), axis=1).sum()), len(ring) - 1
+    r = getattr(p, "radius", None)
+    if r is not None:
+        return 2.0 * math.pi * abs(float(r)), 1
+    return 0.0, 0
+
+
+def _reduce_hidden_density(hidden: list, visible: list, scale: float, stats: dict,
+                           max_edges=_DENSITY_DEFAULT) -> list:
+    """Thin out the hidden lines of an over-dense view (QA round 3 issue 2).
+
+    The wheel's top view drew 454 hidden polylines through the hub: a black
+    mass. When the hidden ink on paper exceeds ``_HIDDEN_DENSITY_RATIO`` (3)
+    x the visible ink, or the view holds more than ``max_edges`` (default
+    ``_HIDDEN_DENSITY_MAX_SEGMENTS``, 20 000) hidden edges, only hidden
+    chains longer than ``_HIDDEN_DENSITY_KEEP_PAPER_MM`` (5 mm) on paper are
+    kept (then the locally dense ones go, ``_drop_locally_dense``).
+    ``max_edges=None`` disables the cut (``--max-hidden-primitives none``).
+    ``stats``: ``hidden_reduced`` True with ``hidden_reduced_reason``
+    ("density" = ink ratio, "max_hidden_primitives" = edge count),
+    ``hidden_density_removed`` / ``hidden_density_kept`` (primitive counts),
+    ``hidden_paper_mm`` / ``visible_paper_mm`` (ink before the cut). Only
+    when NO hidden chain is kept is ``hidden_dropped`` True with
+    ``hidden_dropped_reason`` "density" (hidden_dropped means the view has
+    no hidden lines, Z2 review; the reason is then the same as
+    ``hidden_reduced_reason``).
+    """
+    if max_edges is _DENSITY_DEFAULT:
+        max_edges = _HIDDEN_DENSITY_MAX_SEGMENTS
+    hl = [_prim_len_edges(p) for p in hidden]
+    h_mm = sum(v[0] for v in hl) * scale
+    n_edges = sum(v[1] for v in hl)
+    v_mm = sum(_prim_len_edges(p)[0] for p in visible) * scale
+    stats["hidden_paper_mm"] = round(h_mm, 3)
+    stats["visible_paper_mm"] = round(v_mm, 3)
+    stats["hidden_edges"] = int(n_edges)
+    if max_edges is None:
+        return hidden
+    by_ratio = h_mm > _HIDDEN_DENSITY_RATIO * v_mm
+    by_count = n_edges > int(max_edges)
+    if not (by_ratio or by_count):
+        return hidden
+    keep_len = _HIDDEN_DENSITY_KEEP_PAPER_MM / scale
+    kept = [p for p, (L, _) in zip(hidden, hl) if L > keep_len]
+    kept_mm = sum(L for L, _ in hl if L > keep_len) * scale
+    if kept and kept_mm > _HIDDEN_DENSITY_RATIO * v_mm:
+        kept = _drop_locally_dense(kept, visible, scale, stats)
+    stats["hidden_reduced"] = True
+    stats["hidden_reduced_reason"] = "density" if by_ratio else "max_hidden_primitives"
+    if not kept:
+        stats["hidden_dropped"] = True
+        stats["hidden_dropped_reason"] = stats["hidden_reduced_reason"]
+    stats["hidden_density_removed"] = len(hidden) - len(kept)
+    stats["hidden_density_kept"] = len(kept)
+    stats["hidden_paper_mm_kept"] = round(sum(_prim_len_edges(p)[0] for p in kept) * scale, 3)
+    log.debug("mesh view: hidden density %.1f mm vs %.1f mm visible, %d edges: kept %d of %d",
+              h_mm, v_mm, n_edges, len(kept), len(hidden))
+    return kept
+
+
+def _prim_edges(p) -> np.ndarray:
+    """(k, 2, 2) straight edges of a Segment / Polyline (others: empty)."""
+    if isinstance(p, Segment):
+        return np.array([[p.a, p.b]], dtype=np.float64)
+    if isinstance(p, Polyline):
+        pts = np.asarray(p.points, dtype=np.float64).reshape(-1, 2)
+        ring = np.vstack([pts, pts[:1]]) if p.closed and len(pts) >= 3 else pts
+        if len(ring) >= 2:
+            return np.stack([ring[:-1], ring[1:]], axis=1)
+    return np.zeros((0, 2, 2))
+
+
+def _split_edges(e: np.ndarray, step: float) -> np.ndarray:
+    """Edges cut into pieces no longer than ``step`` (so long edges spread over cells)."""
+    if len(e) == 0:
+        return e
+    L = np.linalg.norm(e[:, 1] - e[:, 0], axis=1)
+    n = np.maximum(1, np.ceil(L / step)).astype(np.int64)
+    if int(n.max()) == 1:
+        return e
+    own = np.repeat(np.arange(len(e)), n)
+    k = np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n)
+    t0 = (k / n[own])[:, None]
+    t1 = ((k + 1) / n[own])[:, None]
+    d = e[own, 1] - e[own, 0]
+    return np.stack([e[own, 0] + d * t0, e[own, 0] + d * t1], axis=1)
+
+
+def _drop_locally_dense(hidden: list, visible: list, scale: float, stats: dict) -> list:
+    """Second density step: drop hidden chains lying mostly in over-inked paper cells.
+
+    Measured on the 25 wheel top view: keeping only hidden chains longer than
+    5 mm on paper removed 12 % of the hidden ink (4766 -> 4204 mm against
+    755 mm visible), because the hub mass is made of long fold silhouettes.
+    The paper is cut into ``_DENSITY_CELL_PAPER_MM`` (5 mm) cells; a cell's
+    ink is the visible plus hidden line length in it per mm2. A hidden chain
+    whose length-weighted mean cell ink exceeds ``_DENSITY_MAX_INK``
+    (1.5 mm/mm2, lines about 0.7 mm apart) is dropped; long sparse lines
+    (rim edges) stay. ``stats["hidden_dense_dropped"]`` counts them.
+    """
+    cell = _DENSITY_CELL_PAPER_MM / scale
+    edges_h = [_split_edges(_prim_edges(p), 0.5 * cell) for p in hidden]
+    all_e = [e for e in edges_h if len(e)] + [
+        e for e in (_split_edges(_prim_edges(p), 0.5 * cell) for p in visible) if len(e)]
+    if not all_e:
+        return hidden
+    E = np.concatenate(all_e)
+    mid = 0.5 * (E[:, 0] + E[:, 1])
+    L = np.linalg.norm(E[:, 1] - E[:, 0], axis=1) * scale
+    ij = np.floor(mid / cell).astype(np.int64)
+    keys, inv = np.unique(ij, axis=0, return_inverse=True)
+    ink = np.bincount(inv.ravel(), weights=L, minlength=len(keys)) / (_DENSITY_CELL_PAPER_MM ** 2)
+    kept, n = [], 0
+    for p, e in zip(hidden, edges_h):
+        if len(e) == 0:
+            kept.append(p)
+            continue
+        m = 0.5 * (e[:, 0] + e[:, 1])
+        le = np.linalg.norm(e[:, 1] - e[:, 0], axis=1)
+        k = np.floor(m / cell).astype(np.int64)
+        pos = np.searchsorted(keys[:, 0] * (1 << 32) + keys[:, 1], k[:, 0] * (1 << 32) + k[:, 1])
+        dens = ink[np.clip(pos, 0, len(ink) - 1)]
+        mean = float((dens * le).sum() / max(le.sum(), 1e-300))
+        if mean > _DENSITY_MAX_INK:
+            n += 1
+        else:
+            kept.append(p)
+    stats["hidden_dense_dropped"] = n
+    return kept
+
+
 def _check(deadline: Optional[float]) -> None:
     if deadline is not None and time.perf_counter() > deadline:
         raise TimeoutError("mesh view: time budget exceeded")
@@ -631,7 +892,8 @@ def _check(deadline: Optional[float]) -> None:
 
 def project_mesh(mesh, spec, *, raster_px: int, feature_angle_deg: float, organic: bool,
                  hidden: bool = True, paper_scale: Optional[float] = None,
-                 time_budget_s: Optional[float] = None) -> ProjectedView:
+                 time_budget_s: Optional[float] = None,
+                 max_hidden_primitives=_DENSITY_DEFAULT) -> ProjectedView:
     """Visible/hidden line view of a triangle mesh (``algorithm="depth_buffer"``).
 
     Sharp + boundary + silhouette edges are split by the depth buffer into
@@ -668,10 +930,17 @@ def project_mesh(mesh, spec, *, raster_px: int, feature_angle_deg: float, organi
     ``stats["hidden_dropped"]`` is True. ``bbox`` is the exact extent of the
     projected vertices. ``stats`` carries ``px`` (pixel size in model mm)
     and the timings.
+
+    ``max_hidden_primitives`` (QA round 3 issue 2, Z2 review): the hidden
+    edge count above which an over-dense view is thinned (default 20 000,
+    see ``_reduce_hidden_density``; the hidden-ink ratio rule also applies);
+    ``None`` disables the thinning, so ``--max-hidden-primitives none``
+    keeps every hidden chain. A thinned view has ``stats["hidden_reduced"]``
+    True; ``hidden_dropped`` is True only when no hidden line is left.
     """
     return _project(mesh, spec, raster_px=raster_px, feature_angle_deg=feature_angle_deg,
                     organic=organic, hidden=hidden, paper_scale=paper_scale,
-                    time_budget_s=time_budget_s)
+                    time_budget_s=time_budget_s, max_hidden_primitives=max_hidden_primitives)
 
 
 __all__ = ["project_mesh", "raster_span", "edge_visibility", "mask_outline", "candidate_edges",

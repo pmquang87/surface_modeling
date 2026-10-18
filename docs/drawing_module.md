@@ -37,7 +37,7 @@ exactly one line `RESULT {json}` (the report).
 |---|---|---|
 | `--formats` | `pdf,svg,dxf` | any subset |
 | `--views` | `front,top,right,iso` | from `front back top bottom left right iso` |
-| `--section` | `auto` | `auto`: the holes are tried largest first and the first of the front, top and right planes that contains the hole axis wins (a washer seen face on is cut by the top plane through its bore); without a usable hole a thin part (depth < 0.1 x the smaller other extent) is cut by the top plane through the bbox centre, anything else by the front plane through it (flag `section_fallback`); an empty plane is retried through the centroids of the 3 largest bodies. Large assemblies get no auto section (below). `front`/`top`/`right` choose the plane orientation (always drawn); `off` |
+| `--section` | `auto` | `auto`: the holes are tried largest first and the first of the front, top and right planes that contains the hole axis wins (a washer seen face on is cut by the top plane through its bore); without a usable hole a thin part (depth < 0.1 x the smaller other extent) is cut by the top plane through the bbox centre, anything else by the front plane through it (flag `section_fallback`); an empty plane is retried through the centroids of the 3 largest bodies (`section.reason` then ends in `_body_centroid_retry`, `section.retry_mm` gives the offset, and the flag detail says so). Large assemblies get no auto section (below). `front`/`top`/`right` choose the plane orientation (always drawn); `off` |
 | `--sheet` | `A3` | `A3` (landscape), `A4` (portrait, ISO), `A4L` (landscape, flagged non-ISO), `auto` (A4 or A3, chosen from the uncapped dimension plan; A3 is preferred over capping the position bands on A4 when A3 shows every dimension at the capped scale or larger) |
 | `--projection` | `first` | `first` (ISO, top view below the front view) or `third` (ASME) |
 | `--orient` | `auto` | `auto`: longest extent → width, shortest → depth, then the viewing side (below); `fixed`: file axes |
@@ -53,7 +53,7 @@ exactly one line `RESULT {json}` (the report).
 | `--memory-limit-mb` | 2048 | committed-memory cap of the child |
 | `--no-sandbox` | | run in-process |
 | `--options-json` | | `DrawingOptions` as JSON; explicit flags override it |
-| `--quiet` | | no progress on stderr, except one `INFO src.drawing.stage: stage ...` line per stage boundary (elapsed, time left, RSS) |
+| `--quiet` | | no progress on stderr, except one `INFO src.drawing.stage: stage ...` line per stage boundary (elapsed, time left, RSS); sandboxed, the parent prints only these lines of the child's stderr tail, after the child ends (the full tail stays in `sandbox.stderr_tail`) |
 
 Programmatic use: `from src.drawing.pipeline import run; code, report = run(path, out_dir, DrawingOptions(...))`.
 
@@ -92,7 +92,10 @@ sniff by content (STEP header | binary STL 84+50n | ASCII STL facet count) -> si
   written to `<stem>.step`; for the drawing the same faces are assembled into
   a shell, edges between near-coplanar facets are coded smooth
   (`EncodeRegularity`, 20° default), and `HLRBRep_PolyAlgo` projects it. No
-  circles exist on this route, so there are no hole callouts (flagged).
+  circles exist on this route, so there are no hole callouts (flagged), and
+  `undimensioned` carries one entry `{kind: features, reason:
+  route_without_brep_features, route}`: the drawn holes, pockets and fillets
+  are not dimensioned (the same entry on the mesh and tessellated routes).
 - **Tessellated STEP route.** A STEP file whose faces are all AP242
   triangulations (`TESSELLATED_SOLID` / `TRIANGULATED_FACE`, no surfaces)
   cannot run HLR or a B-rep census. The triangulations become one mesh (nodes
@@ -119,7 +122,11 @@ sniff by content (STEP header | binary STL 84+50n | ASCII STL facet count) -> si
   `closed_loops_dropped`). Sections from `mesh_plane` segments chained into
   loops (an open chain of an open mesh is closed by a straight chord: flag
   `section_gaps_bridged`); the half mesh behind the plane for the section body.
-  No hole features on this route.
+  No hole features on this route (`undimensioned` kind `features`). An open
+  mesh with winding conflicts has no winding-repaired volume; its conflicts
+  are disclosed by `mesh_winding_inconsistent` (info) and
+  `geometry.winding_conflicts` (with `degenerate_faces` and
+  `volume_raw_signed_mm3`).
 
 ### The classifier
 
@@ -210,23 +217,53 @@ run, for example `2 x Ø100`; a gap between faces of different diameter up to
 so the bore stays one counterbore / stepped feature. Callouts go on circles
 drawn visible in their axial view; holes seen only as hidden circles get no
 callout (`undimensioned` reason `hidden_only`, flag `dimension_hidden_only`).
+A counterbore on the face away from the viewer (its large circle drawn only
+hidden while the bore is visible) gets its leader on the visible bore circle
+and the text `4 x Ø6 / Ø10 cbore far side` (kept compact: a longer note
+took the free band above the view and pushed other callouts onto long leaders)
+(`DimensionPlan.stats["far_side_callouts"]`); near-side and far-side
+counterbores of one size are separate callouts.
 When the position bands at a scale would overflow the sheet, at most 3
 position bands per side are kept and the rest dropped (outermost first,
 never an overall dimension; reason `layout_space`, flag `layout_dims_dropped`).
-Dimension texts that still overlap after the resolution pass give the
-warning `layout_text_collision`; texts the pass moved give the info
-`layout_text_moved`.
+After the resolution pass, the warning `layout_text_collision` counts what
+is left: overlapping texts, texts crossed by a line (extension, dimension,
+leader, shelf) of another dimension, and section-marker items touching a
+dimension line (`sheet.text_collisions`: `remaining`, `text_overlaps`,
+`text_line_crossings`, `marker_dimension_crossings`); texts the pass moved
+give the info `layout_text_moved`. The pass moves a callout out of its
+view's reserved rect into free paper rather than leave its text on another
+dimension's line, but never into another view's rect. A value text too wide
+for its span goes past the end with no extension line of its own or an
+outer band between the span and the text, and not into a corner where the
+perpendicular side has bands (when both ends are taken, the end with more
+room inside the view wins, as before). The section marker's letter sits the
+same way at both ends of the cutting line, and an end whose arrow or letter
+would touch an extension or dimension line of its view moves past the
+outermost dimension line (as an end whose cutting line lies on an extension
+line already did); the reserved room follows.
 
 **Section fill.** The fill is decided per body (the solid each loop comes
 from), from its mean wall thickness on the sheet `t = 2A/P` over all its loops
 (A = outer areas minus hole areas, P = all perimeters; a strip of width w
 gives about w whatever its shape). A body with `t` below 2.1 mm is filled
 solid (ISO 128-50 blackened thin section), otherwise every region of the body
-is hatched: one part, one treatment. Guards: a thin body with more than 10 %
+is hatched: one part, one treatment. A hatched body has ONE hatch spacing
+(ISO 128-50: one part, one hatch): the section spacing (below), unless its
+narrow regions (2A/P from 1.4 mm up to two section spacings) hold more than
+20 % of the body's area; then the smallest `t / 3` of those regions (at
+least 0.7 mm), so a thin ring alone is hatched at about a third of its
+width. Guards: a thin body with more than 10 %
 of its area deeper than 2.1 mm inside the material (a finned heat sink) is
 hatched, not filled; a region of a hatched body under 1.4 mm (2A/P), or with
-fewer than 2 hatch lines, is filled (`fill` `mixed`). Bodies alternate 45° and
-135° hatching. The report gives `section.fill` (`hatch`, `solid`, `mixed`),
+fewer than 2 hatch lines at the body's spacing, is filled (`fill` `mixed`).
+Bodies alternate 45° and
+135° hatching. The report gives `section.hatch_spacing_mm` (the drawn
+spacing in paper mm, rounded to 4 decimals: the single value, or the smallest
+when the bodies differ; null when nothing is hatched, e.g. an all-solid thin
+section; before QA round 3 it held the nominal spacing even then),
+`hatch_spacings_mm` (per body, null for a filled body, same rounding),
+`section.fill` (`hatch`, `solid`, `mixed`),
 `filled_regions`, `filled_area_fraction`, `bodies`, `thick_core_bodies`,
 `body_thickness_paper_mm` (the per-body `t` above, measured on the sheet in
 paper mm, not the part's wall), `body_thickness_model_mm` (the same divided
@@ -239,7 +276,8 @@ flag means the scale blackened walls that 1:1 would hatch (NIST FTC 07: a
 
 Conventional (DIN 406 teaching practice, not ISO): first dimension line 10 mm
 from the outline, 7 mm pitch, 1 mm extension gap, 2 mm overshoot, hatch
-spacing 2 / 3 / 4 mm by section size, 20 mm between views. The report never
+spacing 2 / 3 / 4 mm by section size (one spacing per body, `t / 3` when its
+narrow regions dominate, see Section fill), 20 mm between views. The report never
 cites ISO for these.
 
 ## Quality report
@@ -287,7 +325,7 @@ section 3.8. The parts a consumer should read first:
 | `hidden_lines_dropped` | warning |  | a view lost its hidden lines (time budget or max_hidden_primitives) |
 | `not_a_solid` | warning |  | no closed component (triangle soup): no section, no overall dimensions, level minimal |
 | `mesh_non_manifold` | warning |  | the mesh has edges with more than two faces |
-| `layout_text_collision` | warning |  | dimension texts still overlap after the resolution pass |
+| `layout_text_collision` | warning |  | after the resolution pass dimension texts still overlap, a text is crossed by another dimension's line, or the section marker touches a dimension line (counts in sheet.text_collisions) |
 | `section_skipped_budget` | warning |  | the run deadline was too close (or the section's estimated cost too high): no section view |
 | `sandbox_timeout` | warning |  | the child exceeded the wall-clock limit (run failed) |
 | `sandbox_memory_exceeded` | warning |  | the child exceeded the memory limit (run failed) |
@@ -305,11 +343,9 @@ section 3.8. The parts a consumer should read first:
 | `approval_blank` | info |  | the approval field is blank (always, for an auto-generated drawing) |
 | `loose_curves_ignored` | info |  | loose edges / vertices (sketch, PMI curve sets) or tessellated PMI annotations are not drawn and not in the bbox |
 | `supplemental_shells_ignored` | info |  | free shells / faces or tessellated bodies next to the drawn bodies are not drawn |
-| `supplemental_geometry_ignored` | info |  | other supplemental geometry is not drawn |
-| `loose_curves_drawn` | info |  | a pure wireframe or surface model keeps its loose curves |
 | `unit_assumed_mm` | info | yes | an STL carries no unit and was read as mm (warning when the size looks implausible) |
 | `unit_suspect` | info | yes | the sizes look like another unit; the alternative reading is in the detail |
-| `section_fallback` | info |  | no hole axis fits the section mode: bbox centre, thin-part plane, or no solid (no section) |
+| `section_fallback` | info |  | no hole axis fits the section mode: bbox-centre plane (moved through a body centroid when it cuts nothing), thin-part plane, or an open B-rep surface model (no section); a mesh that is not a solid reports not_a_solid instead |
 | `interior_silhouettes_omitted` | info |  | organic mesh too large for silhouette candidates: interior silhouettes are not drawn |
 | `hidden_lines_omitted_assembly` | info |  | large assembly (more than 20 solids, or 50000 raw hidden edges in a view): no hidden lines |
 | `layout_text_moved` | info |  | dimension texts were moved off the section marker or other texts |
@@ -320,6 +356,7 @@ section 3.8. The parts a consumer should read first:
 | `section_gaps_bridged` | info | yes | open section chains of a mesh were closed by straight chords (warning when a chord exceeds 5 % of the section extent) |
 | `winding_repaired` | info |  | the face winding is inconsistent; the volume comes from a winding-repaired copy |
 | `dimension_hidden_only` | info |  | hole features seen only as hidden circles in their axial view get no callout (undimensioned) |
+| `mesh_winding_inconsistent` | info |  | an open mesh has faces wound against their neighbours (winding conflicts, count in the detail and in geometry.winding_conflicts); no repaired volume exists for an open mesh, the views are not affected |
 <!-- flag-table:end -->
 
 - `input`: `detected_format` `step`, `stl_binary`, `stl_ascii`,
@@ -334,7 +371,11 @@ section 3.8. The parts a consumer should read first:
   `not_solid`, `too_many_triangles`, `off`, `tessellated_step`), every
   fallback with its reason, the orientation (permutation, flips, depth sign).
 - `geometry`: census (B-rep or mesh), exact bbox, volume, area, features,
-  `bodies` (drawn and dropped geometry).
+  `bodies` (drawn and dropped geometry; on the tessellated route
+  `tessellated_bodies` counts the drawn tessellated bodies and a shell folded
+  into `tessellated_shells_outside` is not listed again as `free_shells`;
+  `geometry.solids` is `bodies.solids`); mesh routes add
+  `winding_conflicts`, `degenerate_faces`, `volume_raw_signed_mm3`.
 - `views[]`: algorithm, visible / hidden counts, seconds, time budget, and the
   clean-up counts of the route (`hidden_curves_dropped`,
   `hidden_curves_trimmed`; `welded_ends`, `hairpins_removed`,
@@ -342,10 +383,16 @@ section 3.8. The parts a consumer should read first:
 - `dimensions[]` (what the sheet shows, after the layout's band cap) and
   `undimensioned[]`: kinds `hole_group`, `boss_group`, `fillet_group`,
   `round_group`, `counterbore_depth`, `step_depth`, `body_extent`,
-  `body_position`, `overall`, `linear` (a dropped position dim); reasons
+  `body_position`, `overall`, `linear` (a dropped position dim), `features`
+  (faceted, mesh and tessellated routes: nothing was detected, so the drawn
+  features carry no dimension; `count` null, `route` the source); reasons
   `cap`, `no_axial_view`, `not_supported`, `hidden_only`,
-  `filled_by_fastener`, `assembly`, `layout_space`, `not_a_solid`.
-- `section` (plane, loops, fill, bridged gaps, fasteners left whole),
+  `filled_by_fastener`, `assembly`, `layout_space`, `not_a_solid`,
+  `route_without_brep_features`.
+- `section` (plane, loops, fill, `hatch_spacing_mm` / `hatch_spacings_mm`,
+  bridged gaps, fasteners left whole; `reason` with the suffix
+  `_body_centroid_retry` and `retry_mm` when an empty plane was moved through
+  a body centroid),
   `sheet` (size, scale, `unit_note`, `text_collisions`, `scale_candidates`),
   `outputs`.
 - `writers.dxf_audited`: the DXF was re-read and audited by ezdxf (False
@@ -465,11 +512,16 @@ on the same load: `load_step` 61.0 -> 20.5 s, one view with hidden lines
 
 QA corpus run 3 (30 real-world files: NIST CTC/FTC PMI test parts, Pro/E, NX,
 Inventor, SolidWorks, FreeCAD, KiCad, CadQuery and OCCT exports, trimesh models,
-scans and a topology-optimised bracket; sandboxed, default limits, quiet
-machine): 28 drawings, 2 rejected inputs (empty and truncated STL, exit 1 in
+scans and a topology-optimised bracket; sandboxed with `--timeout 300`
+(`sandbox.timeout_s` 300 in every report), the memory limit and the other
+limits at their defaults, on a shared machine: single re-runs were about 40 %
+faster, so these wall times include load from other jobs): 28 drawings, 2
+rejected inputs (empty and truncated STL, exit 1 in
 0.3 s), exit codes 12 × 0 / 16 × 2 / 2 × 1; median wall time 8.3 s over the 28
 drawn files, 101 s for the 15 MB / 211-solid Inventor assembly (hidden lines,
-section and cross-part dimensions omitted and flagged), 33 s for the
+section and cross-part dimensions omitted and flagged; 34 % of the 300 s
+timeout and 42 % of its 240 s run deadline, and still under the 144 s run
+deadline of the default 180 s timeout, at 70 % of it), 33 s for the
 554k-triangle wheel; peak RSS median 326 MB, 713 MB on the assembly, 1193 MB on
 the wheel (limit 2048 MB). Every DXF re-read with 0 audit errors and 0 fixes,
 every PDF opened by PyMuPDF without repair, every SVG parsed. Rendered examples:
